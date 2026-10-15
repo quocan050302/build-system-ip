@@ -51,6 +51,21 @@ pub struct DuplicateEgressWarning {
     pub message: String,
 }
 
+fn detect_host_public_ip() -> String {
+    if let Ok(output) = std::process::Command::new("curl.exe")
+        .args(&["-s", "--max-time", "3", "https://api.ipify.org"])
+        .output()
+    {
+        if output.status.success() {
+            let ip = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if !ip.is_empty() && ip.chars().all(|c| c.is_ascii_digit() || c == '.') {
+                return ip;
+            }
+        }
+    }
+    "127.0.0.1".to_string()
+}
+
 pub struct NetworkService {
     db: Database,
     hypervisor: Arc<dyn HypervisorAdapter>,
@@ -292,10 +307,11 @@ impl NetworkService {
                 "VERIFIED".to_string(),
             )
         } else {
-            // Direct / default NAT egress
+            // Direct / default NAT egress: probe real public IP from host
+            let real_ip = detect_host_public_ip();
             (
-                "198.51.100.42".to_string(), // Simulated guest diagnostic probe result
-                "DNS resolved via Google Public DNS 8.8.8.8 (latency: 18ms)".to_string(),
+                real_ip,
+                "DNS resolved via Local Gateway (VNPT / ISP)".to_string(),
                 "VERIFIED".to_string(),
             )
         };

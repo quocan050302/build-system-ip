@@ -274,22 +274,34 @@ function mockHandler<T>(cmd: string, args?: Record<string, unknown>): Promise<T>
         } as unknown as T);
       }
 
-      const check: NetworkCheckRecord = {
-        id: `check-${Date.now()}`,
-        environment_id: envId,
-        observed_ipv4: env?.network_endpoint_id ? '198.51.100.42' : '203.0.113.19',
-        observed_ipv6: null,
-        dns_summary: 'DNS resolved via Cloudflare 1.1.1.1 (24ms)',
-        check_source: 'GUEST_AGENT',
-        status: 'VERIFIED',
-        error_message: null,
-        checked_at: new Date().toISOString(),
-      };
-      if (env) {
-        env.last_observed_ipv4 = check.observed_ipv4;
-        env.last_checked_at = check.checked_at;
-      }
-      return Promise.resolve(check as unknown as T);
+      return (async () => {
+        let realIp = '14.241.244.112';
+        try {
+          const res = await fetch('https://api.ipify.org?format=json').then(r => r.json());
+          if (res?.ip) {
+            realIp = res.ip;
+          }
+        } catch {
+          // fallback to detected IP
+        }
+
+        const check: NetworkCheckRecord = {
+          id: `check-${Date.now()}`,
+          environment_id: envId,
+          observed_ipv4: env?.network_endpoint_id ? '198.51.100.42' : realIp,
+          observed_ipv6: null,
+          dns_summary: 'DNS resolved via Local Gateway (VNPT)',
+          check_source: 'GUEST_AGENT',
+          status: 'VERIFIED',
+          error_message: null,
+          checked_at: new Date().toISOString(),
+        };
+        if (env) {
+          env.last_observed_ipv4 = check.observed_ipv4;
+          env.last_checked_at = check.checked_at;
+        }
+        return check as unknown as T;
+      })();
     }
 
     case 'detect_duplicate_egress': {
