@@ -118,5 +118,25 @@ pub fn run_migrations(conn: &mut Connection) -> Result<()> {
         tx.commit()?;
     }
 
+    if current_version < 2 {
+        let tx = conn.transaction()?;
+        tx.execute_batch(
+            "
+            ALTER TABLE environments ADD COLUMN host_platform TEXT NOT NULL DEFAULT 'windows-x86_64';
+            ALTER TABLE environments ADD COLUMN vm_architecture TEXT NOT NULL DEFAULT 'x86_64';
+            ALTER TABLE environments ADD COLUMN provisioning_status TEXT NOT NULL DEFAULT 'COMPLETED';
+            ALTER TABLE environments ADD COLUMN persistent_disk_reference TEXT;
+            ALTER TABLE environments ADD COLUMN network_diagnostics_capability TEXT NOT NULL DEFAULT 'DIRECT_PROBE';
+
+            ALTER TABLE network_checks ADD COLUMN latency_ms INTEGER;
+            ALTER TABLE network_checks ADD COLUMN egress_stage TEXT NOT NULL DEFAULT 'NOT_CHECKED';
+
+            INSERT INTO schema_version (version, applied_at) 
+            VALUES (2, datetime('now'));
+            "
+        )?;
+        tx.commit()?;
+    }
+
     Ok(())
 }

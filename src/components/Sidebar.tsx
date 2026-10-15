@@ -9,6 +9,8 @@ import {
   Cpu
 } from 'lucide-react';
 
+import { PlatformInfo } from '../types';
+
 export type NavItem = 'overview' | 'environments' | 'network' | 'channels' | 'settings';
 
 interface SidebarProps {
@@ -16,6 +18,7 @@ interface SidebarProps {
   onTabChange: (tab: NavItem) => void;
   runningCount: number;
   totalCount: number;
+  platformInfo?: PlatformInfo | null;
 }
 
 export const Sidebar: React.FC<SidebarProps> = ({
@@ -23,6 +26,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
   onTabChange,
   runningCount,
   totalCount,
+  platformInfo,
 }) => {
   const navItems: { id: NavItem; label: string; icon: React.ReactNode; badge?: string }[] = [
     { id: 'overview', label: 'Overview', icon: <LayoutDashboard className="w-4 h-4" /> },
@@ -93,7 +97,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
             <Cpu className="w-3.5 h-3.5 text-slate-500" /> Host Guard
           </span>
           <span className="text-[10px] font-mono text-emerald-400 bg-emerald-950/50 px-1.5 py-0.5 rounded border border-emerald-800/50">
-            DPAPI Active
+            {platformInfo?.os === 'macos' ? 'Keychain Active' : platformInfo?.os === 'windows' ? 'DPAPI Active' : 'Vault Active'}
           </span>
         </div>
         <p className="text-[11px] text-slate-500 leading-tight">

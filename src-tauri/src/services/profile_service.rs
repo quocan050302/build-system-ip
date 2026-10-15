@@ -27,7 +27,12 @@ impl ProfileService {
     }
 
     pub fn validate_path(&self, path: &Path) -> Result<(), String> {
-        // Prevent path traversal
+        // Prevent path traversal across Windows and UNIX path formats
+        let path_str = path.to_string_lossy();
+        if path_str.split(['/', '\\']).any(|part| part == "..") {
+            return Err("Path traversal (..) is not permitted in profile paths".to_string());
+        }
+
         for component in path.components() {
             if let std::path::Component::ParentDir = component {
                 return Err("Path traversal (..) is not permitted in profile paths".to_string());

@@ -10,6 +10,7 @@ import {
   HypervisorInfo,
   HostResources,
   AuditLogEntry,
+  PlatformInfo,
 } from '../types';
 
 // Check if running inside Tauri context
@@ -342,6 +343,34 @@ function mockHandler<T>(cmd: string, args?: Record<string, unknown>): Promise<T>
     case 'list_audit_logs':
       return Promise.resolve([...mockStore.auditLogs] as unknown as T);
 
+    case 'get_platform_info': {
+      const isMac = typeof navigator !== 'undefined' && navigator.userAgent.toLowerCase().includes('mac');
+      return Promise.resolve({
+        os: isMac ? 'macos' : 'windows',
+        arch: isMac ? 'aarch64' : 'x86_64',
+        target_triple: isMac ? 'macos-aarch64' : 'windows-x86_64',
+        is_supported: true,
+        total_memory_mb: 16384,
+        available_memory_mb: 8192,
+        total_disk_mb: 512000,
+        available_disk_mb: 256000,
+        installed_hypervisors: [isMac ? 'UTM' : 'Hyper-V'],
+        supported_capabilities: isMac 
+          ? ['Apple Silicon Native Virtualization', 'UTM Virtual Machine Manager', 'Apple Keychain Secret Sealing'] 
+          : ['Microsoft Hyper-V Type-1 Hypervisor', 'VHDX Dynamic Persistent Disks', 'Windows DPAPI Vault'],
+        permissions_status: 'USER_STANDARD',
+        app_data_dir: isMac ? '~/Library/Application Support/YouTubeIsolationManager' : '%APPDATA%\\YouTubeIsolationManager',
+      } as unknown as T);
+    }
+
+    case 'open_vm_console':
+    case 'launch_guest_browser':
+      return Promise.resolve(undefined as unknown as T);
+
+    case 'reconcile_environment_states':
+      return Promise.resolve(0 as unknown as T);
+
+    case 'test_secret_vault':
     case 'test_dpapi_vault':
       return Promise.resolve(true as unknown as T);
 
@@ -351,7 +380,8 @@ function mockHandler<T>(cmd: string, args?: Record<string, unknown>): Promise<T>
 }
 
 export const api = {
-  // Hypervisor & Resources
+  // Platform & Hypervisor
+  getPlatformInfo: () => callTauri<PlatformInfo>('get_platform_info'),
   getHypervisorInfo: () => callTauri<HypervisorInfo>('get_hypervisor_info'),
   getHostResources: () => callTauri<HostResources>('get_host_resources'),
 
@@ -360,6 +390,9 @@ export const api = {
   createEnvironment: (req: CreateEnvironmentRequest) => callTauri<EnvironmentRecord>('create_environment', { req }),
   startEnvironment: (id: string) => callTauri<void>('start_environment', { id }),
   shutdownEnvironment: (id: string, force: boolean) => callTauri<void>('shutdown_environment', { id, force }),
+  openVmConsole: (id: string) => callTauri<void>('open_vm_console', { id }),
+  launchGuestBrowser: (id: string) => callTauri<void>('launch_guest_browser', { id }),
+  reconcileStates: () => callTauri<number>('reconcile_environment_states'),
   deleteEnvironment: (id: string, deleteDisks: boolean) => callTauri<void>('delete_environment', { id, deleteDisks }),
 
   // Network
@@ -383,5 +416,6 @@ export const api = {
 
   // Audit & Security
   listAuditLogs: (limit?: number) => callTauri<AuditLogEntry[]>('list_audit_logs', { limit }),
+  testSecretVault: () => callTauri<boolean>('test_secret_vault'),
   testDpapiVault: () => callTauri<boolean>('test_dpapi_vault'),
 };

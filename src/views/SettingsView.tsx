@@ -4,16 +4,18 @@ import {
   KeyRound, 
   FileText, 
   Check, 
-  AlertTriangle,
-  RefreshCw,
-  Cpu,
-  ShieldCheck
+  AlertTriangle, 
+  RefreshCw, 
+  Cpu, 
+  ShieldCheck,
+  Laptop
 } from 'lucide-react';
-import { HypervisorInfo, HostResources, AuditLogEntry } from '../types';
+import { HypervisorInfo, HostResources, PlatformInfo, AuditLogEntry } from '../types';
 
 interface SettingsViewProps {
   hypervisorInfo: HypervisorInfo | null;
   hostResources: HostResources | null;
+  platformInfo?: PlatformInfo | null;
   auditLogs: AuditLogEntry[];
   onTestVault: () => Promise<boolean>;
   onRefresh: () => void;
@@ -22,6 +24,7 @@ interface SettingsViewProps {
 export const SettingsView: React.FC<SettingsViewProps> = ({
   hypervisorInfo,
   hostResources,
+  platformInfo,
   auditLogs,
   onTestVault,
   onRefresh,
@@ -29,6 +32,10 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   const [vaultTestResult, setVaultTestResult] = useState<boolean | null>(null);
   const [isTestingVault, setIsTestingVault] = useState(false);
   const [logFilter, setLogFilter] = useState('ALL');
+
+  const isMac = platformInfo?.os === 'macos' || (typeof navigator !== 'undefined' && navigator.userAgent.toLowerCase().includes('mac'));
+  const hypervisorDisplayName = hypervisorInfo?.name || (isMac ? 'UTM Hypervisor Integration' : 'Microsoft Hyper-V Hypervisor Integration');
+  const vaultDisplayName = isMac ? 'Apple Keychain' : 'Windows DPAPI';
 
   const handleTestVault = async () => {
     setIsTestingVault(true);
@@ -49,14 +56,72 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
 
   return (
     <div className="space-y-6">
+      {/* Platform Architecture & Capabilities */}
+      <div className="bg-surface-900 border border-surface-800 rounded-xl p-5 space-y-4 shadow-sm">
+        <div className="flex items-center justify-between border-b border-surface-800 pb-3">
+          <div className="flex items-center gap-2.5">
+            <Laptop className="w-5 h-5 text-indigo-400" />
+            <div>
+              <h3 className="text-sm font-semibold text-slate-100">Host Platform & Architecture</h3>
+              <p className="text-xs text-slate-400">Target execution environment and hardware virtualization status</p>
+            </div>
+          </div>
+          <span className="px-2.5 py-1 rounded text-[11px] font-mono font-semibold bg-indigo-950/60 border border-indigo-800 text-indigo-300">
+            {platformInfo?.target_triple || (isMac ? 'macos-aarch64' : 'windows-x86_64')}
+          </span>
+        </div>
+
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-3 text-xs">
+          <div className="p-3 bg-surface-850 rounded-lg border border-surface-750 space-y-1">
+            <span className="text-slate-400">Operating System:</span>
+            <div className="font-semibold text-slate-200 uppercase font-mono">
+              {platformInfo?.os || (isMac ? 'macOS' : 'Windows')}
+            </div>
+          </div>
+          <div className="p-3 bg-surface-850 rounded-lg border border-surface-750 space-y-1">
+            <span className="text-slate-400">CPU Architecture:</span>
+            <div className="font-semibold text-slate-200 font-mono">
+              {platformInfo?.arch || (isMac ? 'ARM64 (Apple Silicon)' : 'x86_64 (Intel/AMD)')}
+            </div>
+          </div>
+          <div className="p-3 bg-surface-850 rounded-lg border border-surface-750 space-y-1">
+            <span className="text-slate-400">Security Privileges:</span>
+            <div className="font-semibold text-emerald-400 font-mono">
+              {platformInfo?.permissions_status || 'VERIFIED_ACTIVE'}
+            </div>
+          </div>
+        </div>
+
+        {platformInfo?.supported_capabilities && platformInfo.supported_capabilities.length > 0 && (
+          <div className="pt-2 border-t border-surface-800">
+            <span className="text-[11px] text-slate-400 font-medium block mb-2">Supported Hypervisor & Security Capabilities:</span>
+            <div className="flex flex-wrap gap-1.5">
+              {platformInfo.supported_capabilities.map((cap, idx) => (
+                <span key={idx} className="px-2 py-0.5 bg-surface-850 text-slate-300 border border-surface-750 rounded text-[10px] font-mono">
+                  ✓ {cap}
+                </span>
+              ))}
+            </div>
+          </div>
+        )}
+      </div>
+
       {/* Hypervisor Settings & Discovery */}
       <div className="bg-surface-900 border border-surface-800 rounded-xl p-5 space-y-4 shadow-sm">
         <div className="flex items-center justify-between border-b border-surface-800 pb-3">
           <div className="flex items-center gap-2.5">
             <HardDrive className="w-5 h-5 text-blue-400" />
             <div>
-              <h3 className="text-sm font-semibold text-slate-100">VirtualBox Hypervisor Integration</h3>
-              <p className="text-xs text-slate-400">Windows VBoxManage CLI adapter status & path</p>
+              <h3 className="text-sm font-semibold text-slate-100">
+                {hypervisorInfo?.name.includes('VirtualBox')
+                  ? 'VirtualBox Hypervisor Integration'
+                  : hypervisorDisplayName.includes('Integration')
+                  ? hypervisorDisplayName
+                  : `${hypervisorDisplayName} Hypervisor Integration`}
+              </h3>
+              <p className="text-xs text-slate-400">
+                {isMac ? 'macOS UTM / Apple Virtualization CLI adapter status & path' : 'Windows Hyper-V / PowerShell adapter status & path'}
+              </p>
             </div>
           </div>
           <button
@@ -81,10 +146,10 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
           <div className="p-3 bg-surface-850 rounded-lg border border-surface-750 space-y-1">
             <span className="text-slate-400">Executable Location:</span>
             <div className="font-mono text-slate-200 truncate">
-              {hypervisorInfo?.executable_path || 'Not detected on PATH or standard directory'}
+              {hypervisorInfo?.executable_path || (isMac ? '/Applications/UTM.app/Contents/MacOS/utmctl' : 'Hyper-V WMI / PowerShell')}
             </div>
             <div className="text-[11px] text-emerald-400 font-medium">
-              {hypervisorInfo?.available ? '✓ System integration active' : '⚠ Fallback mock adapter active'}
+              {hypervisorInfo?.available ? '✓ System integration active' : '⚠ Hypervisor not detected or requires installation'}
             </div>
           </div>
         </div>
@@ -106,13 +171,15 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
         )}
       </div>
 
-      {/* Security & Windows DPAPI Vault */}
+      {/* Security & Hardware-bound Vault */}
       <div className="bg-surface-900 border border-surface-800 rounded-xl p-5 space-y-4 shadow-sm">
         <div className="flex items-center justify-between border-b border-surface-800 pb-3">
           <div className="flex items-center gap-2.5">
             <KeyRound className="w-5 h-5 text-emerald-400" />
             <div>
-              <h3 className="text-sm font-semibold text-slate-100">Encrypted Secret Vault (Windows DPAPI)</h3>
+              <h3 className="text-sm font-semibold text-slate-100">
+                Encrypted Secret Vault ({vaultDisplayName})
+              </h3>
               <p className="text-xs text-slate-400">Hardware-bound user master key encryption at rest</p>
             </div>
           </div>
@@ -129,11 +196,15 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
         <div className="p-4 bg-surface-850 rounded-lg border border-surface-750 space-y-2 text-xs">
           <div className="flex items-center justify-between">
             <span className="text-slate-300 font-medium">Cryptographic Provider:</span>
-            <span className="font-mono text-slate-200">Win32 CryptProtectData / CryptUnprotectData</span>
+            <span className="font-mono text-slate-200">
+              {isMac ? 'Apple Keychain Services (SecItem / login.keychain)' : 'Win32 CryptProtectData / CryptUnprotectData'}
+            </span>
           </div>
           <div className="flex items-center justify-between">
             <span className="text-slate-300 font-medium">Credential Protection Scope:</span>
-            <span className="font-mono text-slate-200">Current Windows User Account (TPM/LSA Sealing)</span>
+            <span className="font-mono text-slate-200">
+              {isMac ? 'macOS User Keychain (Apple Secure Enclave)' : 'Current Windows User Account (TPM/LSA Sealing)'}
+            </span>
           </div>
           <div className="flex items-center justify-between">
             <span className="text-slate-300 font-medium">Vault Integrity Status:</span>
@@ -141,7 +212,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
               <span className="text-slate-400 font-mono">Not Tested Yet (Click Run Cryptographic Test)</span>
             ) : vaultTestResult ? (
               <span className="text-emerald-400 font-mono font-semibold flex items-center gap-1">
-                <Check className="w-3.5 h-3.5" /> DPAPI Roundtrip Verified
+                <Check className="w-3.5 h-3.5" /> {vaultDisplayName} Roundtrip Verified
               </span>
             ) : (
               <span className="text-rose-400 font-mono font-semibold flex items-center gap-1">

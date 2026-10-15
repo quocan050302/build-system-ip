@@ -141,6 +141,28 @@ impl HypervisorAdapter for MockHypervisorAdapter {
         Ok(())
     }
 
+    fn open_vm_console(&self, _vm_identifier: &str) -> Result<(), HypervisorError> {
+        Ok(())
+    }
+
+    fn get_vm_details(&self, vm_identifier: &str) -> Result<VmDetails, HypervisorError> {
+        let state = self.get_vm_state(vm_identifier)?;
+        let map = self.vms.lock().unwrap();
+        let vm = map.get(vm_identifier).ok_or_else(|| HypervisorError::VmNotFound(vm_identifier.to_string()))?;
+
+        Ok(VmDetails {
+            identifier: vm_identifier.to_string(),
+            name: vm.spec.name.clone(),
+            state,
+            os_type: vm.spec.guest_os.clone(),
+            cpu_count: vm.spec.cpu_count,
+            memory_mb: vm.spec.memory_mb,
+            disk_path: Some(vm.spec.disk_path.clone()),
+            console_type: Some("mock-console".to_string()),
+            architecture: "x86_64".to_string(),
+        })
+    }
+
     fn get_system_resources(&self) -> Result<HostResources, HypervisorError> {
         Ok(HostResources {
             total_memory_mb: 32768,

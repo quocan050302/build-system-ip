@@ -76,9 +76,15 @@ export const OverviewView: React.FC<OverviewViewProps> = ({
           <div className="flex items-center gap-3">
             <AlertTriangle className="w-5 h-5 text-amber-400" />
             <div>
-              <h4 className="text-sm font-medium text-amber-200">VirtualBox Not Detected On Host</h4>
+              <h4 className="text-sm font-medium text-amber-200">
+                {hypervisorInfo.name.includes('UTM') || (typeof navigator !== 'undefined' && navigator.userAgent.toLowerCase().includes('mac'))
+                  ? 'UTM Virtual Machine Manager Not Detected On Host'
+                  : 'Microsoft Hyper-V Not Detected On Host'}
+              </h4>
               <p className="text-xs text-amber-400/80 mt-0.5">
-                Install VirtualBox 7.x or configure the custom executable path in Settings. Mock mode is active for UI testing.
+                {hypervisorInfo.name.includes('UTM') || (typeof navigator !== 'undefined' && navigator.userAgent.toLowerCase().includes('mac'))
+                  ? 'Install UTM at /Applications/UTM.app (or run brew install --cask utm) for native Apple Silicon virtualization.'
+                  : 'Ensure Windows Optional Feature "Microsoft-Hyper-V" is enabled and the VM Management Service (vmms) is running.'}
               </p>
             </div>
           </div>
@@ -86,7 +92,7 @@ export const OverviewView: React.FC<OverviewViewProps> = ({
             onClick={() => onNavigate('settings')}
             className="px-3 py-1.5 bg-amber-900/40 hover:bg-amber-800/40 text-amber-200 text-xs rounded-lg border border-amber-700/60"
           >
-            Configure Path
+            Review Setup
           </button>
         </div>
       )}

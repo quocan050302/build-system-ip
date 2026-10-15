@@ -183,10 +183,20 @@ export const NetworkView: React.FC<NetworkViewProps> = ({
                         </span>
                       </div>
 
+                      {env.network_endpoint_name && (
+                        <div className="flex items-center justify-between text-[11px] text-slate-400">
+                          <span>Target Gateway:</span>
+                          <span className="font-mono text-slate-300">
+                            {endpoints.find(e => e.id === env.network_endpoint_id || e.name === env.network_endpoint_name)?.host}:
+                            {endpoints.find(e => e.id === env.network_endpoint_id || e.name === env.network_endpoint_name)?.port}
+                          </span>
+                        </div>
+                      )}
+
                       <div className="flex items-center justify-between">
                         <span className="text-slate-400">Observed IPv4:</span>
                         <span className="font-mono text-emerald-400 font-semibold">
-                          {env.last_observed_ipv4 || 'Not Checked'}
+                          {env.last_observed_ipv4 || (env.network_endpoint_name ? 'Proxy Linked (Awaiting Traffic)' : 'Direct NAT')}
                         </span>
                       </div>
 
@@ -235,7 +245,7 @@ export const NetworkView: React.FC<NetworkViewProps> = ({
         <div className="px-5 py-4 border-b border-surface-800 bg-surface-850/40 flex items-center justify-between">
           <div>
             <h3 className="text-sm font-semibold text-slate-100">Registered Network Endpoints</h3>
-            <p className="text-xs text-slate-400">All credentials securely sealed via Windows DPAPI</p>
+            <p className="text-xs text-slate-400">All credentials securely sealed via native hardware vault</p>
           </div>
           <span className="text-xs font-mono text-slate-500">{endpoints.length} configured</span>
         </div>
@@ -280,7 +290,7 @@ export const NetworkView: React.FC<NetworkViewProps> = ({
                     <td className="py-3.5 px-4">
                       {ep.has_credentials ? (
                         <span className="inline-flex items-center gap-1 text-[11px] text-emerald-400 font-medium">
-                          <Lock className="w-3 h-3" /> Sealed in DPAPI
+                          <Lock className="w-3 h-3" /> Sealed in Vault
                         </span>
                       ) : (
                         <span className="text-[11px] text-slate-500">No Credentials</span>

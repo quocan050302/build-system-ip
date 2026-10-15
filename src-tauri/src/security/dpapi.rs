@@ -1,15 +1,6 @@
+use super::{SecretStore, SecurityError};
+#[allow(unused_imports)]
 use base64::prelude::*;
-use thiserror::Error;
-
-#[derive(Error, Debug)]
-pub enum SecurityError {
-    #[error("Encryption failed: {0}")]
-    EncryptionFailed(String),
-    #[error("Decryption failed: {0}")]
-    DecryptionFailed(String),
-    #[error("Invalid base64 payload")]
-    Base64Error(#[from] base64::DecodeError),
-}
 
 #[cfg(windows)]
 mod win_dpapi {
@@ -83,42 +74,90 @@ mod win_dpapi {
     }
 }
 
-#[cfg(not(windows))]
-mod fallback_cipher {
-    use super::*;
+pub struct WindowsDpapiSecretStore;
 
-    // Reversible obfuscation cipher solely for non-Windows testing / CI
-    pub fn encrypt_bytes(data: &[u8]) -> Result<Vec<u8>, SecurityError> {
-        let key = 0x5A;
-        Ok(data.iter().map(|b| b ^ key).collect())
-    }
-
-    pub fn decrypt_bytes(encrypted: &[u8]) -> Result<Vec<u8>, SecurityError> {
-        let key = 0x5A;
-        Ok(encrypted.iter().map(|b| b ^ key).collect())
+impl WindowsDpapiSecretStore {
+    pub fn new() -> Self {
+        Self
     }
 }
 
+impl SecretStore for WindowsDpapiSecretStore {
+    fn store_secret(&self, _key: &str, secret: &str) -> Result<String, SecurityError> {
+        #[cfg(windows)]
+        {
+            let encrypted = win_dpapi::encrypt_bytes(secret.as_bytes())?;
+            Ok(BASE64_STANDARD.encode(encrypted))
+        }
+
+        #[cfg(not(windows))]
+        {
+            let _ = secret;
+            Err(SecurityError::EncryptionFailed(
+                "Windows DPAPI is only supported on Windows hosts".to_string(),
+            ))
+        }
+    }
+
+    fn retrieve_secret(&self, reference: &str) -> Result<String, SecurityError> {
+        #[cfg(windows)]
+        {
+            let decoded = BASE64_STANDARD.decode(reference)?;
+            let decrypted = win_dpapi::decrypt_bytes(&decoded)?;
+            String::from_utf8(decrypted)
+                .map_err(|e| SecurityError::DecryptionFailed(e.to_string()))
+        }
+
+        #[cfg(not(windows))]
+        {
+            let _ = reference;
+            Err(SecurityError::DecryptionFailed(
+                "Windows DPAPI is only supported on Windows hosts".to_string(),
+            ))
+        }
+    }
+
+    fn delete_secret(&self, _reference: &str) -> Result<(), SecurityError> {
+        // DPAPI ciphertexts are self-contained; deletion from DB removes the ciphertext
+        Ok(())
+    }
+
+    fn test_vault(&self) -> Result<bool, SecurityError> {
+        #[cfg(windows)]
+        {
+            let test_val = "test-secret-youtube-isolation-2026";
+            let enc = self.store_secret("probe", test_val)?;
+            let dec = self.retrieve_secret(&enc)?;
+            Ok(dec == test_val)
+        }
+
+        #[cfg(not(windows))]
+        {
+            Ok(false)
+        }
+    }
+
+    fn provider_name(&self) -> &'static str {
+        "Windows DPAPI"
+    }
+}
+
+/// Backward-compatible vault facade that delegates to the active cross-platform SecretStore
 pub struct DpapiVault;
 
 impl DpapiVault {
     pub fn encrypt_secret(plaintext: &str) -> Result<String, SecurityError> {
-        #[cfg(windows)]
-        let encrypted = win_dpapi::encrypt_bytes(plaintext.as_bytes())?;
-        #[cfg(not(windows))]
-        let encrypted = fallback_cipher::encrypt_bytes(plaintext.as_bytes())?;
-
-        Ok(BASE64_STANDARD.encode(encrypted))
+        let store = super::get_secret_store();
+        store.store_secret("", plaintext)
     }
 
     pub fn decrypt_secret(ciphertext: &str) -> Result<String, SecurityError> {
-        let decoded = BASE64_STANDARD.decode(ciphertext)?;
-        #[cfg(windows)]
-        let decrypted = win_dpapi::decrypt_bytes(&decoded)?;
-        #[cfg(not(windows))]
-        let decrypted = fallback_cipher::decrypt_bytes(&decoded)?;
+        let store = super::get_secret_store();
+        store.retrieve_secret(ciphertext)
+    }
 
-        String::from_utf8(decrypted)
-            .map_err(|e| SecurityError::DecryptionFailed(e.to_string()))
+    pub fn test_vault() -> Result<bool, SecurityError> {
+        let store = super::get_secret_store();
+        store.test_vault()
     }
 }
