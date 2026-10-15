@@ -34,6 +34,7 @@ interface EnvironmentsViewProps {
   onShutdownEnvironment: (id: string, force: boolean) => Promise<void>;
   onDeleteEnvironment: (id: string, deleteDisks: boolean) => Promise<void>;
   onCheckNetwork: (id: string) => Promise<void>;
+  onLaunchBrowser: (id: string) => Promise<void>;
 }
 
 export const EnvironmentsView: React.FC<EnvironmentsViewProps> = ({
@@ -47,6 +48,7 @@ export const EnvironmentsView: React.FC<EnvironmentsViewProps> = ({
   onShutdownEnvironment,
   onDeleteEnvironment,
   onCheckNetwork,
+  onLaunchBrowser,
 }) => {
   const [searchTerm, setSearchTerm] = useState('');
   const [statusFilter, setStatusFilter] = useState('ALL');
@@ -277,6 +279,16 @@ export const EnvironmentsView: React.FC<EnvironmentsViewProps> = ({
                               <Play className="w-3.5 h-3.5" />
                             </button>
                           )}
+
+                          {/* Launch Isolated Browser */}
+                          <button
+                            onClick={() => handleAction(() => onLaunchBrowser(env.id), `launch-${env.id}`)}
+                            disabled={Boolean(isLoading)}
+                            title="🚀 Mở Trình duyệt Kênh (YouTube Studio)"
+                            className="px-2 py-1 bg-rose-950/50 hover:bg-rose-900/70 text-rose-300 border border-rose-800/80 rounded-md transition-colors flex items-center gap-1 font-medium text-[11px]"
+                          >
+                            <span>🚀 Studio</span>
+                          </button>
 
                           {/* Network Diagnostic Trigger */}
                           <button

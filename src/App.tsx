@@ -105,6 +105,10 @@ export const App: React.FC = () => {
     await loadData();
   };
 
+  const handleLaunchBrowser = async (environmentId: string) => {
+    await api.launchBrowserProfile(environmentId);
+  };
+
   // Channel Handlers
   const handleCreateChannel = async (req: CreateChannelRequest) => {
     await api.createChannel(req);
@@ -197,6 +201,7 @@ export const App: React.FC = () => {
                 onShutdownEnvironment={handleShutdownEnvironment}
                 onDeleteEnvironment={handleDeleteEnvironment}
                 onCheckNetwork={handleCheckNetwork}
+                onLaunchBrowser={handleLaunchBrowser}
               />
             )}
 
@@ -210,6 +215,7 @@ export const App: React.FC = () => {
                 onDeleteEndpoint={handleDeleteEndpoint}
                 onAssignEndpoint={handleAssignEndpoint}
                 onCheckNetwork={handleCheckNetwork}
+                onLaunchBrowser={handleLaunchBrowser}
               />
             )}
 

@@ -210,6 +210,13 @@ function mockHandler<T>(cmd: string, args?: Record<string, unknown>): Promise<T>
       return Promise.resolve(undefined as unknown as T);
     }
 
+    case 'launch_browser_profile': {
+      if (typeof window !== 'undefined') {
+        window.open('https://studio.youtube.com', '_blank');
+      }
+      return Promise.resolve('Opened YouTube Studio (mock)' as unknown as T);
+    }
+
     case 'list_network_endpoints':
       return Promise.resolve([...mockStore.endpoints] as unknown as T);
 
@@ -361,6 +368,7 @@ export const api = {
   startEnvironment: (id: string) => callTauri<void>('start_environment', { id }),
   shutdownEnvironment: (id: string, force: boolean) => callTauri<void>('shutdown_environment', { id, force }),
   deleteEnvironment: (id: string, deleteDisks: boolean) => callTauri<void>('delete_environment', { id, deleteDisks }),
+  launchBrowserProfile: (environmentId: string) => callTauri<string>('launch_browser_profile', { environmentId }),
 
   // Network
   listEndpoints: () => callTauri<NetworkEndpointRecord[]>('list_network_endpoints'),

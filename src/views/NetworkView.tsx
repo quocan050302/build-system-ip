@@ -27,6 +27,7 @@ interface NetworkViewProps {
   onDeleteEndpoint: (id: string) => Promise<void>;
   onAssignEndpoint: (environmentId: string, endpointId?: string | null) => Promise<void>;
   onCheckNetwork: (environmentId: string) => Promise<void>;
+  onLaunchBrowser: (environmentId: string) => Promise<void>;
 }
 
 export const NetworkView: React.FC<NetworkViewProps> = ({
@@ -38,10 +39,22 @@ export const NetworkView: React.FC<NetworkViewProps> = ({
   onDeleteEndpoint,
   onAssignEndpoint,
   onCheckNetwork,
+  onLaunchBrowser,
 }) => {
   const [isAddOpen, setIsAddOpen] = useState(false);
   const [selectedEndpointForDelete, setSelectedEndpointForDelete] = useState<NetworkEndpointRecord | null>(null);
   const [loadingKey, setLoadingKey] = useState<string | null>(null);
+
+  const handleLaunchBrowser = async (envId: string) => {
+    try {
+      setLoadingKey(`launch-${envId}`);
+      await onLaunchBrowser(envId);
+    } catch (err: any) {
+      alert(`Không thể mở trình duyệt: ${err?.message || err}`);
+    } finally {
+      setLoadingKey(null);
+    }
+  };
 
   // Form State
   const [name, setName] = useState('');
@@ -223,6 +236,15 @@ export const NetworkView: React.FC<NetworkViewProps> = ({
                       <span>{isChecking ? 'Testing...' : 'Verify'}</span>
                     </button>
                   </div>
+
+                  {/* Button: Mở Trình duyệt Kênh (YouTube Studio) */}
+                  <button
+                    onClick={() => handleLaunchBrowser(env.id)}
+                    disabled={loadingKey === `launch-${env.id}`}
+                    className="w-full mt-2.5 py-2 px-3 bg-gradient-to-r from-red-600 to-rose-600 hover:from-red-500 hover:to-rose-500 active:scale-[0.99] text-white rounded-lg text-xs font-semibold shadow-md shadow-rose-950/30 transition-all flex items-center justify-center gap-2"
+                  >
+                    <span>🚀 Mở Trình duyệt Kênh (YouTube Studio)</span>
+                  </button>
                 </div>
               );
             })

@@ -115,4 +115,112 @@ impl ProfileService {
         }
         Ok(())
     }
+
+    pub fn find_browser_executable(&self, preferred: &str) -> Option<PathBuf> {
+        let candidates = match preferred.to_lowercase().as_str() {
+            "brave" => vec![
+                PathBuf::from(r"C:\Program Files\BraveSoftware\Brave-Browser\Application\brave.exe"),
+                PathBuf::from(r"C:\Program Files (x86)\BraveSoftware\Brave-Browser\Application\brave.exe"),
+            ],
+            "firefox" => vec![
+                PathBuf::from(r"C:\Program Files\Mozilla Firefox\firefox.exe"),
+                PathBuf::from(r"C:\Program Files (x86)\Mozilla Firefox\firefox.exe"),
+            ],
+            _ => vec![
+                PathBuf::from(r"C:\Program Files\Google\Chrome\Application\chrome.exe"),
+                PathBuf::from(r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe"),
+            ],
+        };
+
+        for path in candidates {
+            if path.exists() {
+                return Some(path);
+            }
+        }
+
+        // Always check Microsoft Edge as universal Windows fallback
+        let edge_paths = vec![
+            PathBuf::from(r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe"),
+            PathBuf::from(r"C:\Program Files\Microsoft\Edge\Application\msedge.exe"),
+        ];
+        for path in edge_paths {
+            if path.exists() {
+                return Some(path);
+            }
+        }
+
+        // Try where.exe
+        if let Ok(output) = std::process::Command::new("where.exe").arg("chrome").output() {
+            if output.status.success() {
+                if let Some(line) = String::from_utf8_lossy(&output.stdout).lines().next() {
+                    let p = PathBuf::from(line.trim());
+                    if p.exists() {
+                        return Some(p);
+                    }
+                }
+            }
+        }
+
+        None
+    }
+
+    pub fn launch_isolated_browser(
+        &self,
+        environment_id: &str,
+    ) -> Result<String, String> {
+        let profile = match self.get_profile_by_environment(environment_id)? {
+            Some(p) => p,
+            None => self.create_profile(environment_id, "chrome")?,
+        };
+
+        let exe = self.find_browser_executable(&profile.browser_type)
+            .ok_or_else(|| "No supported browser (Chrome, Edge, Brave) found on system".to_string())?;
+
+        // Query proxy if configured
+        let proxy_arg: Option<String> = self.db.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT ne.type, ne.host, ne.port
+                 FROM environment_networks en
+                 JOIN network_endpoints ne ON ne.id = en.network_endpoint_id
+                 WHERE en.environment_id = ?1",
+            )?;
+
+            let mut rows = stmt.query(rusqlite::params![environment_id])?;
+            if let Some(row) = rows.next()? {
+                let proto: String = row.get(0)?;
+                let host: Option<String> = row.get(1)?;
+                let port: Option<u16> = row.get(2)?;
+                if let (Some(h), Some(p)) = (host, port) {
+                    let proto_str = match proto.to_uppercase().as_str() {
+                        "SOCKS5" => "socks5",
+                        _ => "http",
+                    };
+                    Ok(Some(format!("{}://{}:{}", proto_str, h, p)))
+                } else {
+                    Ok(None)
+                }
+            } else {
+                Ok(None)
+            }
+        }).unwrap_or(None);
+
+        let mut cmd = std::process::Command::new(&exe);
+        cmd.arg(format!("--user-data-dir={}", profile.profile_path));
+        cmd.arg("--no-first-run");
+        cmd.arg("--no-default-browser-check");
+
+        if let Some(ref proxy) = proxy_arg {
+            cmd.arg(format!("--proxy-server={}", proxy));
+        }
+
+        cmd.arg("https://studio.youtube.com");
+
+        cmd.spawn()
+            .map_err(|e| format!("Failed to spawn browser: {}", e))?;
+
+        Ok(format!(
+            "Successfully opened YouTube Studio in isolated profile ({})",
+            exe.file_name().unwrap_or_default().to_string_lossy()
+        ))
+    }
 }

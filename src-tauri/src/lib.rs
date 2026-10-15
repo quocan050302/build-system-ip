@@ -82,6 +82,7 @@ pub fn run() {
             commands::start_environment,
             commands::shutdown_environment,
             commands::delete_environment,
+            commands::launch_browser_profile,
             commands::create_network_endpoint,
             commands::list_network_endpoints,
             commands::delete_network_endpoint,

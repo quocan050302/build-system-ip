@@ -56,6 +56,11 @@ pub fn delete_environment(id: String, delete_disks: bool, state: State<AppState>
     state.vm_service.delete_environment(&id, delete_disks)
 }
 
+#[tauri::command]
+pub fn launch_browser_profile(environment_id: String, state: State<AppState>) -> Result<String, String> {
+    state.profile_service.launch_isolated_browser(&environment_id)
+}
+
 // --- Network Commands ---
 
 #[tauri::command]
