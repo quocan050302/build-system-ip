@@ -1,0 +1,27 @@
+# Node & Frontend
+node_modules/
+dist/
+dist-ssr/
+*.local
+
+# Rust & Tauri
+src-tauri/target/
+src-tauri/Cargo.lock
+
+# App Data & Local Databases
+app_data/
+*.db
+*.db-wal
+*.db-shm
+*.vdi
+
+# Editor & OS
+.vscode/
+.idea/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+.DS_Store
+Thumbs.db
