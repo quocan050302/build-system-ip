@@ -2,6 +2,9 @@
 setlocal enabledelayedexpansion
 title YouTube Isolation Manager
 
+:: Ensure current working directory is the project directory (critical for Run as Administrator)
+cd /d "%~dp0"
+
 echo ========================================================
 echo        YOUTUBE ISOLATION MANAGER - ONE-CLICK LAUNCH
 echo ========================================================

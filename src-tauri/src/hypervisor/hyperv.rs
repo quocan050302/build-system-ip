@@ -39,12 +39,23 @@ impl HyperVAdapter {
     fn check_hyperv_feature_enabled(&self) -> bool {
         #[cfg(windows)]
         {
-            let script = "Get-WindowsOptionalFeature -Online -FeatureName Microsoft-Hyper-V -ErrorAction SilentlyContinue | Select-Object -ExpandProperty State";
+            let script = "if ((Get-CimInstance Win32_ComputerSystem -ErrorAction SilentlyContinue).HypervisorPresent -or (Test-Path 'HKLM:\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Virtualization')) { 'Enabled' } else { 'Disabled' }";
             if let Ok(out) = self.run_powershell(script) {
                 return out.trim().eq_ignore_ascii_case("Enabled");
             }
         }
         false
+    }
+
+    fn check_hyperv_permission(&self) -> bool {
+        #[cfg(windows)]
+        {
+            let script = "try { Get-VM -ErrorAction Stop | Out-Null; 'OK' } catch { if ($_.CategoryInfo.Category -eq 'PermissionDenied' -or $_.Exception.Message -like '*permission*') { 'DENIED' } else { 'OK' } }";
+            if let Ok(out) = self.run_powershell(script) {
+                return out.trim() == "OK";
+            }
+        }
+        true
     }
 
     fn check_vmms_service_running(&self) -> bool {
@@ -76,8 +87,9 @@ impl HypervisorAdapter for HyperVAdapter {
         {
             let feature_enabled = self.check_hyperv_feature_enabled();
             let service_running = self.check_vmms_service_running();
+            let has_permission = self.check_hyperv_permission();
 
-            if feature_enabled && service_running {
+            if feature_enabled && service_running && has_permission {
                 // Query version
                 let version_script = "[System.Environment]::OSVersion.Version.ToString()";
                 let ver = self.run_powershell(version_script).unwrap_or_else(|_| "10.0".to_string()).trim().to_string();
@@ -91,13 +103,15 @@ impl HypervisorAdapter for HyperVAdapter {
             } else {
                 let reason = if !feature_enabled {
                     "Hyper-V optional feature is not enabled on this Windows edition. Enable via 'Enable-WindowsOptionalFeature -Online -FeatureName Microsoft-Hyper-V -All' in an Administrator PowerShell."
-                } else {
+                } else if !service_running {
                     "Hyper-V VM Management Service (vmms) is not running. Start via 'Start-Service vmms'."
+                } else {
+                    "Hyper-V is running, but requires Administrator rights or session refresh. Please run as Administrator or Sign Out & Sign Back In."
                 };
 
                 Ok(HypervisorInfo {
                     name: "Microsoft Hyper-V".to_string(),
-                    version: "Unavailable".to_string(),
+                    version: if !has_permission { "Permission Required".to_string() } else { "Unavailable".to_string() },
                     available: false,
                     executable_path: Some(reason.to_string()),
                 })

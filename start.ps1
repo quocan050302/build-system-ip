@@ -1,5 +1,6 @@
 # YouTube Isolation Manager - One-Click Launcher (PowerShell)
 $Host.UI.RawUI.WindowTitle = "YouTube Isolation Manager"
+Set-Location -Path $PSScriptRoot
 
 Write-Host "========================================================" -ForegroundColor Cyan
 Write-Host "       YOUTUBE ISOLATION MANAGER - ONE-CLICK LAUNCH" -ForegroundColor Cyan
