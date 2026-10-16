@@ -34,8 +34,23 @@ impl VirtualBoxAdapter {
             return Some(default_win_path);
         }
 
+        // Standard macOS installation directory
+        let mac_vbox = PathBuf::from("/Applications/VirtualBox.app/Contents/MacOS/VBoxManage");
+        if mac_vbox.exists() {
+            return Some(mac_vbox);
+        }
+        let mac_bin = PathBuf::from("/usr/local/bin/VBoxManage");
+        if mac_bin.exists() {
+            return Some(mac_bin);
+        }
+
         // Check PATH
-        if let Ok(output) = Command::new("where.exe").arg("VBoxManage").output() {
+        #[cfg(windows)]
+        let lookup_cmd = "where.exe";
+        #[cfg(not(windows))]
+        let lookup_cmd = "which";
+
+        if let Ok(output) = Command::new(lookup_cmd).arg("VBoxManage").output() {
             if output.status.success() {
                 let stdout = String::from_utf8_lossy(&output.stdout);
                 if let Some(first_line) = stdout.lines().next() {
@@ -295,51 +310,69 @@ impl HypervisorAdapter for VirtualBoxAdapter {
         Ok(())
     }
 
-    fn get_system_resources(&self) -> Result<HostResources, HypervisorError> {
-        #[cfg(windows)]
-        {
-            use std::mem::zeroed;
-            use windows::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
-            use windows::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
-            use windows::core::HSTRING;
+    fn open_vm_console(&self, vm_identifier: &str) -> Result<(), HypervisorError> {
+        let exe = self.find_executable().ok_or_else(|| {
+            HypervisorError::NotFound("VirtualBox VBoxManage executable not found".to_string())
+        })?;
 
-            unsafe {
-                let mut mem: MEMORYSTATUSEX = zeroed();
-                mem.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
-                let _ = GlobalMemoryStatusEx(&mut mem);
+        // Launch GUI for VM
+        Command::new(exe)
+            .args(["startvm", vm_identifier, "--type", "gui"])
+            .spawn()
+            .map_err(|e| HypervisorError::ExecutionFailed(format!("Failed to open VirtualBox console: {}", e)))?;
 
-                let total_mem = mem.ullTotalPhys / (1024 * 1024);
-                let avail_mem = mem.ullAvailPhys / (1024 * 1024);
+        Ok(())
+    }
 
-                let mut free_bytes_avail = 0u64;
-                let mut total_bytes = 0u64;
-                let mut total_free = 0u64;
+    fn get_vm_details(&self, vm_identifier: &str) -> Result<VmDetails, HypervisorError> {
+        let state = self.get_vm_state(vm_identifier)?;
+        let output = self.run_vbox_cmd(&["showvminfo", vm_identifier, "--machinereadable"])?;
 
-                let c_drive = HSTRING::from("C:\\");
-                let _ = GetDiskFreeSpaceExW(
-                    &c_drive,
-                    Some(&mut free_bytes_avail),
-                    Some(&mut total_bytes),
-                    Some(&mut total_free),
-                );
+        let mut name = vm_identifier.to_string();
+        let mut os_type = "Unknown".to_string();
+        let mut cpu_count = 2u32;
+        let mut memory_mb = 2048u64;
 
-                Ok(HostResources {
-                    total_memory_mb: total_mem,
-                    available_memory_mb: avail_mem,
-                    total_disk_mb: total_bytes / (1024 * 1024),
-                    available_disk_mb: free_bytes_avail / (1024 * 1024),
-                })
+        for line in output.lines() {
+            if line.starts_with("name=") {
+                name = line.trim_start_matches("name=").trim_matches('"').to_string();
+            } else if line.starts_with("Ostype=") {
+                os_type = line.trim_start_matches("Ostype=").trim_matches('"').to_string();
+            } else if line.starts_with("cpus=") {
+                if let Ok(c) = line.trim_start_matches("cpus=").trim_matches('"').parse::<u32>() {
+                    cpu_count = c;
+                }
+            } else if line.starts_with("memory=") {
+                if let Ok(m) = line.trim_start_matches("memory=").trim_matches('"').parse::<u64>() {
+                    memory_mb = m;
+                }
             }
         }
 
-        #[cfg(not(windows))]
-        {
-            Ok(HostResources {
-                total_memory_mb: 16384,
-                available_memory_mb: 8192,
-                total_disk_mb: 512000,
-                available_disk_mb: 256000,
-            })
-        }
+        Ok(VmDetails {
+            identifier: vm_identifier.to_string(),
+            name,
+            state,
+            os_type,
+            cpu_count,
+            memory_mb,
+            disk_path: None,
+            console_type: Some("vbox-gui".to_string()),
+            architecture: "x86_64".to_string(),
+        })
+    }
+
+    fn get_system_resources(&self) -> Result<HostResources, HypervisorError> {
+        let platform_svc = crate::services::platform_service::PlatformService::new(
+            crate::services::platform_service::PlatformService::resolve_default_data_dir()
+        );
+        let (total_mem, avail_mem, total_disk, avail_disk) = platform_svc.query_system_resources();
+
+        Ok(HostResources {
+            total_memory_mb: total_mem,
+            available_memory_mb: avail_mem,
+            total_disk_mb: total_disk,
+            available_disk_mb: avail_disk,
+        })
     }
 }

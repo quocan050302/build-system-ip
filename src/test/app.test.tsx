@@ -49,7 +49,7 @@ describe('YouTube Isolation Manager Desktop UI', () => {
     fireEvent.click(screen.getByRole('button', { name: /settings/i }));
     await waitFor(() => {
       expect(screen.getByText('Application Settings')).toBeInTheDocument();
-      expect(screen.getByText('VirtualBox Hypervisor Integration')).toBeInTheDocument();
+      expect(screen.getByText(/Integration/i)).toBeInTheDocument();
     });
   });
 
@@ -84,12 +84,12 @@ describe('YouTube Isolation Manager Desktop UI', () => {
     });
   });
 
-  it('displays DPAPI vault test tool in Settings screen', async () => {
+  it('displays native secret vault test tool in Settings screen', async () => {
     render(<App />);
 
     fireEvent.click(screen.getByRole('button', { name: /settings/i }));
     await waitFor(() => {
-      expect(screen.getByText('Encrypted Secret Vault (Windows DPAPI)')).toBeInTheDocument();
+      expect(screen.getByText(/Encrypted Secret Vault/i)).toBeInTheDocument();
       expect(screen.getByText('Run Cryptographic Test')).toBeInTheDocument();
     });
   });

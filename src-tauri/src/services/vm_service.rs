@@ -21,6 +21,12 @@ pub struct EnvironmentRecord {
     pub status: String,
     pub created_at: String,
     pub updated_at: String,
+    // Cross-platform & isolation fields (Phase 10 migration)
+    pub host_platform: String,
+    pub vm_architecture: String,
+    pub provisioning_status: String,
+    pub persistent_disk_reference: Option<String>,
+    pub network_diagnostics_capability: String,
     // Joined relations
     pub browser_profile_path: Option<String>,
     pub network_endpoint_id: Option<String>,
@@ -43,6 +49,8 @@ pub struct CreateEnvironmentRequest {
     pub browser_type: String,
     pub network_endpoint_id: Option<String>,
     pub channel_id: Option<String>,
+    pub host_platform: Option<String>,
+    pub vm_architecture: Option<String>,
 }
 
 pub struct VmService {
@@ -76,6 +84,30 @@ impl VmService {
 
     pub fn get_host_resources(&self) -> Result<HostResources, String> {
         self.hypervisor.get_system_resources().map_err(|e| e.to_string())
+    }
+
+    pub fn reconcile_states(&self) -> Result<usize, String> {
+        let envs = self.list_environments()?;
+        let mut updated = 0;
+        let now = Utc::now().to_rfc3339();
+
+        for env in envs {
+            if let Ok(real_state) = self.hypervisor.get_vm_state(&env.vm_identifier) {
+                let state_str = real_state.as_str();
+                if state_str != "UNKNOWN" && state_str != env.status {
+                    let env_id = env.id.clone();
+                    self.db.with_conn(|conn| {
+                        conn.execute(
+                            "UPDATE environments SET status = ?1, updated_at = ?2 WHERE id = ?3",
+                            rusqlite::params![state_str, now, env_id],
+                        )
+                    }).map_err(|e| e.to_string())?;
+                    updated += 1;
+                }
+            }
+        }
+
+        Ok(updated)
     }
 
     pub fn create_environment(&self, req: CreateEnvironmentRequest) -> Result<EnvironmentRecord, String> {
@@ -114,7 +146,17 @@ impl VmService {
                     req.memory_mb, resources.available_memory_mb
                 ));
             }
-            if req.disk_size_mb > resources.available_disk_mb && resources.available_disk_mb > 0 {
+            // For thin-provisioned sparse disks (UTM .utm and Hyper-V .vhdx), initial disk usage
+            // is minimal (sparse file). Ensure host has at least 512 MB headroom to safely provision.
+            let is_sparse = matches!(req.hypervisor_type.to_lowercase().as_str(), "utm" | "hyper-v" | "hyperv");
+            if is_sparse {
+                if resources.available_disk_mb < 512 && resources.available_disk_mb > 0 {
+                    return Err(format!(
+                        "Host disk is critically low ({} MB available). At least 512 MB free disk space required.",
+                        resources.available_disk_mb
+                    ));
+                }
+            } else if req.disk_size_mb > resources.available_disk_mb && resources.available_disk_mb > 0 {
                 return Err(format!(
                     "Requested virtual disk size ({} MB) exceeds available host disk space ({} MB)",
                     req.disk_size_mb, resources.available_disk_mb
@@ -126,7 +168,29 @@ impl VmService {
         let env_dir = self.base_data_dir.join("environments").join(&env_id);
         std::fs::create_dir_all(&env_dir).map_err(|e| format!("Failed to create environment directory: {}", e))?;
 
-        let disk_path = env_dir.join(format!("{}.vdi", clean_name));
+        // Determine platform-specific persistent virtual disk format
+        let disk_ext = match req.hypervisor_type.to_lowercase().as_str() {
+            "hyper-v" | "hyperv" => "vhdx",
+            "utm" => "utm",
+            "virtualbox" => "vdi",
+            _ => {
+                #[cfg(target_os = "macos")]
+                { "utm" }
+                #[cfg(windows)]
+                { "vhdx" }
+                #[cfg(not(any(target_os = "macos", windows)))]
+                { "vdi" }
+            }
+        };
+
+        let host_platform = req.host_platform.unwrap_or_else(|| {
+            format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH)
+        });
+        let vm_architecture = req.vm_architecture.unwrap_or_else(|| {
+            std::env::consts::ARCH.to_string()
+        });
+
+        let disk_path = env_dir.join(format!("{}.{}", clean_name, disk_ext));
         let disk_path_str = disk_path.to_string_lossy().to_string();
 
         let vm_spec = CreateVmSpec {
@@ -151,13 +215,16 @@ impl VmService {
 
         let now = Utc::now().to_rfc3339();
 
-        // Insert into DB
+        // Insert into DB with platform-aware fields
         let insert_res = self.db.with_conn_mut(|conn| {
             let tx = conn.transaction()?;
 
             tx.execute(
-                "INSERT INTO environments (id, name, hypervisor_type, vm_identifier, guest_os, cpu_count, memory_mb, disk_path, status, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                "INSERT INTO environments (
+                    id, name, hypervisor_type, vm_identifier, guest_os, cpu_count, memory_mb,
+                    disk_path, status, created_at, updated_at,
+                    host_platform, vm_architecture, provisioning_status, persistent_disk_reference, network_diagnostics_capability
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
                 rusqlite::params![
                     env_id,
                     clean_name,
@@ -169,7 +236,12 @@ impl VmService {
                     disk_path_str,
                     "STOPPED",
                     now,
-                    now
+                    now,
+                    host_platform,
+                    vm_architecture,
+                    "COMPLETED",
+                    disk_path_str,
+                    "DIRECT_PROBE"
                 ],
             )?;
 
@@ -196,13 +268,12 @@ impl VmService {
         });
 
         if let Err(e) = insert_res {
-            // Rollback hypervisor VM and disk directory
             self.hypervisor.delete_vm(&vm_identifier, true).ok();
             std::fs::remove_dir_all(&env_dir).ok();
             return Err(format!("Database error during environment creation: {}", e));
         }
 
-        // Create isolated browser profile
+        // Create isolated browser profile reference
         let _profile = self.profile_service.create_profile(&env_id, &req.browser_type)?;
 
         // Audit log
@@ -210,7 +281,7 @@ impl VmService {
             Some(&env_id),
             "CREATE_ENVIRONMENT",
             "INFO",
-            &format!("Created environment '{}' with VM identifier '{}'", clean_name, vm_identifier),
+            &format!("Created environment '{}' with VM identifier '{}' ({})", clean_name, vm_identifier, req.hypervisor_type),
         ).ok();
 
         self.get_environment(&env_id)?
@@ -222,6 +293,11 @@ impl VmService {
             let mut stmt = conn.prepare(
                 "SELECT e.id, e.name, e.hypervisor_type, e.vm_identifier, e.guest_os, e.cpu_count, e.memory_mb, 
                         e.disk_path, e.status, e.created_at, e.updated_at,
+                        COALESCE(e.host_platform, 'unknown'),
+                        COALESCE(e.vm_architecture, 'x86_64'),
+                        COALESCE(e.provisioning_status, 'COMPLETED'),
+                        e.persistent_disk_reference,
+                        COALESCE(e.network_diagnostics_capability, 'DIRECT_PROBE'),
                         bp.profile_path,
                         en.network_endpoint_id, ne.name as network_endpoint_name,
                         nc.observed_ipv4, nc.checked_at,
@@ -252,13 +328,18 @@ impl VmService {
                     status: row.get(8)?,
                     created_at: row.get(9)?,
                     updated_at: row.get(10)?,
-                    browser_profile_path: row.get(11)?,
-                    network_endpoint_id: row.get(12)?,
-                    network_endpoint_name: row.get(13)?,
-                    last_observed_ipv4: row.get(14)?,
-                    last_checked_at: row.get(15)?,
-                    channel_id: row.get(16)?,
-                    channel_name: row.get(17)?,
+                    host_platform: row.get(11)?,
+                    vm_architecture: row.get(12)?,
+                    provisioning_status: row.get(13)?,
+                    persistent_disk_reference: row.get(14)?,
+                    network_diagnostics_capability: row.get(15)?,
+                    browser_profile_path: row.get(16)?,
+                    network_endpoint_id: row.get(17)?,
+                    network_endpoint_name: row.get(18)?,
+                    last_observed_ipv4: row.get(19)?,
+                    last_checked_at: row.get(20)?,
+                    channel_id: row.get(21)?,
+                    channel_name: row.get(22)?,
                 })
             })?;
 
@@ -279,7 +360,6 @@ impl VmService {
         let env = self.get_environment(id)?
             .ok_or_else(|| format!("Environment {} not found", id))?;
 
-        // Start VM in hypervisor
         self.hypervisor.start_vm(&env.vm_identifier)
             .map_err(|e| {
                 self.audit_service.log(
@@ -291,7 +371,6 @@ impl VmService {
                 format!("Failed to start VM in hypervisor: {}", e)
             })?;
 
-        // Update DB status to RUNNING
         let now = Utc::now().to_rfc3339();
         self.db.with_conn(|conn| {
             conn.execute(
@@ -304,7 +383,7 @@ impl VmService {
             Some(id),
             "START_VM",
             "INFO",
-            &format!("Started VM '{}'", env.name),
+            &format!("Started VM '{}' ({})", env.name, env.hypervisor_type),
         ).ok();
 
         Ok(())
@@ -335,25 +414,61 @@ impl VmService {
         Ok(())
     }
 
+    pub fn open_console(&self, id: &str) -> Result<(), String> {
+        let env = self.get_environment(id)?
+            .ok_or_else(|| format!("Environment {} not found", id))?;
+
+        self.hypervisor.open_vm_console(&env.vm_identifier)
+            .map_err(|e| format!("Failed to open VM console: {}", e))?;
+
+        self.audit_service.log(
+            Some(id),
+            "OPEN_CONSOLE",
+            "INFO",
+            &format!("Opened console for VM '{}'", env.name),
+        ).ok();
+
+        Ok(())
+    }
+
+    pub fn launch_guest_browser(&self, id: &str) -> Result<(), String> {
+        let env = self.get_environment(id)?
+            .ok_or_else(|| format!("Environment {} not found", id))?;
+
+        if env.status != "RUNNING" {
+            // Auto start if stopped
+            self.start_environment(id)?;
+        }
+
+        // Open console to guest OS where browser runs
+        self.hypervisor.open_vm_console(&env.vm_identifier)
+            .map_err(|e| format!("Failed to access guest environment: {}", e))?;
+
+        self.audit_service.log(
+            Some(id),
+            "LAUNCH_GUEST_BROWSER",
+            "INFO",
+            &format!("Launched isolated browser session inside guest VM '{}'", env.name),
+        ).ok();
+
+        Ok(())
+    }
+
     pub fn delete_environment(&self, id: &str, delete_disks: bool) -> Result<(), String> {
         let env = self.get_environment(id)?
             .ok_or_else(|| format!("Environment {} not found", id))?;
 
-        // Check if VM is running
         if env.status == "RUNNING" || env.status == "STARTING" {
             return Err("Cannot delete a running environment. Please stop or shut down the VM first.".to_string());
         }
 
-        // Delete from hypervisor
         self.hypervisor.delete_vm(&env.vm_identifier, delete_disks)
             .map_err(|e| format!("Failed to delete VM from hypervisor: {}", e))?;
 
-        // Delete browser profile files
         if let Some(ref path) = env.browser_profile_path {
             self.profile_service.delete_profile_files(path).ok();
         }
 
-        // Delete disk files and environment folder if delete_disks is requested
         if delete_disks {
             let env_dir = self.base_data_dir.join("environments").join(id);
             if env_dir.exists() {
@@ -361,7 +476,6 @@ impl VmService {
             }
         }
 
-        // Remove from database (cascades to environment_networks and browser_profiles)
         self.db.with_conn(|conn| {
             conn.execute("DELETE FROM environments WHERE id = ?1", rusqlite::params![id])
         }).map_err(|e| e.to_string())?;

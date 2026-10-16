@@ -18,10 +18,29 @@ export type NetworkStatus =
   | 'NOT_CONFIGURED' 
   | 'NOT_CHECKED' 
   | 'CHECKING' 
+  | 'ENDPOINT_CONFIGURED'
+  | 'ENDPOINT_REACHABLE'
+  | 'GUEST_EGRESS_OBSERVED'
   | 'VERIFIED' 
   | 'DEGRADED' 
   | 'DISCONNECTED' 
+  | 'CONNECTION_FAILED'
   | 'ERROR';
+
+export interface PlatformInfo {
+  os: string;
+  arch: string;
+  target_triple: string;
+  is_supported: boolean;
+  total_memory_mb: number;
+  available_memory_mb: number;
+  total_disk_mb: number;
+  available_disk_mb: number;
+  installed_hypervisors: string[];
+  supported_capabilities: string[];
+  permissions_status: string;
+  app_data_dir: string;
+}
 
 export interface EnvironmentRecord {
   id: string;
@@ -35,6 +54,13 @@ export interface EnvironmentRecord {
   status: string;
   created_at: string;
   updated_at: string;
+  // Platform & isolation metadata
+  host_platform?: string;
+  vm_architecture?: string;
+  provisioning_status?: string;
+  persistent_disk_reference?: string | null;
+  network_diagnostics_capability?: string;
+  // Relations
   browser_profile_path?: string | null;
   network_endpoint_id?: string | null;
   network_endpoint_name?: string | null;
@@ -55,6 +81,8 @@ export interface CreateEnvironmentRequest {
   browser_type: string;
   network_endpoint_id?: string | null;
   channel_id?: string | null;
+  host_platform?: string | null;
+  vm_architecture?: string | null;
 }
 
 export interface NetworkEndpointRecord {
@@ -89,6 +117,7 @@ export interface NetworkCheckRecord {
   status: string;
   error_message?: string | null;
   checked_at: string;
+  latency_ms?: number | null;
 }
 
 export interface DuplicateEgressWarning {

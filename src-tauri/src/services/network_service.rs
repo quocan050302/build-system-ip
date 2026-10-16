@@ -1,10 +1,12 @@
 use crate::db::Database;
 use crate::hypervisor::HypervisorAdapter;
-use crate::security::dpapi::DpapiVault;
+use crate::security::{get_secret_store, SecretStore};
 use crate::services::audit_service::AuditService;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
+use std::net::{TcpStream, ToSocketAddrs};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -38,10 +40,11 @@ pub struct NetworkCheckRecord {
     pub observed_ipv4: Option<String>,
     pub observed_ipv6: Option<String>,
     pub dns_summary: Option<String>,
-    pub check_source: String, // "GUEST_AGENT", "HOST_SIMULATION", "DIRECT_PROBE"
-    pub status: String,       // "VERIFIED", "DEGRADED", "ERROR", "NOT_CHECKED"
+    pub check_source: String, // "GUEST_AGENT", "HOST_PROBE", "DIRECT_PROBE", "TEST_FIXTURE"
+    pub status: String,       // "ENDPOINT_CONFIGURED", "ENDPOINT_REACHABLE", "GUEST_EGRESS_OBSERVED", "CONNECTION_FAILED", "VERIFICATION_UNAVAILABLE", "NOT_CHECKED"
     pub error_message: Option<String>,
     pub checked_at: String,
+    pub latency_ms: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -69,6 +72,7 @@ fn detect_host_public_ip() -> String {
 pub struct NetworkService {
     db: Database,
     hypervisor: Arc<dyn HypervisorAdapter>,
+    secret_store: Arc<dyn SecretStore>,
     audit_service: Arc<AuditService>,
 }
 
@@ -81,6 +85,21 @@ impl NetworkService {
         Self {
             db,
             hypervisor,
+            secret_store: get_secret_store(),
+            audit_service,
+        }
+    }
+
+    pub fn with_secret_store(
+        db: Database,
+        hypervisor: Arc<dyn HypervisorAdapter>,
+        secret_store: Arc<dyn SecretStore>,
+        audit_service: Arc<AuditService>,
+    ) -> Self {
+        Self {
+            db,
+            hypervisor,
+            secret_store,
             audit_service,
         }
     }
@@ -94,10 +113,10 @@ impl NetworkService {
         let id = Uuid::new_v4().to_string();
         let now = Utc::now().to_rfc3339();
 
-        // Encrypt credentials with Windows DPAPI if provided
+        // Encrypt credentials via cross-platform SecretStore
         let encrypted_secret = if let Some(ref creds) = req.credentials_secret {
             if !creds.is_empty() {
-                Some(DpapiVault::encrypt_secret(creds).map_err(|e| format!("DPAPI encryption error: {}", e))?)
+                Some(self.secret_store.store_secret(&id, creds).map_err(|e| format!("Secret store error: {}", e))?)
             } else {
                 None
             }
@@ -130,7 +149,7 @@ impl NetworkService {
             None,
             "CREATE_NETWORK_ENDPOINT",
             "INFO",
-            &format!("Created network endpoint '{}' ({})", clean_name, req.endpoint_type),
+            &format!("Created network endpoint '{}' ({}) via {}", clean_name, req.endpoint_type, self.secret_store.provider_name()),
         ).ok();
 
         Ok(NetworkEndpointRecord {
@@ -179,6 +198,21 @@ impl NetworkService {
     }
 
     pub fn delete_endpoint(&self, id: &str) -> Result<(), String> {
+        // Remove secret from vault if present
+        let secret_ref: Option<String> = self.db.with_conn(|conn| {
+            let mut stmt = conn.prepare("SELECT encrypted_secret_reference FROM network_endpoints WHERE id = ?1")?;
+            let mut rows = stmt.query(rusqlite::params![id])?;
+            if let Some(r) = rows.next()? {
+                Ok(r.get(0)?)
+            } else {
+                Ok(None)
+            }
+        }).unwrap_or(None);
+
+        if let Some(ref sref) = secret_ref {
+            self.secret_store.delete_secret(sref).ok();
+        }
+
         self.db.with_conn(|conn| {
             conn.execute("DELETE FROM network_endpoints WHERE id = ?1", rusqlite::params![id])
         }).map_err(|e| e.to_string())?;
@@ -202,13 +236,11 @@ impl NetworkService {
 
         self.db.with_conn_mut(|conn| {
             let tx = conn.transaction()?;
-            // Remove existing assignment
             tx.execute(
                 "DELETE FROM environment_networks WHERE environment_id = ?1",
                 rusqlite::params![environment_id],
             )?;
 
-            // If new endpoint specified, link it
             if let Some(ep_id) = endpoint_id {
                 let link_id = Uuid::new_v4().to_string();
                 tx.execute(
@@ -232,11 +264,95 @@ impl NetworkService {
         Ok(())
     }
 
+    fn probe_http_proxy_egress(host: &str, port: u16, creds: Option<&str>, timeout: Duration) -> Result<(String, u32), String> {
+        use std::io::{Read, Write};
+        use base64::Engine;
+        let start = Instant::now();
+        let target_str = format!("{}:{}", host, port);
+        let addrs: Vec<_> = target_str
+            .to_socket_addrs()
+            .map_err(|e| format!("DNS lookup failed for {}:{}: {}", host, port, e))?
+            .collect();
+
+        let sock_addr = addrs.first().ok_or_else(|| format!("Could not resolve address for {}", host))?;
+        let mut stream = TcpStream::connect_timeout(sock_addr, timeout)
+            .map_err(|e| format!("Connection to proxy {}:{} timed out / refused: {}", host, port, e))?;
+
+        stream.set_read_timeout(Some(timeout)).ok();
+        stream.set_write_timeout(Some(timeout)).ok();
+
+        let mut auth_header = String::new();
+        if let Some(c) = creds {
+            if !c.trim().is_empty() {
+                let encoded = base64::engine::general_purpose::STANDARD.encode(c.trim());
+                auth_header = format!("Proxy-Authorization: Basic {}\r\n", encoded);
+            }
+        }
+
+        let req = format!(
+            "GET http://api.ipify.org/ HTTP/1.1\r\nHost: api.ipify.org\r\n{}User-Agent: curl/8.4.0\r\nConnection: close\r\n\r\n",
+            auth_header
+        );
+
+        stream.write_all(req.as_bytes()).map_err(|e| format!("Proxy write failed: {}", e))?;
+
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).map_err(|e| format!("Proxy read failed: {}", e))?;
+        let latency = start.elapsed().as_millis() as u32;
+
+        let resp_str = String::from_utf8_lossy(&response);
+        if resp_str.contains("407") {
+            return Err("Proxy Authentication Failed (HTTP 407): Sai tên đăng nhập hoặc mật khẩu proxy!".to_string());
+        }
+
+        if let Some(pos) = resp_str.find("\r\n\r\n") {
+            let body = resp_str[pos + 4..].trim().to_string();
+            if body.split('.').count() == 4 || body.contains(':') {
+                return Ok((body, latency));
+            }
+        }
+
+        Err("Proxy returned non-IP response".to_string())
+    }
+
+    fn probe_direct_egress(timeout: Duration) -> Result<(String, u32), String> {
+        use std::io::{Read, Write};
+        let start = Instant::now();
+        let addrs: Vec<_> = "api.ipify.org:80"
+            .to_socket_addrs()
+            .map_err(|e| format!("DNS lookup failed for api.ipify.org: {}", e))?
+            .collect();
+
+        let sock_addr = addrs.first().ok_or_else(|| "Could not resolve api.ipify.org".to_string())?;
+        let mut stream = TcpStream::connect_timeout(sock_addr, timeout)
+            .map_err(|e| format!("Connection to api.ipify.org failed: {}", e))?;
+
+        stream.set_read_timeout(Some(timeout)).ok();
+        stream.set_write_timeout(Some(timeout)).ok();
+
+        let req = "GET / HTTP/1.1\r\nHost: api.ipify.org\r\nUser-Agent: curl/8.4.0\r\nConnection: close\r\n\r\n";
+        stream.write_all(req.as_bytes()).map_err(|e| format!("Write failed: {}", e))?;
+
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).map_err(|e| format!("Read failed: {}", e))?;
+        let latency = start.elapsed().as_millis() as u32;
+
+        let resp_str = String::from_utf8_lossy(&response);
+        if let Some(pos) = resp_str.find("\r\n\r\n") {
+            let body = resp_str[pos + 4..].trim().to_string();
+            if body.split('.').count() == 4 || body.contains(':') {
+                return Ok((body, latency));
+            }
+        }
+
+        Err("Failed to resolve direct egress IP".to_string())
+    }
+
     pub fn check_network(&self, environment_id: &str) -> Result<NetworkCheckRecord, String> {
-        // Step 1: Check environment and VM status
+        // Step 1: Query environment, endpoint, and encrypted secret reference
         let env_info = self.db.with_conn(|conn| {
             let mut stmt = conn.prepare(
-                "SELECT e.name, e.vm_identifier, e.status, en.network_endpoint_id, ne.name, ne.host, ne.port
+                "SELECT e.name, e.vm_identifier, e.status, en.network_endpoint_id, ne.name, ne.host, ne.port, ne.type, ne.encrypted_secret_reference
                  FROM environments e
                  LEFT JOIN environment_networks en ON en.environment_id = e.id
                  LEFT JOIN network_endpoints ne ON ne.id = en.network_endpoint_id
@@ -253,110 +369,312 @@ impl NetworkService {
                     row.get::<_, Option<String>>(4)?,
                     row.get::<_, Option<String>>(5)?,
                     row.get::<_, Option<u16>>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                    row.get::<_, Option<String>>(8)?,
                 )))
             } else {
                 Ok(None)
             }
         }).map_err(|e| e.to_string())?;
 
-        let (env_name, vm_id, db_status, _ep_id, _ep_name, ep_host, _ep_port) = match env_info {
+        let (env_name, vm_id, db_status, _ep_id, ep_name, ep_host, ep_port, ep_type, ep_secret_ref) = match env_info {
             Some(info) => info,
             None => return Err(format!("Environment {} not found", environment_id)),
         };
 
-        // Query real VM state from hypervisor
-        let actual_vm_state = self.hypervisor.get_vm_state(&vm_id).unwrap_or(crate::hypervisor::VmState::Unknown);
+        let decrypted_secret = if let Some(ref sec_ref) = ep_secret_ref {
+            self.secret_store.retrieve_secret(sec_ref).ok()
+        } else {
+            None
+        };
 
+        let actual_vm_state = self.hypervisor.get_vm_state(&vm_id).unwrap_or(crate::hypervisor::VmState::Unknown);
         let now = Utc::now().to_rfc3339();
         let check_id = Uuid::new_v4().to_string();
 
-        // Strict truthfulness: If VM is not running, we CANNOT truthfully verify guest egress!
+        // Strict truthfulness requirement (Phase 8):
+        // If VM is not running, we CANNOT truthfully verify guest egress
         if actual_vm_state != crate::hypervisor::VmState::Running && db_status != "RUNNING" {
             let record = NetworkCheckRecord {
                 id: check_id.clone(),
                 environment_id: environment_id.to_string(),
                 observed_ipv4: None,
                 observed_ipv6: None,
-                dns_summary: None,
+                dns_summary: Some("DNS: Unreachable (guest VM stopped)".to_string()),
                 check_source: "GUEST_DIAGNOSTICS".to_string(),
                 status: "NOT_CHECKED".to_string(),
                 error_message: Some(format!(
-                    "Cannot verify network egress for '{}': VM is stopped. Truthful diagnostics require a running guest.",
+                    "Cannot verify network egress for '{}': VM is stopped. Diagnostics require a running guest OS.",
                     env_name
                 )),
                 checked_at: now.clone(),
+                latency_ms: None,
             };
 
             self.db.with_conn(|conn| {
                 conn.execute(
-                    "INSERT INTO network_checks (id, environment_id, observed_ipv4, observed_ipv6, dns_summary, check_source, status, checked_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-                    rusqlite::params![check_id, environment_id, None::<String>, None::<String>, "DNS: Not reachable (VM stopped)", "GUEST_DIAGNOSTICS", "NOT_CHECKED", now],
+                    "INSERT INTO network_checks (id, environment_id, observed_ipv4, observed_ipv6, dns_summary, check_source, status, checked_at, latency_ms, egress_stage)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                    rusqlite::params![
+                        check_id,
+                        environment_id,
+                        None::<String>,
+                        None::<String>,
+                        "DNS: Unreachable (guest VM stopped)",
+                        "GUEST_DIAGNOSTICS",
+                        "NOT_CHECKED",
+                        now,
+                        None::<u32>,
+                        "VM_STOPPED"
+                    ],
                 )
             }).map_err(|e| e.to_string())?;
 
             return Ok(record);
         }
+        // If VM is running:
+        // Distinguish: ENDPOINT_CONFIGURED, ENDPOINT_REACHABLE, GUEST_EGRESS_OBSERVED, CONNECTION_FAILED, VERIFICATION_UNAVAILABLE
+        if let Some(ref host) = ep_host {
+            let port = ep_port.unwrap_or(1080);
+            let target_addr = format!("{}:{}", host, port);
 
-        // If VM is running, determine egress based on assigned endpoint or guest probe
-        let (observed_ip, dns_info, check_status) = if let Some(ref host) = ep_host {
-            // Associated with a configured endpoint
-            (
-                host.clone(),
-                format!("DNS resolved via proxy endpoint: {} (latency: 34ms)", host),
-                "VERIFIED".to_string(),
-            )
+            let start = Instant::now();
+            let reachability_result = target_addr
+                .to_socket_addrs()
+                .ok()
+                .and_then(|mut addrs| addrs.next())
+                .map(|sock_addr| TcpStream::connect_timeout(&sock_addr, Duration::from_millis(2000)));
+
+            let latency = start.elapsed().as_millis() as u32;
+
+            match reachability_result {
+                Some(Ok(_)) => {
+                    // Try real HTTP proxy egress probe with decrypted credentials from SecretStore
+                    let is_http_proxy = ep_type.as_deref().unwrap_or("HTTP").eq_ignore_ascii_case("HTTP");
+                    let egress_probe_result = if is_http_proxy {
+                        Self::probe_http_proxy_egress(host, port, decrypted_secret.as_deref(), Duration::from_millis(4000))
+                    } else {
+                        Err("Egress probe currently supported for HTTP endpoints".to_string())
+                    };
+
+                    let (observed_ipv4, status, egress_stage, dns_info, error_message) = match egress_probe_result {
+                        Ok((real_ip, real_latency)) => {
+                            let note = format!("Proxy verified via {}:{} -> Observed Egress IP: {} ({}ms)", host, port, real_ip, real_latency);
+                            (Some(real_ip), "VERIFIED".to_string(), "VERIFIED".to_string(), note, None)
+                        }
+                        Err(ref err) if err.contains("407") => {
+                            (None, "CONNECTION_FAILED".to_string(), "AUTH_FAILED".to_string(), err.clone(), Some(err.clone()))
+                        }
+                        Err(ref err) => {
+                            let note = format!("Endpoint {}:{} TCP handshake succeeded ({}ms). Direct probe: {}", host, port, latency, err);
+                            (None, "ENDPOINT_REACHABLE".to_string(), "ENDPOINT_REACHABLE".to_string(), note, None)
+                        }
+                    };
+
+                    let record = NetworkCheckRecord {
+                        id: check_id.clone(),
+                        environment_id: environment_id.to_string(),
+                        observed_ipv4: observed_ipv4.clone(),
+                        observed_ipv6: None,
+                        dns_summary: Some(dns_info.clone()),
+                        check_source: "PROXY_PROBE".to_string(),
+                        status: status.clone(),
+                        error_message: error_message.clone(),
+                        checked_at: now.clone(),
+                        latency_ms: Some(latency),
+                    };
+
+                    self.db.with_conn(|conn| {
+                        conn.execute(
+                            "INSERT INTO network_checks (id, environment_id, observed_ipv4, observed_ipv6, dns_summary, check_source, status, checked_at, latency_ms, egress_stage)
+                             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                            rusqlite::params![
+                                check_id,
+                                environment_id,
+                                observed_ipv4,
+                                None::<String>,
+                                dns_info,
+                                "PROXY_PROBE",
+                                status,
+                                now,
+                                latency,
+                                egress_stage
+                            ],
+                        )?;
+
+                        conn.execute(
+                            "UPDATE environments SET updated_at = ?1 WHERE id = ?2",
+                            rusqlite::params![now, environment_id],
+                        )?;
+
+                        Ok(())
+                    }).map_err(|e| e.to_string())?;
+
+                    self.audit_service.log(
+                        Some(environment_id),
+                        "NETWORK_REACHABILITY_CHECK",
+                        "INFO",
+                        &format!("Endpoint '{:?}' ({}:{}) verified status: {}", ep_name, host, port, status),
+                    ).ok();
+
+                    Ok(record)
+                }
+                _ => {
+                    let err_msg = format!("TCP connection to configured endpoint {}:{} failed (timeout / unreachable)", host, port);
+                    let record = NetworkCheckRecord {
+                        id: check_id.clone(),
+                        environment_id: environment_id.to_string(),
+                        observed_ipv4: None,
+                        observed_ipv6: None,
+                        dns_summary: Some("Connection to proxy host failed".to_string()),
+                        check_source: "HOST_PROBE".to_string(),
+                        status: "CONNECTION_FAILED".to_string(),
+                        error_message: Some(err_msg.clone()),
+                        checked_at: now.clone(),
+                        latency_ms: None,
+                    };
+
+                    self.db.with_conn(|conn| {
+                        conn.execute(
+                            "INSERT INTO network_checks (id, environment_id, observed_ipv4, observed_ipv6, dns_summary, check_source, status, checked_at, latency_ms, egress_stage)
+                             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                            rusqlite::params![
+                                check_id,
+                                environment_id,
+                                None::<String>,
+                                None::<String>,
+                                "Connection failed",
+                                "HOST_PROBE",
+                                "CONNECTION_FAILED",
+                                now,
+                                None::<u32>,
+                                "FAILED"
+                            ],
+                        )?;
+
+                        conn.execute(
+                            "UPDATE environments SET updated_at = ?1 WHERE id = ?2",
+                            rusqlite::params![now, environment_id],
+                        )?;
+
+                        Ok(())
+                    }).map_err(|e| e.to_string())?;
+
+                    Ok(record)
+                }
+            }
         } else {
-            // Direct / default NAT egress: probe real public IP from host
-            let real_ip = detect_host_public_ip();
-            (
-                real_ip,
-                "DNS resolved via Local Gateway (VNPT / ISP)".to_string(),
-                "VERIFIED".to_string(),
-            )
-        };
+            // Direct / NAT network without a configured proxy endpoint
+            let direct_probe = Self::probe_direct_egress(Duration::from_millis(3000));
+            let (observed_ipv4, status, note, latency) = match direct_probe {
+                Ok((ip, lat)) => (Some(ip.clone()), "VERIFIED".to_string(), format!("Direct host NAT egress verified: {} ({}ms)", ip, lat), Some(lat)),
+                Err(_) => {
+                    let fallback_ip = detect_host_public_ip();
+                    if fallback_ip != "127.0.0.1" {
+                        (Some(fallback_ip.clone()), "VERIFIED".to_string(), format!("Direct host NAT egress verified: {}", fallback_ip), None)
+                    } else {
+                        (None, "ENDPOINT_CONFIGURED".to_string(), "Direct host NAT virtual network adapter attached".to_string(), None)
+                    }
+                }
+            };
 
-        // Record check in database
+            let record = NetworkCheckRecord {
+                id: check_id.clone(),
+                environment_id: environment_id.to_string(),
+                observed_ipv4: observed_ipv4.clone(),
+                observed_ipv6: None,
+                dns_summary: Some(note.clone()),
+                check_source: "DIRECT_PROBE".to_string(),
+                status: status.clone(),
+                error_message: None,
+                checked_at: now.clone(),
+                latency_ms: latency,
+            };
+
+            self.db.with_conn(|conn| {
+                conn.execute(
+                    "INSERT INTO network_checks (id, environment_id, observed_ipv4, observed_ipv6, dns_summary, check_source, status, checked_at, latency_ms, egress_stage)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                    rusqlite::params![
+                        check_id,
+                        environment_id,
+                        observed_ipv4,
+                        None::<String>,
+                        note,
+                        "DIRECT_PROBE",
+                        status,
+                        now,
+                        latency,
+                        "DIRECT"
+                    ],
+                )?;
+
+                conn.execute(
+                    "UPDATE environments SET updated_at = ?1 WHERE id = ?2",
+                    rusqlite::params![now, environment_id],
+                )?;
+
+                Ok(())
+            }).map_err(|e| e.to_string())?;
+
+            Ok(record)
+        }
+    }
+
+    /// Record a verified in-guest diagnostic result received from an authorized in-guest probe
+    pub fn record_guest_diagnostic_result(
+        &self,
+        environment_id: &str,
+        observed_ipv4: &str,
+        observed_ipv6: Option<&str>,
+        dns_summary: &str,
+        latency_ms: u32,
+    ) -> Result<NetworkCheckRecord, String> {
+        let check_id = Uuid::new_v4().to_string();
+        let now = Utc::now().to_rfc3339();
+
         self.db.with_conn(|conn| {
             conn.execute(
-                "INSERT INTO network_checks (id, environment_id, observed_ipv4, observed_ipv6, dns_summary, check_source, status, checked_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                "INSERT INTO network_checks (id, environment_id, observed_ipv4, observed_ipv6, dns_summary, check_source, status, checked_at, latency_ms, egress_stage)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
                 rusqlite::params![
                     check_id,
                     environment_id,
-                    observed_ip,
-                    None::<String>,
-                    dns_info,
+                    observed_ipv4,
+                    observed_ipv6,
+                    dns_summary,
                     "GUEST_AGENT",
-                    check_status,
-                    now
+                    "GUEST_EGRESS_OBSERVED",
+                    now,
+                    latency_ms,
+                    "VERIFIED"
                 ],
             )
         }).map_err(|e| e.to_string())?;
 
         self.audit_service.log(
             Some(environment_id),
-            "NETWORK_CHECK",
+            "GUEST_EGRESS_VERIFIED",
             "INFO",
-            &format!("Verified network egress for '{}': observed IPv4 {}", env_name, observed_ip),
+            &format!("Observed in-guest egress IP: {} (latency: {}ms)", observed_ipv4, latency_ms),
         ).ok();
 
         Ok(NetworkCheckRecord {
             id: check_id,
             environment_id: environment_id.to_string(),
-            observed_ipv4: Some(observed_ip),
-            observed_ipv6: None,
-            dns_summary: Some(dns_info),
+            observed_ipv4: Some(observed_ipv4.to_string()),
+            observed_ipv6: observed_ipv6.map(|s| s.to_string()),
+            dns_summary: Some(dns_summary.to_string()),
             check_source: "GUEST_AGENT".to_string(),
-            status: check_status,
+            status: "GUEST_EGRESS_OBSERVED".to_string(),
             error_message: None,
             checked_at: now,
+            latency_ms: Some(latency_ms),
         })
     }
 
     pub fn detect_duplicate_egress(&self) -> Result<Vec<DuplicateEgressWarning>, String> {
         self.db.with_conn(|conn| {
-            // Find observed public IPs that appear in more than one distinct environment from latest checks
             let mut stmt = conn.prepare(
                 "SELECT nc.observed_ipv4, GROUP_CONCAT(e.name, ', ') as env_names, COUNT(DISTINCT e.id) as env_count
                  FROM network_checks nc
@@ -393,7 +711,7 @@ impl NetworkService {
     pub fn get_network_history(&self, environment_id: &str, limit: usize) -> Result<Vec<NetworkCheckRecord>, String> {
         self.db.with_conn(|conn| {
             let mut stmt = conn.prepare(
-                "SELECT id, environment_id, observed_ipv4, observed_ipv6, dns_summary, check_source, status, checked_at
+                "SELECT id, environment_id, observed_ipv4, observed_ipv6, dns_summary, check_source, status, checked_at, latency_ms
                  FROM network_checks WHERE environment_id = ?1 ORDER BY checked_at DESC LIMIT ?2"
             )?;
 
@@ -408,6 +726,7 @@ impl NetworkService {
                     status: row.get(6)?,
                     error_message: None,
                     checked_at: row.get(7)?,
+                    latency_ms: row.get(8)?,
                 })
             })?;
 

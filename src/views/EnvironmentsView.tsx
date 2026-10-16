@@ -7,17 +7,16 @@ import {
   Trash2, 
   ShieldAlert, 
   Layers, 
-  Cpu, 
-  HardDrive,
   RefreshCw,
-  Activity
+  Terminal
 } from 'lucide-react';
 import { 
   EnvironmentRecord, 
   CreateEnvironmentRequest, 
-  NetworkEndpointRecord, 
+  NetworkEndpointRecord,
   ChannelRecord,
-  HypervisorInfo 
+  HypervisorInfo,
+  PlatformInfo
 } from '../types';
 import { StatusBadge } from '../components/StatusBadge';
 import { Modal } from '../components/Modal';
@@ -28,13 +27,15 @@ interface EnvironmentsViewProps {
   endpoints: NetworkEndpointRecord[];
   channels: ChannelRecord[];
   hypervisorInfo: HypervisorInfo | null;
+  platformInfo?: PlatformInfo | null;
   onRefresh: () => void;
   onCreateEnvironment: (req: CreateEnvironmentRequest) => Promise<void>;
   onStartEnvironment: (id: string) => Promise<void>;
   onShutdownEnvironment: (id: string, force: boolean) => Promise<void>;
+  onOpenConsole?: (id: string) => Promise<void>;
+  onLaunchBrowser?: (id: string) => Promise<void>;
   onDeleteEnvironment: (id: string, deleteDisks: boolean) => Promise<void>;
   onCheckNetwork: (id: string) => Promise<void>;
-  onLaunchBrowser: (id: string) => Promise<void>;
 }
 
 export const EnvironmentsView: React.FC<EnvironmentsViewProps> = ({
@@ -42,13 +43,15 @@ export const EnvironmentsView: React.FC<EnvironmentsViewProps> = ({
   endpoints,
   channels,
   hypervisorInfo,
+  platformInfo,
   onRefresh,
   onCreateEnvironment,
   onStartEnvironment,
   onShutdownEnvironment,
+  onOpenConsole,
+  onLaunchBrowser,
   onDeleteEnvironment,
   onCheckNetwork,
-  onLaunchBrowser,
 }) => {
   const [searchTerm, setSearchTerm] = useState('');
   const [statusFilter, setStatusFilter] = useState('ALL');
@@ -56,9 +59,14 @@ export const EnvironmentsView: React.FC<EnvironmentsViewProps> = ({
   const [selectedEnvForDelete, setSelectedEnvForDelete] = useState<EnvironmentRecord | null>(null);
   const [isActionLoading, setIsActionLoading] = useState<string | null>(null);
 
+  const isMac = platformInfo?.os === 'macos' || (typeof navigator !== 'undefined' && navigator.userAgent.toLowerCase().includes('mac'));
+  const defaultHvType = isMac ? 'UTM' : 'Hyper-V';
+  const defaultOsType = isMac ? 'Ubuntu_ARM64' : 'Ubuntu_64';
+
   // New Environment Form State
   const [newName, setNewName] = useState('');
-  const [newGuestOs, setNewGuestOs] = useState('Ubuntu_64');
+  const [newHypervisor, setNewHypervisor] = useState(defaultHvType);
+  const [newGuestOs, setNewGuestOs] = useState(defaultOsType);
   const [newCpu, setNewCpu] = useState(2);
   const [newRamMb, setNewRamMb] = useState(2048);
   const [newDiskMb, setNewDiskMb] = useState(20480);
@@ -95,7 +103,7 @@ export const EnvironmentsView: React.FC<EnvironmentsViewProps> = ({
       setIsActionLoading('create');
       await onCreateEnvironment({
         name: newName.trim(),
-        hypervisor_type: hypervisorInfo?.name.includes('VirtualBox') ? 'VirtualBox' : 'Mock',
+        hypervisor_type: newHypervisor || (hypervisorInfo?.name.includes('UTM') ? 'UTM' : hypervisorInfo?.name.includes('Hyper-V') ? 'Hyper-V' : 'VirtualBox'),
         guest_os: newGuestOs,
         cpu_count: Number(newCpu),
         memory_mb: Number(newRamMb),
@@ -104,9 +112,10 @@ export const EnvironmentsView: React.FC<EnvironmentsViewProps> = ({
         browser_type: newBrowser,
         network_endpoint_id: newEndpointId || null,
         channel_id: newChannelId || null,
+        host_platform: platformInfo?.target_triple || (isMac ? 'macos-aarch64' : 'windows-x86_64'),
+        vm_architecture: platformInfo?.arch || (isMac ? 'aarch64' : 'x86_64'),
       });
       setIsCreateOpen(false);
-      // Reset form
       setNewName('');
       setNewIsoPath('');
     } catch (err: any) {
@@ -181,20 +190,21 @@ export const EnvironmentsView: React.FC<EnvironmentsViewProps> = ({
           <table className="w-full text-left text-xs">
             <thead className="bg-surface-850/60 border-b border-surface-800 text-slate-400 uppercase font-semibold tracking-wider">
               <tr>
-                <th className="py-3.5 px-4">Environment</th>
-                <th className="py-3.5 px-4">Status</th>
-                <th className="py-3.5 px-4">Guest OS / Specs</th>
-                <th className="py-3.5 px-4">Network & Egress</th>
-                <th className="py-3.5 px-4">Assigned Channel</th>
-                <th className="py-3.5 px-4 text-right">Actions</th>
+                <th className="py-3 px-4">Environment</th>
+                <th className="py-3 px-4">Hypervisor & Arch</th>
+                <th className="py-3 px-4">Allocated Resources</th>
+                <th className="py-3 px-4">Assigned Channel</th>
+                <th className="py-3 px-4">Network Egress Status</th>
+                <th className="py-3 px-4 text-right">Actions</th>
               </tr>
             </thead>
             <tbody className="divide-y divide-surface-800/80">
               {filteredEnvironments.length === 0 ? (
                 <tr>
                   <td colSpan={6} className="py-12 text-center text-slate-500">
-                    <Layers className="w-8 h-8 mx-auto mb-2 text-slate-600" />
-                    No virtual environments found. Click "Create Environment" to provision one.
+                    <Layers className="w-8 h-8 mx-auto mb-2 opacity-30" />
+                    <p className="text-sm font-medium text-slate-400">No environments match your criteria</p>
+                    <p className="text-xs mt-1">Create a new isolated guest VM to get started.</p>
                   </td>
                 </tr>
               ) : (
@@ -204,53 +214,67 @@ export const EnvironmentsView: React.FC<EnvironmentsViewProps> = ({
 
                   return (
                     <tr key={env.id} className="hover:bg-surface-850/40 transition-colors">
-                      {/* Name & ID */}
+                      {/* Name & Status */}
                       <td className="py-3.5 px-4">
-                        <div className="font-semibold text-slate-200">{env.name}</div>
-                        <div className="text-[11px] font-mono text-slate-500 truncate max-w-[180px]">
-                          {env.vm_identifier}
-                        </div>
-                      </td>
-
-                      {/* Status */}
-                      <td className="py-3.5 px-4">
-                        <StatusBadge status={env.status} type="vm" />
-                      </td>
-
-                      {/* Specs */}
-                      <td className="py-3.5 px-4 text-slate-300">
-                        <div className="font-medium text-slate-200">{env.guest_os}</div>
-                        <div className="text-[11px] text-slate-500 font-mono">
-                          {env.cpu_count} vCPU • {(env.memory_mb / 1024).toFixed(0)} GB RAM
-                        </div>
-                      </td>
-
-                      {/* Network & Egress */}
-                      <td className="py-3.5 px-4">
-                        {env.network_endpoint_name ? (
-                          <div className="text-slate-200 font-medium truncate max-w-[150px]">
-                            {env.network_endpoint_name}
+                        <div className="flex items-center gap-2.5">
+                          <StatusBadge status={env.status} />
+                          <div>
+                            <span className="font-semibold text-slate-100 block">{env.name}</span>
+                            <span className="text-[11px] text-slate-400 font-mono">{env.vm_identifier}</span>
                           </div>
-                        ) : (
-                          <span className="text-slate-500 italic">Direct / Host NAT</span>
-                        )}
-                        <div className="text-[11px] font-mono flex items-center gap-1.5 mt-0.5">
-                          {env.last_observed_ipv4 ? (
-                            <span className="text-emerald-400 font-medium">{env.last_observed_ipv4}</span>
-                          ) : (
-                            <span className="text-slate-500">Not verified</span>
-                          )}
+                        </div>
+                      </td>
+
+                      {/* Hypervisor & Architecture */}
+                      <td className="py-3.5 px-4">
+                        <div className="space-y-0.5">
+                          <div className="font-medium text-slate-200">{env.hypervisor_type}</div>
+                          <div className="text-[11px] text-slate-400 font-mono">
+                            {env.vm_architecture || (isMac ? 'aarch64' : 'x86_64')} • {env.guest_os}
+                          </div>
+                        </div>
+                      </td>
+
+                      {/* Allocations */}
+                      <td className="py-3.5 px-4 font-mono text-slate-300">
+                        <div className="space-y-0.5">
+                          <div>{env.cpu_count} vCPU • {(env.memory_mb / 1024).toFixed(1)} GB RAM</div>
+                          <div className="text-[11px] text-slate-400 truncate max-w-xs" title={env.disk_path}>
+                            {env.disk_path.split(/[/\\]/).pop()}
+                          </div>
                         </div>
                       </td>
 
                       {/* Channel */}
                       <td className="py-3.5 px-4">
                         {env.channel_name ? (
-                          <span className="text-slate-200 font-medium truncate block max-w-[160px]">
-                            {env.channel_name}
-                          </span>
+                          <div className="flex items-center gap-1.5 text-slate-200 font-medium">
+                            <span className="w-2 h-2 rounded-full bg-rose-500 inline-block" />
+                            <span>{env.channel_name}</span>
+                          </div>
                         ) : (
                           <span className="text-slate-500 italic">Unassigned</span>
+                        )}
+                      </td>
+
+                      {/* Network Status */}
+                      <td className="py-3.5 px-4">
+                        {env.last_observed_ipv4 ? (
+                          <div className="space-y-0.5">
+                            <span className="font-mono text-emerald-400 font-medium block">
+                              {env.last_observed_ipv4}
+                            </span>
+                            <span className="text-[10px] text-slate-400">
+                              Verified: {new Date(env.last_checked_at || '').toLocaleTimeString()}
+                            </span>
+                          </div>
+                        ) : env.network_endpoint_name ? (
+                          <div className="space-y-0.5">
+                            <span className="text-slate-300 block">{env.network_endpoint_name}</span>
+                            <span className="text-[10px] text-amber-400/90 font-mono">Egress unverified</span>
+                          </div>
+                        ) : (
+                          <span className="text-slate-500 italic">Direct NAT</span>
                         )}
                       </td>
 
@@ -259,16 +283,14 @@ export const EnvironmentsView: React.FC<EnvironmentsViewProps> = ({
                         <div className="flex items-center justify-end gap-1.5">
                           {/* VM Lifecycle Buttons */}
                           {isRunning ? (
-                            <>
-                              <button
-                                onClick={() => handleAction(() => onShutdownEnvironment(env.id, false), env.id)}
-                                disabled={Boolean(isLoading)}
-                                title="Graceful ACPI Shutdown"
-                                className="p-1.5 bg-amber-950/40 hover:bg-amber-900/60 text-amber-300 border border-amber-800/60 rounded-md transition-colors"
-                              >
-                                <Square className="w-3.5 h-3.5" />
-                              </button>
-                            </>
+                            <button
+                              onClick={() => handleAction(() => onShutdownEnvironment(env.id, false), env.id)}
+                              disabled={Boolean(isLoading)}
+                              title="Graceful ACPI Shutdown"
+                              className="p-1.5 bg-amber-950/40 hover:bg-amber-900/60 text-amber-300 border border-amber-800/60 rounded-md transition-colors"
+                            >
+                              <Square className="w-3.5 h-3.5" />
+                            </button>
                           ) : (
                             <button
                               onClick={() => handleAction(() => onStartEnvironment(env.id), env.id)}
@@ -280,15 +302,29 @@ export const EnvironmentsView: React.FC<EnvironmentsViewProps> = ({
                             </button>
                           )}
 
+                          {/* Open VM Console */}
+                          {onOpenConsole && (
+                            <button
+                              onClick={() => handleAction(() => onOpenConsole(env.id), env.id)}
+                              disabled={Boolean(isLoading)}
+                              title="Open Hypervisor VM Console"
+                              className="p-1.5 bg-surface-800 hover:bg-surface-750 text-blue-300 border border-surface-700 rounded-md transition-colors"
+                            >
+                              <Terminal className="w-3.5 h-3.5" />
+                            </button>
+                          )}
+
                           {/* Launch Isolated Browser */}
-                          <button
-                            onClick={() => handleAction(() => onLaunchBrowser(env.id), `launch-${env.id}`)}
-                            disabled={Boolean(isLoading)}
-                            title="🚀 Mở Trình duyệt Kênh (YouTube Studio)"
-                            className="px-2 py-1 bg-rose-950/50 hover:bg-rose-900/70 text-rose-300 border border-rose-800/80 rounded-md transition-colors flex items-center gap-1 font-medium text-[11px]"
-                          >
-                            <span>🚀 Studio</span>
-                          </button>
+                          {onLaunchBrowser && (
+                            <button
+                              onClick={() => handleAction(() => onLaunchBrowser(env.id), `launch-${env.id}`)}
+                              disabled={Boolean(isLoading)}
+                              title="🚀 Mở Trình duyệt Kênh (YouTube Studio)"
+                              className="px-2 py-1 bg-rose-950/50 hover:bg-rose-900/70 text-rose-300 border border-rose-800/80 rounded-md transition-colors flex items-center gap-1 font-medium text-[11px]"
+                            >
+                              <span>🚀 Studio</span>
+                            </button>
+                          )}
 
                           {/* Network Diagnostic Trigger */}
                           <button
@@ -329,7 +365,7 @@ export const EnvironmentsView: React.FC<EnvironmentsViewProps> = ({
         isOpen={isCreateOpen}
         onClose={() => setIsCreateOpen(false)}
         title="Create Isolated Environment"
-        subtitle="Provision dedicated VM storage, isolated browser profile, and network mapping"
+        subtitle="Provision dedicated VM storage, isolated guest profile, and network mapping"
         maxWidth="max-w-2xl"
       >
         <form onSubmit={handleCreateSubmit} className="space-y-4 text-xs">
@@ -354,123 +390,156 @@ export const EnvironmentsView: React.FC<EnvironmentsViewProps> = ({
             </div>
 
             <div>
+              <label className="block text-slate-300 font-medium mb-1">Hypervisor Engine</label>
+              <select
+                value={newHypervisor}
+                onChange={(e) => setNewHypervisor(e.target.value)}
+                className="w-full px-3 py-2 bg-surface-850 border border-surface-750 rounded-lg text-slate-100 focus:outline-none focus:border-brand-accent"
+              >
+                {isMac ? (
+                  <>
+                    <option value="UTM">UTM (Apple Silicon Native Virtualization)</option>
+                    <option value="VirtualBox">VirtualBox (Fallback)</option>
+                  </>
+                ) : (
+                  <>
+                    <option value="Hyper-V">Microsoft Hyper-V (Windows 11 Pro)</option>
+                    <option value="VirtualBox">Oracle VM VirtualBox</option>
+                  </>
+                )}
+              </select>
+            </div>
+
+            <div>
               <label className="block text-slate-300 font-medium mb-1">Guest Operating System</label>
               <select
                 value={newGuestOs}
                 onChange={(e) => setNewGuestOs(e.target.value)}
                 className="w-full px-3 py-2 bg-surface-850 border border-surface-750 rounded-lg text-slate-100 focus:outline-none focus:border-brand-accent"
               >
-                <option value="Ubuntu_64">Ubuntu Linux (64-bit) [Recommended]</option>
-                <option value="Debian_64">Debian GNU/Linux (64-bit)</option>
-                <option value="Windows11_64">Windows 11 (64-bit, license required)</option>
-                <option value="Windows10_64">Windows 10 (64-bit, license required)</option>
+                {isMac ? (
+                  <>
+                    <option value="Ubuntu_ARM64">Ubuntu Linux 22.04 ARM64 (Recommended)</option>
+                    <option value="Debian_ARM64">Debian 12 ARM64</option>
+                    <option value="Fedora_ARM64">Fedora 40 ARM64</option>
+                  </>
+                ) : (
+                  <>
+                    <option value="Ubuntu_64">Ubuntu Linux 22.04 x64 (Recommended)</option>
+                    <option value="Windows11_64">Windows 11 Guest (x64)</option>
+                    <option value="Debian_64">Debian 12 x64</option>
+                  </>
+                )}
               </select>
             </div>
-          </div>
 
-          <div className="grid grid-cols-3 gap-3 pt-2 border-t border-surface-800">
             <div>
-              <label className="block text-slate-300 font-medium mb-1 flex items-center gap-1">
-                <Cpu className="w-3 h-3 text-slate-400" /> CPU Allocation
-              </label>
-              <input
-                type="number"
-                min={1}
-                max={16}
-                value={newCpu}
-                onChange={(e) => setNewCpu(Number(e.target.value))}
-                className="w-full px-3 py-1.5 bg-surface-850 border border-surface-750 rounded-lg text-slate-100 font-mono"
-              />
-            </div>
-            <div>
-              <label className="block text-slate-300 font-medium mb-1 flex items-center gap-1">
-                <Activity className="w-3 h-3 text-slate-400" /> Memory (MB)
-              </label>
-              <input
-                type="number"
-                min={1024}
-                step={512}
-                value={newRamMb}
-                onChange={(e) => setNewRamMb(Number(e.target.value))}
-                className="w-full px-3 py-1.5 bg-surface-850 border border-surface-750 rounded-lg text-slate-100 font-mono"
-              />
-            </div>
-            <div>
-              <label className="block text-slate-300 font-medium mb-1 flex items-center gap-1">
-                <HardDrive className="w-3 h-3 text-slate-400" /> Disk Size (MB)
-              </label>
-              <input
-                type="number"
-                min={5120}
-                step={1024}
-                value={newDiskMb}
-                onChange={(e) => setNewDiskMb(Number(e.target.value))}
-                className="w-full px-3 py-1.5 bg-surface-850 border border-surface-750 rounded-lg text-slate-100 font-mono"
-              />
-            </div>
-          </div>
-
-          <div>
-            <label className="block text-slate-300 font-medium mb-1">Guest Installer ISO Path (Optional)</label>
-            <input
-              type="text"
-              placeholder="C:\ISOs\ubuntu-24.04-desktop-amd64.iso"
-              value={newIsoPath}
-              onChange={(e) => setNewIsoPath(e.target.value)}
-              className="w-full px-3 py-2 bg-surface-850 border border-surface-750 rounded-lg text-slate-100 font-mono focus:outline-none focus:border-brand-accent"
-            />
-            <p className="text-[10px] text-slate-500 mt-1">If empty, VM will boot to EFI shell ready for manual image attachment.</p>
-          </div>
-
-          <div className="grid grid-cols-1 md:grid-cols-3 gap-4 pt-2 border-t border-surface-800">
-            <div>
-              <label className="block text-slate-300 font-medium mb-1">Browser Engine</label>
+              <label className="block text-slate-300 font-medium mb-1">Guest Browser Type</label>
               <select
                 value={newBrowser}
                 onChange={(e) => setNewBrowser(e.target.value)}
                 className="w-full px-3 py-2 bg-surface-850 border border-surface-750 rounded-lg text-slate-100 focus:outline-none focus:border-brand-accent"
               >
-                <option value="chrome">Google Chrome (Dedicated Profile)</option>
-                <option value="brave">Brave Browser (Dedicated Profile)</option>
-                <option value="firefox">Mozilla Firefox (Dedicated Profile)</option>
-                <option value="edge">Microsoft Edge (Dedicated Profile)</option>
+                <option value="chrome">Google Chrome (Isolated Guest Execution)</option>
+                <option value="brave">Brave Browser (Privacy Optimized)</option>
+                <option value="firefox">Mozilla Firefox</option>
               </select>
             </div>
 
             <div>
-              <label className="block text-slate-300 font-medium mb-1">Assign Network Endpoint</label>
+              <label className="block text-slate-300 font-medium mb-1">Allocated vCPU Cores</label>
+              <input
+                type="number"
+                min="1"
+                max="16"
+                value={newCpu}
+                onChange={(e) => setNewCpu(Number(e.target.value))}
+                className="w-full px-3 py-2 bg-surface-850 border border-surface-750 rounded-lg text-slate-100 focus:outline-none focus:border-brand-accent font-mono"
+              />
+            </div>
+
+            <div>
+              <label className="block text-slate-300 font-medium mb-1">Memory Allocation (MB)</label>
+              <input
+                type="number"
+                step="512"
+                min="1024"
+                max="65536"
+                value={newRamMb}
+                onChange={(e) => setNewRamMb(Number(e.target.value))}
+                className="w-full px-3 py-2 bg-surface-850 border border-surface-750 rounded-lg text-slate-100 focus:outline-none focus:border-brand-accent font-mono"
+              />
+            </div>
+
+            <div>
+              <label className="block text-slate-300 font-medium mb-1 flex items-center justify-between">
+                <span>Virtual Disk Size (MB)</span>
+                {platformInfo?.available_disk_mb ? (
+                  <span className="text-[11px] text-slate-400 font-mono font-normal">
+                    (Host Free: {platformInfo.available_disk_mb.toLocaleString()} MB)
+                  </span>
+                ) : null}
+              </label>
+              <input
+                type="number"
+                step="1024"
+                min="1024"
+                value={newDiskMb}
+                onChange={(e) => setNewDiskMb(Number(e.target.value))}
+                className="w-full px-3 py-2 bg-surface-850 border border-surface-750 rounded-lg text-slate-100 focus:outline-none focus:border-brand-accent font-mono"
+              />
+              <p className="text-[10px] text-slate-500 mt-1">
+                Format: {isMac ? '.utm dynamic sparse disk (thin-provisioned)' : '.vhdx dynamic virtual hard disk (thin-provisioned)'}
+              </p>
+            </div>
+
+            <div>
+              <label className="block text-slate-300 font-medium mb-1">Installer ISO Image (Optional)</label>
+              <input
+                type="text"
+                placeholder={isMac ? "/Users/.../ubuntu-22.04-arm64.iso" : "C:\\ISO\\ubuntu-22.04-x64.iso"}
+                value={newIsoPath}
+                onChange={(e) => setNewIsoPath(e.target.value)}
+                className="w-full px-3 py-2 bg-surface-850 border border-surface-750 rounded-lg text-slate-100 focus:outline-none focus:border-brand-accent font-mono"
+              />
+            </div>
+
+            <div>
+              <label className="block text-slate-300 font-medium mb-1">Network Proxy Endpoint (Optional)</label>
               <select
                 value={newEndpointId}
                 onChange={(e) => setNewEndpointId(e.target.value)}
                 className="w-full px-3 py-2 bg-surface-850 border border-surface-750 rounded-lg text-slate-100 focus:outline-none focus:border-brand-accent"
               >
-                <option value="">Direct / None (Host Default)</option>
+                <option value="">Direct / Default NAT (No Proxy)</option>
                 {endpoints.map((ep) => (
                   <option key={ep.id} value={ep.id}>
-                    {ep.name} ({ep.endpoint_type} - {ep.host || 'Dynamic'})
+                    {ep.name} ({ep.endpoint_type})
                   </option>
                 ))}
               </select>
             </div>
 
             <div>
-              <label className="block text-slate-300 font-medium mb-1">Assign YouTube Channel</label>
+              <label className="block text-slate-300 font-medium mb-1">Assign YouTube Channel (Optional)</label>
               <select
                 value={newChannelId}
                 onChange={(e) => setNewChannelId(e.target.value)}
                 className="w-full px-3 py-2 bg-surface-850 border border-surface-750 rounded-lg text-slate-100 focus:outline-none focus:border-brand-accent"
               >
-                <option value="">Unassigned</option>
-                {channels.map((ch) => (
-                  <option key={ch.id} value={ch.id}>
-                    {ch.display_name} ({ch.authorization_status})
-                  </option>
-                ))}
+                <option value="">None (Can assign later)</option>
+                {channels
+                  .filter((c) => !c.environment_id)
+                  .map((ch) => (
+                    <option key={ch.id} value={ch.id}>
+                      {ch.display_name} ({ch.youtube_channel_id})
+                    </option>
+                  ))}
               </select>
             </div>
           </div>
 
-          <div className="flex items-center justify-end gap-3 pt-4 border-t border-surface-800">
+          <div className="pt-4 border-t border-surface-800 flex items-center justify-end gap-3">
             <button
               type="button"
               onClick={() => setIsCreateOpen(false)}
@@ -481,32 +550,31 @@ export const EnvironmentsView: React.FC<EnvironmentsViewProps> = ({
             <button
               type="submit"
               disabled={isActionLoading === 'create'}
-              className="px-4 py-2 bg-brand-accent hover:bg-blue-600 text-white rounded-lg font-semibold shadow-sm transition-colors flex items-center gap-1.5"
+              className="px-4 py-2 bg-brand-accent hover:bg-blue-600 text-white rounded-lg font-medium transition-colors flex items-center gap-2"
             >
               {isActionLoading === 'create' && <RefreshCw className="w-3.5 h-3.5 animate-spin" />}
-              <span>Create Environment</span>
+              <span>Provision Isolated VM</span>
             </button>
           </div>
         </form>
       </Modal>
 
-      {/* Delete Confirmation Dialog */}
-      <ConfirmDialog
-        isOpen={Boolean(selectedEnvForDelete)}
-        onClose={() => setSelectedEnvForDelete(null)}
-        onConfirm={async () => {
-          if (selectedEnvForDelete) {
-            await handleAction(
-              () => onDeleteEnvironment(selectedEnvForDelete.id, true),
-              selectedEnvForDelete.id
-            );
-          }
-        }}
-        title={`Delete Environment '${selectedEnvForDelete?.name}'?`}
-        message={`This will permanently remove the virtual machine from the hypervisor and delete its dedicated virtual disk (.vdi) and isolated browser profile. This action cannot be undone.`}
-        confirmLabel="Permanently Delete"
-        isDestructive={true}
-      />
+      {/* Delete Confirmation Modal */}
+      {selectedEnvForDelete && (
+        <ConfirmDialog
+          isOpen={true}
+          title={`Delete Environment '${selectedEnvForDelete.name}'?`}
+          message="This action will unregister the virtual machine, release network bindings, and remove the environment record. Dedicated virtual disk files will also be permanently deleted."
+          confirmLabel="Delete Permanently"
+          isDestructive={true}
+          onConfirm={async () => {
+            const envId = selectedEnvForDelete.id;
+            setSelectedEnvForDelete(null);
+            await handleAction(() => onDeleteEnvironment(envId, true), envId);
+          }}
+          onClose={() => setSelectedEnvForDelete(null)}
+        />
+      )}
     </div>
   );
 };

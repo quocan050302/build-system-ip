@@ -15,6 +15,7 @@ import {
   AuditLogEntry, 
   HypervisorInfo, 
   HostResources,
+  PlatformInfo,
   CreateEnvironmentRequest,
   CreateEndpointRequest,
   CreateChannelRequest
@@ -32,12 +33,13 @@ export const App: React.FC = () => {
   const [auditLogs, setAuditLogs] = useState<AuditLogEntry[]>([]);
   const [hypervisorInfo, setHypervisorInfo] = useState<HypervisorInfo | null>(null);
   const [hostResources, setHostResources] = useState<HostResources | null>(null);
+  const [platformInfo, setPlatformInfo] = useState<PlatformInfo | null>(null);
 
   // Load all system data
   const loadData = useCallback(async () => {
     try {
       setIsLoading(true);
-      const [envs, eps, chs, warnings, logs, hvInfo, resources] = await Promise.all([
+      const [envs, eps, chs, warnings, logs, hvInfo, resources, platInfo] = await Promise.all([
         api.listEnvironments().catch(() => []),
         api.listEndpoints().catch(() => []),
         api.listChannels().catch(() => []),
@@ -45,6 +47,7 @@ export const App: React.FC = () => {
         api.listAuditLogs(50).catch(() => []),
         api.getHypervisorInfo().catch(() => null),
         api.getHostResources().catch(() => null),
+        api.getPlatformInfo().catch(() => null),
       ]);
 
       setEnvironments(envs);
@@ -54,6 +57,7 @@ export const App: React.FC = () => {
       setAuditLogs(logs);
       setHypervisorInfo(hvInfo);
       setHostResources(resources);
+      setPlatformInfo(platInfo);
     } finally {
       setIsLoading(false);
     }
@@ -77,6 +81,10 @@ export const App: React.FC = () => {
   const handleShutdownEnvironment = async (id: string, force: boolean) => {
     await api.shutdownEnvironment(id, force);
     await loadData();
+  };
+
+  const handleOpenConsole = async (id: string) => {
+    await api.openVmConsole(id);
   };
 
   const handleDeleteEnvironment = async (id: string, deleteDisks: boolean) => {
@@ -106,7 +114,12 @@ export const App: React.FC = () => {
   };
 
   const handleLaunchBrowser = async (environmentId: string) => {
-    await api.launchBrowserProfile(environmentId);
+    try {
+      await api.launchBrowserProfile(environmentId);
+    } catch {
+      await api.launchGuestBrowser(environmentId);
+      await loadData();
+    }
   };
 
   // Channel Handlers
@@ -132,7 +145,7 @@ export const App: React.FC = () => {
 
   // Security Test
   const handleTestVault = async () => {
-    return api.testDpapiVault();
+    return api.testSecretVault();
   };
 
   const runningCount = environments.filter((e) => e.status === 'RUNNING').length;
@@ -148,7 +161,7 @@ export const App: React.FC = () => {
       case 'channels':
         return { title: 'YouTube Channel Registry', subtitle: 'Authorized channel assignments and platform compliance controls' };
       case 'settings':
-        return { title: 'Application Settings', subtitle: 'Hypervisor discovery, DPAPI vault status, and audit logs' };
+        return { title: 'Application Settings', subtitle: 'Hypervisor discovery, hardware-bound vault status, and audit logs' };
     }
   };
 
@@ -162,6 +175,7 @@ export const App: React.FC = () => {
         onTabChange={setCurrentTab}
         runningCount={runningCount}
         totalCount={environments.length}
+        platformInfo={platformInfo}
       />
 
       {/* Main Workspace Layout */}
@@ -171,6 +185,7 @@ export const App: React.FC = () => {
           title={title}
           subtitle={subtitle}
           hypervisorInfo={hypervisorInfo}
+          platformInfo={platformInfo}
           onRefresh={loadData}
           isLoading={isLoading}
         />
@@ -195,13 +210,15 @@ export const App: React.FC = () => {
                 endpoints={endpoints}
                 channels={channels}
                 hypervisorInfo={hypervisorInfo}
+                platformInfo={platformInfo}
                 onRefresh={loadData}
                 onCreateEnvironment={handleCreateEnvironment}
                 onStartEnvironment={handleStartEnvironment}
                 onShutdownEnvironment={handleShutdownEnvironment}
+                onOpenConsole={handleOpenConsole}
+                onLaunchBrowser={handleLaunchBrowser}
                 onDeleteEnvironment={handleDeleteEnvironment}
                 onCheckNetwork={handleCheckNetwork}
-                onLaunchBrowser={handleLaunchBrowser}
               />
             )}
 
@@ -235,6 +252,7 @@ export const App: React.FC = () => {
               <SettingsView
                 hypervisorInfo={hypervisorInfo}
                 hostResources={hostResources}
+                platformInfo={platformInfo}
                 auditLogs={auditLogs}
                 onTestVault={handleTestVault}
                 onRefresh={loadData}

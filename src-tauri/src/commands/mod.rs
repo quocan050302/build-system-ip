@@ -1,15 +1,21 @@
 use crate::hypervisor::{HostResources, HypervisorInfo};
-use crate::security::dpapi::DpapiVault;
+use crate::security::{get_secret_store, dpapi::DpapiVault};
 use crate::services::audit_service::AuditLogEntry;
 use crate::services::channel_service::{ChannelRecord, CreateChannelRequest};
 use crate::services::network_service::{
     CreateEndpointRequest, DuplicateEgressWarning, NetworkCheckRecord, NetworkEndpointRecord,
 };
+use crate::services::platform_service::PlatformInfo;
 use crate::services::vm_service::{CreateEnvironmentRequest, EnvironmentRecord};
 use crate::AppState;
 use tauri::State;
 
-// --- Hypervisor & Host Commands ---
+// --- Platform & Host Commands ---
+
+#[tauri::command]
+pub fn get_platform_info(state: State<AppState>) -> Result<PlatformInfo, String> {
+    Ok(state.platform_service.detect())
+}
 
 #[tauri::command]
 pub fn get_hypervisor_info(state: State<AppState>) -> Result<HypervisorInfo, String> {
@@ -49,6 +55,21 @@ pub fn start_environment(id: String, state: State<AppState>) -> Result<(), Strin
 #[tauri::command]
 pub fn shutdown_environment(id: String, force: bool, state: State<AppState>) -> Result<(), String> {
     state.vm_service.shutdown_environment(&id, force)
+}
+
+#[tauri::command]
+pub fn open_vm_console(id: String, state: State<AppState>) -> Result<(), String> {
+    state.vm_service.open_console(&id)
+}
+
+#[tauri::command]
+pub fn launch_guest_browser(id: String, state: State<AppState>) -> Result<(), String> {
+    state.vm_service.launch_guest_browser(&id)
+}
+
+#[tauri::command]
+pub fn reconcile_environment_states(state: State<AppState>) -> Result<usize, String> {
+    state.vm_service.reconcile_states()
 }
 
 #[tauri::command]
@@ -96,6 +117,24 @@ pub fn check_environment_network(
     state: State<AppState>,
 ) -> Result<NetworkCheckRecord, String> {
     state.network_service.check_network(&environment_id)
+}
+
+#[tauri::command]
+pub fn record_guest_diagnostic_result(
+    environment_id: String,
+    observed_ipv4: String,
+    observed_ipv6: Option<String>,
+    dns_summary: String,
+    latency_ms: u32,
+    state: State<AppState>,
+) -> Result<NetworkCheckRecord, String> {
+    state.network_service.record_guest_diagnostic_result(
+        &environment_id,
+        &observed_ipv4,
+        observed_ipv6.as_deref(),
+        &dns_summary,
+        latency_ms,
+    )
 }
 
 #[tauri::command]
@@ -161,9 +200,13 @@ pub fn list_audit_logs(
 }
 
 #[tauri::command]
+pub fn test_secret_vault() -> Result<bool, String> {
+    let store = get_secret_store();
+    store.test_vault().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 pub fn test_dpapi_vault() -> Result<bool, String> {
-    let test_secret = "test-secret-youtube-isolation-2026";
-    let encrypted = DpapiVault::encrypt_secret(test_secret).map_err(|e| e.to_string())?;
-    let decrypted = DpapiVault::decrypt_secret(&encrypted).map_err(|e| e.to_string())?;
-    Ok(decrypted == test_secret)
+    // Backward-compatible command for existing tests and UI
+    DpapiVault::test_vault().map_err(|e| e.to_string())
 }
