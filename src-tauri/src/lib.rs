@@ -97,6 +97,7 @@ pub fn run() {
             commands::create_channel,
             commands::list_channels,
             commands::update_channel_status,
+            commands::update_channel_youtube_id,
             commands::assign_channel_environment,
             commands::delete_channel,
             commands::list_audit_logs,

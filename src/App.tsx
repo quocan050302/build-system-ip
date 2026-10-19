@@ -143,6 +143,11 @@ export const App: React.FC = () => {
     await loadData();
   };
 
+  const handleUpdateChannelYoutubeId = async (channelId: string, youtubeChannelId: string) => {
+    await api.updateChannelYoutubeId(channelId, youtubeChannelId);
+    await loadData();
+  };
+
   // Security Test
   const handleTestVault = async () => {
     return api.testSecretVault();
@@ -245,6 +250,7 @@ export const App: React.FC = () => {
                 onUpdateStatus={handleUpdateChannelStatus}
                 onAssignEnvironment={handleAssignChannelEnvironment}
                 onDeleteChannel={handleDeleteChannel}
+                onUpdateChannelId={handleUpdateChannelYoutubeId}
               />
             )}
 

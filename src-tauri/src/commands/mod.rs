@@ -162,6 +162,15 @@ pub fn create_channel(
 }
 
 #[tauri::command]
+pub fn update_channel_youtube_id(
+    id: String,
+    youtube_channel_id: String,
+    state: State<AppState>,
+) -> Result<(), String> {
+    state.channel_service.update_channel_id(&id, &youtube_channel_id)
+}
+
+#[tauri::command]
 pub fn list_channels(state: State<AppState>) -> Result<Vec<ChannelRecord>, String> {
     state.channel_service.list_channels()
 }

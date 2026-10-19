@@ -433,6 +433,8 @@ export const api = {
   assignChannelEnvironment: (channelId: string, environmentId?: string | null) => 
     callTauri<void>('assign_channel_environment', { channelId, environmentId: environmentId || null }),
   deleteChannel: (id: string) => callTauri<void>('delete_channel', { id }),
+  updateChannelYoutubeId: (id: string, youtubeChannelId: string) =>
+    callTauri<void>('update_channel_youtube_id', { id, youtubeChannelId }),
 
   // Audit & Security
   listAuditLogs: (limit?: number) => callTauri<AuditLogEntry[]>('list_audit_logs', { limit }),

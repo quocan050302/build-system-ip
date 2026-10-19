@@ -7,7 +7,11 @@ import {
   CheckCircle2, 
   XCircle, 
   Lock,
-  RefreshCw
+  RefreshCw,
+  Pencil,
+  Check,
+  X as XIcon,
+  AlertTriangle
 } from 'lucide-react';
 import { 
   ChannelRecord, 
@@ -25,6 +29,7 @@ interface ChannelsViewProps {
   onUpdateStatus: (id: string, status: string) => Promise<void>;
   onAssignEnvironment: (channelId: string, environmentId?: string | null) => Promise<void>;
   onDeleteChannel: (id: string) => Promise<void>;
+  onUpdateChannelId?: (channelId: string, youtubeChannelId: string) => Promise<void>;
 }
 
 export const ChannelsView: React.FC<ChannelsViewProps> = ({
@@ -35,9 +40,14 @@ export const ChannelsView: React.FC<ChannelsViewProps> = ({
   onUpdateStatus,
   onAssignEnvironment,
   onDeleteChannel,
+  onUpdateChannelId,
 }) => {
   const [isAddOpen, setIsAddOpen] = useState(false);
   const [selectedChannelForDelete, setSelectedChannelForDelete] = useState<ChannelRecord | null>(null);
+  const [editingChannelId, setEditingChannelId] = useState<string | null>(null);
+  const [editChannelIdValue, setEditChannelIdValue] = useState('');
+  const [editChannelIdError, setEditChannelIdError] = useState<string | null>(null);
+  const [editChannelIdLoading, setEditChannelIdLoading] = useState(false);
 
   // Form State
   const [channelId, setChannelId] = useState('');
@@ -45,6 +55,45 @@ export const ChannelsView: React.FC<ChannelsViewProps> = ({
   const [environmentId, setEnvironmentId] = useState('');
   const [authStatus, setAuthStatus] = useState('AUTHORIZED');
   const [formError, setFormError] = useState<string | null>(null);
+
+  const startEditChannelId = (ch: ChannelRecord) => {
+    setEditingChannelId(ch.id);
+    setEditChannelIdValue(ch.youtube_channel_id.startsWith('UC_') ? '' : ch.youtube_channel_id);
+    setEditChannelIdError(null);
+  };
+
+  const cancelEditChannelId = () => {
+    setEditingChannelId(null);
+    setEditChannelIdValue('');
+    setEditChannelIdError(null);
+  };
+
+  const confirmEditChannelId = async (channelRecordId: string) => {
+    const trimmed = editChannelIdValue.trim();
+    if (!trimmed) {
+      setEditChannelIdError('Channel ID cannot be empty');
+      return;
+    }
+    if (!trimmed.startsWith('UC')) {
+      setEditChannelIdError('YouTube Channel ID must start with "UC"');
+      return;
+    }
+    if (trimmed.length < 10) {
+      setEditChannelIdError('Channel ID seems too short — check the ID from youtube.com/channel/UC...');
+      return;
+    }
+    if (!onUpdateChannelId) return;
+    setEditChannelIdLoading(true);
+    try {
+      await onUpdateChannelId(channelRecordId, trimmed);
+      cancelEditChannelId();
+      onRefresh();
+    } catch (err: any) {
+      setEditChannelIdError(err?.message || String(err));
+    } finally {
+      setEditChannelIdLoading(false);
+    }
+  };
 
   const handleCreate = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -145,9 +194,59 @@ export const ChannelsView: React.FC<ChannelsViewProps> = ({
                       {/* Name & ID */}
                       <td className="py-3.5 px-4">
                         <div className="font-semibold text-slate-200">{ch.display_name}</div>
-                        <div className="text-[11px] font-mono text-slate-500 truncate max-w-[200px]">
-                          {ch.youtube_channel_id}
-                        </div>
+                        {editingChannelId === ch.id ? (
+                          <div className="mt-1.5 space-y-1">
+                            <div className="flex items-center gap-1">
+                              <input
+                                autoFocus
+                                type="text"
+                                value={editChannelIdValue}
+                                onChange={e => { setEditChannelIdValue(e.target.value); setEditChannelIdError(null); }}
+                                onKeyDown={e => { if (e.key === 'Enter') confirmEditChannelId(ch.id); if (e.key === 'Escape') cancelEditChannelId(); }}
+                                placeholder="UCxxxxxxxxxxxxxxxxxx"
+                                className="flex-1 w-40 px-2 py-0.5 bg-surface-800 border border-amber-500/60 rounded text-[11px] font-mono text-slate-100 focus:outline-none focus:border-amber-400"
+                              />
+                              <button
+                                onClick={() => confirmEditChannelId(ch.id)}
+                                disabled={editChannelIdLoading}
+                                title="Save Channel ID"
+                                className="p-1 bg-emerald-950/60 hover:bg-emerald-900 border border-emerald-700 rounded text-emerald-400 disabled:opacity-50"
+                              >
+                                <Check className="w-3 h-3" />
+                              </button>
+                              <button
+                                onClick={cancelEditChannelId}
+                                title="Cancel"
+                                className="p-1 bg-surface-800 hover:bg-surface-700 border border-surface-700 rounded text-slate-400"
+                              >
+                                <XIcon className="w-3 h-3" />
+                              </button>
+                            </div>
+                            {editChannelIdError && (
+                              <div className="text-[10px] text-rose-400">{editChannelIdError}</div>
+                            )}
+                          </div>
+                        ) : (
+                          <div className="flex items-center gap-1 mt-0.5">
+                            {ch.youtube_channel_id.startsWith('UC_') ? (
+                              <span className="inline-flex items-center gap-1 text-[11px] font-mono text-amber-400 bg-amber-950/50 border border-amber-700/60 px-1.5 py-0.5 rounded">
+                                <AlertTriangle className="w-3 h-3 shrink-0" />
+                                Chưa có Channel ID thật
+                              </span>
+                            ) : (
+                              <span className="text-[11px] font-mono text-slate-500 truncate max-w-[180px]">{ch.youtube_channel_id}</span>
+                            )}
+                            {onUpdateChannelId && (
+                              <button
+                                onClick={() => startEditChannelId(ch)}
+                                title="Edit YouTube Channel ID"
+                                className="p-0.5 text-slate-600 hover:text-amber-400 hover:bg-amber-950/30 rounded transition-colors shrink-0"
+                              >
+                                <Pencil className="w-3 h-3" />
+                              </button>
+                            )}
+                          </div>
+                        )}
                       </td>
 
                       {/* Status Dropdown */}

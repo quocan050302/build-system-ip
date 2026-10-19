@@ -77,12 +77,16 @@ export const OverviewView: React.FC<OverviewViewProps> = ({
             <AlertTriangle className="w-5 h-5 text-amber-400" />
             <div>
               <h4 className="text-sm font-medium text-amber-200">
-                {hypervisorInfo.name.includes('UTM') || (typeof navigator !== 'undefined' && navigator.userAgent.toLowerCase().includes('mac'))
+                {hypervisorInfo.version === 'Permission Required'
+                  ? 'Hyper-V Permissions Required / Session Refresh Needed'
+                  : hypervisorInfo.name.includes('UTM') || (typeof navigator !== 'undefined' && navigator.userAgent.toLowerCase().includes('mac'))
                   ? 'UTM Virtual Machine Manager Not Detected On Host'
                   : 'Microsoft Hyper-V Not Detected On Host'}
               </h4>
               <p className="text-xs text-amber-400/80 mt-0.5">
-                {hypervisorInfo.name.includes('UTM') || (typeof navigator !== 'undefined' && navigator.userAgent.toLowerCase().includes('mac'))
+                {hypervisorInfo.executable_path && hypervisorInfo.executable_path.includes('Hyper-V is running')
+                  ? hypervisorInfo.executable_path
+                  : hypervisorInfo.name.includes('UTM') || (typeof navigator !== 'undefined' && navigator.userAgent.toLowerCase().includes('mac'))
                   ? 'Install UTM at /Applications/UTM.app (or run brew install --cask utm) for native Apple Silicon virtualization.'
                   : 'Ensure Windows Optional Feature "Microsoft-Hyper-V" is enabled and the VM Management Service (vmms) is running.'}
               </p>

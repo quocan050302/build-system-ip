@@ -185,6 +185,43 @@ impl ChannelService {
         Ok(())
     }
 
+    pub fn update_channel_id(&self, id: &str, new_youtube_channel_id: &str) -> Result<(), String> {
+        let clean_id = new_youtube_channel_id.trim();
+        if clean_id.is_empty() {
+            return Err("YouTube Channel ID cannot be empty".to_string());
+        }
+
+        // Check uniqueness (ignore self)
+        let already_exists: bool = self.db.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT COUNT(1) FROM channels WHERE youtube_channel_id = ?1 AND id != ?2"
+            )?;
+            let count: i64 = stmt.query_row(rusqlite::params![clean_id, id], |r| r.get(0))?;
+            Ok(count > 0)
+        }).map_err(|e| e.to_string())?;
+
+        if already_exists {
+            return Err(format!("Channel ID '{}' is already registered to another channel", clean_id));
+        }
+
+        let now = Utc::now().to_rfc3339();
+        self.db.with_conn(|conn| {
+            conn.execute(
+                "UPDATE channels SET youtube_channel_id = ?1, updated_at = ?2 WHERE id = ?3",
+                rusqlite::params![clean_id, now, id],
+            )
+        }).map_err(|e| e.to_string())?;
+
+        self.audit_service.log(
+            None,
+            "UPDATE_CHANNEL_ID",
+            "INFO",
+            &format!("Updated youtube_channel_id for channel {} to '{}'", id, clean_id),
+        ).ok();
+
+        Ok(())
+    }
+
     pub fn delete_channel(&self, id: &str) -> Result<(), String> {
         self.db.with_conn(|conn| {
             conn.execute("DELETE FROM channels WHERE id = ?1", rusqlite::params![id])
