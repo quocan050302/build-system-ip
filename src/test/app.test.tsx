@@ -41,8 +41,8 @@ describe('YouTube Isolation Manager Desktop UI', () => {
     // 4. Navigate to Channels
     fireEvent.click(screen.getByRole('button', { name: /channels/i }));
     await waitFor(() => {
-      expect(screen.getByText('YouTube Channel Registry')).toBeInTheDocument();
-      expect(screen.getByText('Register Channel')).toBeInTheDocument();
+      expect(screen.getByText('Social Media Channel Registry — Alexa Creator Studio')).toBeInTheDocument();
+      expect(screen.getByText('Register Account')).toBeInTheDocument();
     });
 
     // 5. Navigate to Settings

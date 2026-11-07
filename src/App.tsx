@@ -18,7 +18,8 @@ import {
   PlatformInfo,
   CreateEnvironmentRequest,
   CreateEndpointRequest,
-  CreateChannelRequest
+  CreateChannelRequest,
+  BrowserInfo,
 } from './types';
 
 export const App: React.FC = () => {
@@ -34,6 +35,7 @@ export const App: React.FC = () => {
   const [hypervisorInfo, setHypervisorInfo] = useState<HypervisorInfo | null>(null);
   const [hostResources, setHostResources] = useState<HostResources | null>(null);
   const [platformInfo, setPlatformInfo] = useState<PlatformInfo | null>(null);
+  const [detectedBrowsers, setDetectedBrowsers] = useState<BrowserInfo[]>([]);
 
   // Load all system data
   const loadData = useCallback(async () => {
@@ -58,6 +60,9 @@ export const App: React.FC = () => {
       setHypervisorInfo(hvInfo);
       setHostResources(resources);
       setPlatformInfo(platInfo);
+
+      // Detect browsers in background
+      api.detectBrowsers().then(setDetectedBrowsers).catch(() => {});
     } finally {
       setIsLoading(false);
     }
@@ -120,6 +125,36 @@ export const App: React.FC = () => {
       await api.launchGuestBrowser(environmentId);
       await loadData();
     }
+  };
+
+  const handleLaunchNativeBrowser = async (environmentId: string, url?: string) => {
+    await api.launchBrowserWithUrl(environmentId, url);
+    await loadData();
+  };
+
+  const handleStopBrowser = async (environmentId: string) => {
+    await api.stopBrowserProfile(environmentId);
+    await loadData();
+  };
+
+  const handleVerifyBrowserEgress = async (environmentId: string) => {
+    await api.verifyBrowserEgress(environmentId);
+    await loadData();
+  };
+
+  const handleUpdateChannelGumroad = async (
+    id: string,
+    gumroadUrl?: string | null,
+    utmSource?: string | null,
+    utmMedium?: string | null,
+    utmCampaign?: string | null,
+  ) => {
+    await api.updateChannelGumroad(id, gumroadUrl, utmSource, utmMedium, utmCampaign);
+    await loadData();
+  };
+
+  const handleOpenChannelInBrowser = async (channelId: string, openAnalytics?: boolean) => {
+    await api.openChannelInBrowser(channelId, openAnalytics);
   };
 
   // Channel Handlers
@@ -222,6 +257,9 @@ export const App: React.FC = () => {
                 onShutdownEnvironment={handleShutdownEnvironment}
                 onOpenConsole={handleOpenConsole}
                 onLaunchBrowser={handleLaunchBrowser}
+                onLaunchNativeBrowser={handleLaunchNativeBrowser}
+                onStopBrowser={handleStopBrowser}
+                onVerifyBrowserEgress={handleVerifyBrowserEgress}
                 onDeleteEnvironment={handleDeleteEnvironment}
                 onCheckNetwork={handleCheckNetwork}
               />
@@ -237,6 +275,7 @@ export const App: React.FC = () => {
                 onDeleteEndpoint={handleDeleteEndpoint}
                 onAssignEndpoint={handleAssignEndpoint}
                 onCheckNetwork={handleCheckNetwork}
+                onVerifyBrowserEgress={handleVerifyBrowserEgress}
                 onLaunchBrowser={handleLaunchBrowser}
               />
             )}
@@ -251,6 +290,8 @@ export const App: React.FC = () => {
                 onAssignEnvironment={handleAssignChannelEnvironment}
                 onDeleteChannel={handleDeleteChannel}
                 onUpdateChannelId={handleUpdateChannelYoutubeId}
+                onUpdateChannelGumroad={handleUpdateChannelGumroad}
+                onOpenChannelInBrowser={handleOpenChannelInBrowser}
               />
             )}
 
@@ -260,6 +301,7 @@ export const App: React.FC = () => {
                 hostResources={hostResources}
                 platformInfo={platformInfo}
                 auditLogs={auditLogs}
+                detectedBrowsers={detectedBrowsers}
                 onTestVault={handleTestVault}
                 onRefresh={loadData}
               />

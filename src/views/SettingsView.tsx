@@ -8,9 +8,10 @@ import {
   RefreshCw, 
   Cpu, 
   ShieldCheck,
-  Laptop
+  Laptop,
+  Monitor
 } from 'lucide-react';
-import { HypervisorInfo, HostResources, PlatformInfo, AuditLogEntry } from '../types';
+import { HypervisorInfo, HostResources, PlatformInfo, AuditLogEntry, BrowserInfo } from '../types';
 
 interface SettingsViewProps {
   hypervisorInfo: HypervisorInfo | null;
@@ -19,6 +20,7 @@ interface SettingsViewProps {
   auditLogs: AuditLogEntry[];
   onTestVault: () => Promise<boolean>;
   onRefresh: () => void;
+  detectedBrowsers?: BrowserInfo[];
 }
 
 export const SettingsView: React.FC<SettingsViewProps> = ({
@@ -28,6 +30,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   auditLogs,
   onTestVault,
   onRefresh,
+  detectedBrowsers = [],
 }) => {
   const [vaultTestResult, setVaultTestResult] = useState<boolean | null>(null);
   const [isTestingVault, setIsTestingVault] = useState(false);
@@ -221,6 +224,67 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
             )}
           </div>
         </div>
+      </div>
+
+      {/* Browser Detection Section */}
+      <div className="bg-surface-900 border border-surface-800 rounded-xl p-5 space-y-4 shadow-sm">
+        <div className="flex items-center justify-between border-b border-surface-800 pb-3">
+          <div className="flex items-center gap-2.5">
+            <Monitor className="w-5 h-5 text-purple-400" />
+            <div>
+              <h3 className="text-sm font-semibold text-slate-100">Browser Detection</h3>
+              <p className="text-xs text-slate-400">
+                Installed browsers available for Native Browser Mode (macOS only). No browser is fabricated.
+              </p>
+            </div>
+          </div>
+          <button
+            onClick={onRefresh}
+            className="text-xs text-brand-accent hover:text-blue-400 font-medium flex items-center gap-1.5"
+          >
+            <RefreshCw className="w-3.5 h-3.5" /> Re-detect
+          </button>
+        </div>
+
+        {detectedBrowsers.length === 0 ? (
+          <div className="p-4 bg-surface-850 rounded-lg border border-surface-750 text-xs text-slate-400 text-center">
+            No browsers detected, or detection not yet run. Click Re-detect.
+          </div>
+        ) : (
+          <div className="space-y-3">
+            {detectedBrowsers.map((browser, idx) => (
+              <div key={idx} className="p-3 bg-surface-850 rounded-lg border border-surface-750 flex items-center justify-between text-xs">
+                <div className="flex items-center gap-3">
+                  <div className={`w-2 h-2 rounded-full ${browser.installed ? 'bg-emerald-400' : 'bg-rose-500'}`} />
+                  <div>
+                    <div className="font-semibold text-slate-200">{browser.display_name || browser.browser_type}</div>
+                    {browser.executable_path && (
+                      <div className="text-[11px] font-mono text-slate-500 mt-0.5 truncate max-w-[400px]">{browser.executable_path}</div>
+                    )}
+                  </div>
+                </div>
+                <div className="flex items-center gap-3">
+                  {browser.version && (
+                    <span className="font-mono text-slate-400 text-[11px]">v{browser.version}</span>
+                  )}
+                  <span className={`px-2 py-0.5 rounded-full text-[11px] font-semibold border ${
+                    browser.installed
+                      ? 'bg-emerald-950/60 text-emerald-400 border-emerald-800/60'
+                      : 'bg-rose-950/60 text-rose-400 border-rose-800/60'
+                  }`}>
+                    {browser.installed ? '✓ Installed' : '✗ Not Found'}
+                  </span>
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+
+        {isMac && (
+          <div className="text-[11px] text-slate-500 leading-relaxed pt-1">
+            💡 Native Browser Mode launches Microsoft Edge directly on macOS Apple Silicon with an isolated persistent profile and an authenticated proxy bridge (127.0.0.1 only). Requires Edge to be installed at <span className="font-mono">/Applications/Microsoft Edge.app</span>.
+          </div>
+        )}
       </div>
 
       {/* Audit Log Trail Viewer */}

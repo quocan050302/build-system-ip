@@ -11,16 +11,41 @@ export const StatusBadge: React.FC<StatusBadgeProps> = ({ status, type: _type = 
 
   const normalized = status.toUpperCase();
 
-  if (normalized === 'RUNNING' || normalized === 'VERIFIED' || normalized === 'AUTHORIZED' || normalized === 'ACTIVE') {
+  if (
+    normalized === 'RUNNING' ||
+    normalized === 'VERIFIED' ||
+    normalized === 'BROWSER_EGRESS_VERIFIED' ||
+    normalized === 'GUEST_EGRESS_OBSERVED' ||
+    normalized === 'AUTHORIZED' ||
+    normalized === 'ACTIVE'
+  ) {
     bg = 'bg-emerald-950/60 text-emerald-300 border-emerald-800/80';
     dot = 'bg-emerald-400';
-  } else if (normalized === 'STARTING' || normalized === 'CHECKING' || normalized === 'DEGRADED') {
+  } else if (
+    normalized === 'PROXY_EGRESS_VERIFIED' ||
+    normalized === 'ENDPOINT_REACHABLE'
+  ) {
+    bg = 'bg-blue-950/60 text-blue-300 border-blue-800/80';
+    dot = 'bg-blue-400';
+  } else if (
+    normalized === 'STARTING' ||
+    normalized === 'CHECKING' ||
+    normalized === 'DEGRADED' ||
+    normalized === 'ENDPOINT_CONFIGURED' ||
+    normalized === 'VERIFICATION_UNAVAILABLE'
+  ) {
     bg = 'bg-amber-950/60 text-amber-300 border-amber-800/80';
     dot = 'bg-amber-400 animate-pulse';
   } else if (normalized === 'STOPPED' || normalized === 'NOT_CHECKED' || normalized === 'INACTIVE') {
     bg = 'bg-slate-800/80 text-slate-400 border-slate-700/80';
     dot = 'bg-slate-500';
-  } else if (normalized === 'ERROR' || normalized === 'TERMINATED' || normalized === 'DISCONNECTED') {
+  } else if (
+    normalized === 'ERROR' ||
+    normalized === 'TERMINATED' ||
+    normalized === 'DISCONNECTED' ||
+    normalized === 'AUTH_FAILED' ||
+    normalized === 'CONNECTION_FAILED'
+  ) {
     bg = 'bg-rose-950/70 text-rose-300 border-rose-800/80';
     dot = 'bg-rose-500';
   } else if (normalized === 'RESTRICTED' || normalized === 'STOPPING') {

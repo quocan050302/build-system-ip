@@ -86,6 +86,7 @@ fn test_env_001_create_environment_valid() {
         channel_id: None,
         host_platform: None,
         vm_architecture: None,
+        ..Default::default()
     };
 
     let env = vm_service.create_environment(req).expect("Failed to create environment");
@@ -113,6 +114,7 @@ fn test_env_002_reject_duplicate_environment_name() {
         channel_id: None,
         host_platform: None,
         vm_architecture: None,
+        ..Default::default()
     };
 
     vm_service.create_environment(req.clone()).expect("First creation should succeed");
@@ -137,6 +139,7 @@ fn test_env_005_start_and_shutdown_vm() {
         channel_id: None,
         host_platform: None,
         vm_architecture: None,
+        ..Default::default()
     };
 
     let env = vm_service.create_environment(req).unwrap();
@@ -173,6 +176,7 @@ fn test_env_008_prevent_unsafe_deletion_of_running_vm() {
         channel_id: None,
         host_platform: None,
         vm_architecture: None,
+        ..Default::default()
     };
 
     let env = vm_service.create_environment(req).unwrap();
@@ -199,6 +203,7 @@ fn test_env_009_storage_isolation_distinct_paths() {
         channel_id: None,
         host_platform: None,
         vm_architecture: None,
+        ..Default::default()
     }).unwrap();
 
     let env2 = vm_service.create_environment(CreateEnvironmentRequest {
@@ -214,6 +219,7 @@ fn test_env_009_storage_isolation_distinct_paths() {
         channel_id: None,
         host_platform: None,
         vm_architecture: None,
+        ..Default::default()
     }).unwrap();
 
     assert_ne!(env1.disk_path, env2.disk_path);
@@ -231,6 +237,7 @@ fn test_net_001_truthful_guest_network_check() {
         host: Some("198.51.100.88".to_string()),
         port: Some(1080),
         credentials_secret: Some("secret123".to_string()),
+        ..Default::default()
     }).unwrap();
 
     let env = vm_service.create_environment(CreateEnvironmentRequest {
@@ -246,6 +253,7 @@ fn test_net_001_truthful_guest_network_check() {
         channel_id: None,
         host_platform: None,
         vm_architecture: None,
+        ..Default::default()
     }).unwrap();
 
     // VM is STOPPED: network check must NOT claim verification
@@ -278,6 +286,7 @@ fn test_net_002_verified_in_guest_diagnostics() {
         channel_id: None,
         host_platform: Some("macos-aarch64".to_string()),
         vm_architecture: Some("aarch64".to_string()),
+        ..Default::default()
     }).unwrap();
 
     // Record legitimate in-guest observed egress
@@ -312,6 +321,7 @@ fn test_net_005_duplicate_egress_warning_detection() {
         channel_id: None,
         host_platform: None,
         vm_architecture: None,
+        ..Default::default()
     }).unwrap();
 
     let env2 = vm_service.create_environment(CreateEnvironmentRequest {
@@ -327,6 +337,7 @@ fn test_net_005_duplicate_egress_warning_detection() {
         channel_id: None,
         host_platform: None,
         vm_architecture: None,
+        ..Default::default()
     }).unwrap();
 
     // Both environments observe the same public IP egress
@@ -361,6 +372,7 @@ fn test_ch_001_and_004_channel_compliance_and_termination_lock() {
         display_name: "Channel Alpha".to_string(),
         environment_id: None,
         authorization_status: "AUTHORIZED".to_string(),
+        ..Default::default()
     }).unwrap();
 
     assert_eq!(ch.authorization_status, "AUTHORIZED");
@@ -467,10 +479,10 @@ fn test_hypervisor_factory_no_silent_mock_fallback() {
 }
 
 #[test]
-fn test_database_migrations_v1_to_v2() {
+fn test_database_migrations_v1_to_v3() {
     let mut conn = rusqlite::Connection::open_in_memory().unwrap();
 
-    // Run migrations up to v2
+    // Run all migrations
     youtube_isolation_manager_lib::db::migrations::run_migrations(&mut conn).unwrap();
 
     let version: i64 = conn.query_row(
@@ -478,15 +490,31 @@ fn test_database_migrations_v1_to_v2() {
         [],
         |r| r.get(0),
     ).unwrap();
-    assert_eq!(version, 2);
+    assert!(version >= 3, "Expected schema version >= 3, got {}", version);
 
     // Verify v2 columns exist in environments table
-    let count: i64 = conn.query_row(
+    let count_v2: i64 = conn.query_row(
         "SELECT COUNT(1) FROM pragma_table_info('environments') WHERE name IN ('host_platform', 'vm_architecture', 'provisioning_status');",
         [],
         |r| r.get(0),
     ).unwrap();
-    assert_eq!(count, 3);
+    assert_eq!(count_v2, 3, "v2 columns missing");
+
+    // Verify v3 columns exist in environments table
+    let count_v3: i64 = conn.query_row(
+        "SELECT COUNT(1) FROM pragma_table_info('environments') WHERE name IN ('execution_mode', 'startup_url', 'preferred_language');",
+        [],
+        |r| r.get(0),
+    ).unwrap();
+    assert_eq!(count_v3, 3, "v3 columns missing from environments");
+
+    // Verify v3 columns exist in network_endpoints table
+    let count_ep_v3: i64 = conn.query_row(
+        "SELECT COUNT(1) FROM pragma_table_info('network_endpoints') WHERE name IN ('username', 'expected_country', 'expected_ip');",
+        [],
+        |r| r.get(0),
+    ).unwrap();
+    assert_eq!(count_ep_v3, 3, "v3 columns missing from network_endpoints");
 }
 
 #[test]
@@ -506,6 +534,7 @@ fn test_application_restart_reconciliation() {
         channel_id: None,
         host_platform: None,
         vm_architecture: None,
+        ..Default::default()
     }).unwrap();
 
     // Manually mutate mock hypervisor state directly (simulating external power event)

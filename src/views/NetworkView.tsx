@@ -7,7 +7,9 @@ import {
   Activity, 
   Lock, 
   RefreshCw,
-  Layers
+  Layers,
+  ShieldCheck,
+  Monitor
 } from 'lucide-react';
 import { 
   NetworkEndpointRecord, 
@@ -28,6 +30,7 @@ interface NetworkViewProps {
   onAssignEndpoint: (environmentId: string, endpointId?: string | null) => Promise<void>;
   onCheckNetwork: (environmentId: string) => Promise<void>;
   onLaunchBrowser: (environmentId: string) => Promise<void>;
+  onVerifyBrowserEgress?: (environmentId: string) => Promise<void>;
 }
 
 export const NetworkView: React.FC<NetworkViewProps> = ({
@@ -40,6 +43,7 @@ export const NetworkView: React.FC<NetworkViewProps> = ({
   onAssignEndpoint,
   onCheckNetwork,
   onLaunchBrowser,
+  onVerifyBrowserEgress,
 }) => {
   const [isAddOpen, setIsAddOpen] = useState(false);
   const [selectedEndpointForDelete, setSelectedEndpointForDelete] = useState<NetworkEndpointRecord | null>(null);
@@ -56,13 +60,40 @@ export const NetworkView: React.FC<NetworkViewProps> = ({
     }
   };
 
+  const handleVerifyBrowserEgress = async (envId: string) => {
+    if (!onVerifyBrowserEgress) return;
+    try {
+      setLoadingKey(`browser-egress-${envId}`);
+      await onVerifyBrowserEgress(envId);
+    } catch (err: any) {
+      alert(`Browser egress verification failed: ${err?.message || err}`);
+    } finally {
+      setLoadingKey(null);
+    }
+  };
+
+  const handleDiagnosticTrigger = async (envId: string) => {
+    try {
+      setLoadingKey(envId);
+      await onCheckNetwork(envId);
+    } catch (err: any) {
+      alert(`Network diagnostic error: ${err?.message || err}`);
+    } finally {
+      setLoadingKey(null);
+    }
+  };
+
   // Form State
   const [name, setName] = useState('');
-  const [endpointType, setEndpointType] = useState('SOCKS5');
+  const [endpointType, setEndpointType] = useState('HTTP');
   const [providerLabel, setProviderLabel] = useState('');
   const [host, setHost] = useState('');
-  const [port, setPort] = useState(1080);
+  const [port, setPort] = useState(8080);
+  const [username, setUsername] = useState('');
   const [secret, setSecret] = useState('');
+  const [expectedCountry, setExpectedCountry] = useState('US');
+  const [expectedIp, setExpectedIp] = useState('');
+  const [expiresAt, setExpiresAt] = useState('');
   const [formError, setFormError] = useState<string | null>(null);
 
   const handleCreate = async (e: React.FormEvent) => {
@@ -82,13 +113,21 @@ export const NetworkView: React.FC<NetworkViewProps> = ({
         provider_label: providerLabel.trim() || null,
         host: host.trim() || null,
         port: port ? Number(port) : null,
+        username: username.trim() || null,
         credentials_secret: secret.trim() || null,
+        expected_country: expectedCountry.trim() || null,
+        expected_ip: expectedIp.trim() || null,
+        expires_at: expiresAt || null,
       });
       setIsAddOpen(false);
       setName('');
       setHost('');
       setSecret('');
       setProviderLabel('');
+      setUsername('');
+      setExpectedCountry('US');
+      setExpectedIp('');
+      setExpiresAt('');
     } catch (err: any) {
       setFormError(err?.message || String(err));
     } finally {
@@ -96,14 +135,22 @@ export const NetworkView: React.FC<NetworkViewProps> = ({
     }
   };
 
-  const handleDiagnosticTrigger = async (envId: string) => {
-    try {
-      setLoadingKey(envId);
-      await onCheckNetwork(envId);
-    } catch (err: any) {
-      alert(`Network diagnostic error: ${err?.message || err}`);
-    } finally {
-      setLoadingKey(null);
+  const getNetworkStatusBadge = (status?: string | null) => {
+    switch (status) {
+      case 'BROWSER_EGRESS_VERIFIED':
+        return <span className="text-[10px] font-mono px-2 py-0.5 rounded-full border bg-emerald-950/80 text-emerald-300 border-emerald-700/80">🛡️ BROWSER VERIFIED</span>;
+      case 'PROXY_EGRESS_VERIFIED':
+        return <span className="text-[10px] font-mono px-2 py-0.5 rounded-full border bg-blue-950/80 text-blue-300 border-blue-700/80">✅ PROXY VERIFIED</span>;
+      case 'ENDPOINT_REACHABLE':
+        return <span className="text-[10px] font-mono px-2 py-0.5 rounded-full border bg-sky-950/60 text-sky-400 border-sky-800/60">REACHABLE</span>;
+      case 'CONNECTION_FAILED':
+        return <span className="text-[10px] font-mono px-2 py-0.5 rounded-full border bg-rose-950/60 text-rose-400 border-rose-800/60">FAILED</span>;
+      case 'AUTH_FAILED':
+        return <span className="text-[10px] font-mono px-2 py-0.5 rounded-full border bg-orange-950/60 text-orange-400 border-orange-800/60">AUTH FAILED</span>;
+      case 'NOT_CONFIGURED':
+        return <span className="text-[10px] font-mono px-2 py-0.5 rounded-full border bg-surface-800 text-slate-500 border-surface-700">NOT CONFIGURED</span>;
+      default:
+        return <span className="text-[10px] font-mono px-2 py-0.5 rounded-full border bg-surface-800 text-slate-500 border-surface-700">{status || 'UNKNOWN'}</span>;
     }
   };
 
@@ -134,9 +181,9 @@ export const NetworkView: React.FC<NetworkViewProps> = ({
       {/* Top Header Controls */}
       <div className="flex flex-col sm:flex-row items-center justify-between gap-4 bg-surface-900 border border-surface-800 p-4 rounded-xl">
         <div>
-          <h3 className="text-sm font-semibold text-slate-100">Network Endpoints & Egress Verification</h3>
+          <h3 className="text-sm font-semibold text-slate-100">Network Endpoints &amp; Egress Verification</h3>
           <p className="text-xs text-slate-400">
-            Configure legitimate residential/dedicated proxies or VPN connections. Verified directly from guest VMs.
+            Configure authenticated US proxies. Distinct states: Endpoint Configured → Proxy Verified → Browser Verified.
           </p>
         </div>
 
@@ -171,20 +218,32 @@ export const NetworkView: React.FC<NetworkViewProps> = ({
           ) : (
             environments.map((env) => {
               const isRunning = env.status === 'RUNNING';
+              const isNative = env.execution_mode === 'NATIVE_BROWSER';
               const isChecking = loadingKey === env.id;
+              const isVerifyingBrowser = loadingKey === `browser-egress-${env.id}`;
+              const isLaunching = loadingKey === `launch-${env.id}`;
 
               return (
                 <div key={env.id} className="bg-surface-900 border border-surface-800 rounded-xl p-4 space-y-3 flex flex-col justify-between">
                   <div>
                     <div className="flex items-center justify-between">
                       <div className="flex items-center gap-2">
-                        <Layers className="w-4 h-4 text-blue-400" />
+                        {isNative ? <Monitor className="w-4 h-4 text-purple-400" /> : <Layers className="w-4 h-4 text-blue-400" />}
                         <span className="font-semibold text-sm text-slate-100">{env.name}</span>
                       </div>
                       <span className={`text-[10px] font-mono px-2 py-0.5 rounded-full border ${
                         isRunning ? 'bg-emerald-950/60 text-emerald-400 border-emerald-800/80' : 'bg-surface-800 text-slate-400 border-surface-700'
                       }`}>
                         {env.status}
+                      </span>
+                    </div>
+
+                    {/* Mode badge */}
+                    <div className="mt-1.5">
+                      <span className={`text-[10px] font-mono px-2 py-0.5 rounded border ${
+                        isNative ? 'bg-purple-950/60 text-purple-300 border-purple-800/60' : 'bg-blue-950/60 text-blue-300 border-blue-800/60'
+                      }`}>
+                        {isNative ? '🌐 Native Browser' : '🖥️ VM'}
                       </span>
                     </div>
 
@@ -213,6 +272,29 @@ export const NetworkView: React.FC<NetworkViewProps> = ({
                         </span>
                       </div>
 
+                      {env.last_observed_country && (
+                        <div className="flex items-center justify-between text-[11px]">
+                          <span className="text-slate-400">Observed Country:</span>
+                          <span className="font-mono font-semibold text-amber-300">{env.last_observed_country}</span>
+                        </div>
+                      )}
+
+                      {/* Network status badge */}
+                      {env.last_network_status && env.last_network_status !== 'NOT_CONFIGURED' && (
+                        <div className="flex items-center justify-between text-[11px]">
+                          <span className="text-slate-400">Egress Status:</span>
+                          {getNetworkStatusBadge(env.last_network_status)}
+                        </div>
+                      )}
+
+                      {/* Proxy bridge port for native mode */}
+                      {isNative && env.proxy_bridge_port && (
+                        <div className="flex items-center justify-between text-[11px]">
+                          <span className="text-slate-400">Proxy Bridge Port:</span>
+                          <span className="font-mono text-purple-300">{env.proxy_bridge_port}</span>
+                        </div>
+                      )}
+
                       <div className="flex items-center justify-between text-[11px] pt-1 border-t border-surface-750/80 text-slate-500">
                         <span>Last Verified:</span>
                         <span className="font-mono">
@@ -222,6 +304,7 @@ export const NetworkView: React.FC<NetworkViewProps> = ({
                     </div>
                   </div>
 
+                  {/* Endpoint assign + Verify buttons */}
                   <div className="flex items-center justify-between gap-2 pt-2 border-t border-surface-800">
                     <select
                       value={env.network_endpoint_id || ''}
@@ -239,7 +322,7 @@ export const NetworkView: React.FC<NetworkViewProps> = ({
                     <button
                       onClick={() => handleDiagnosticTrigger(env.id)}
                       disabled={isChecking}
-                      title="Run Guest Diagnostic Egress Check"
+                      title="Run Proxy Egress Check (backend probe)"
                       className="px-2.5 py-1 bg-brand-accent/20 hover:bg-brand-accent/30 text-blue-400 border border-brand-accent/40 rounded text-xs font-medium transition-colors flex items-center gap-1"
                     >
                       <Activity className={`w-3.5 h-3.5 ${isChecking ? 'animate-spin' : ''}`} />
@@ -247,13 +330,30 @@ export const NetworkView: React.FC<NetworkViewProps> = ({
                     </button>
                   </div>
 
-                  {/* Button: Mở Trình duyệt Kênh (YouTube Studio) */}
+                  {/* Browser Egress Verify (native mode only) */}
+                  {isNative && onVerifyBrowserEgress && (
+                    <button
+                      onClick={() => handleVerifyBrowserEgress(env.id)}
+                      disabled={isVerifyingBrowser || !isRunning}
+                      title={isRunning ? 'Verify actual browser network egress through proxy bridge' : 'Start browser first to verify egress'}
+                      className={`w-full py-1.5 px-3 rounded-lg text-xs font-semibold transition-all flex items-center justify-center gap-2 border ${
+                        isRunning
+                          ? 'bg-emerald-950/40 hover:bg-emerald-900/60 text-emerald-400 border-emerald-800/60'
+                          : 'bg-surface-850 text-slate-500 border-surface-700 cursor-not-allowed opacity-60'
+                      }`}
+                    >
+                      <ShieldCheck className={`w-3.5 h-3.5 ${isVerifyingBrowser ? 'animate-spin' : ''}`} />
+                      <span>{isVerifyingBrowser ? 'Verifying Browser Egress...' : '🛡️ Verify Browser Egress'}</span>
+                    </button>
+                  )}
+
+                  {/* Launch Browser button */}
                   <button
                     onClick={() => handleLaunchBrowser(env.id)}
-                    disabled={loadingKey === `launch-${env.id}`}
-                    className="w-full mt-2.5 py-2 px-3 bg-gradient-to-r from-red-600 to-rose-600 hover:from-red-500 hover:to-rose-500 active:scale-[0.99] text-white rounded-lg text-xs font-semibold shadow-md shadow-rose-950/30 transition-all flex items-center justify-center gap-2"
+                    disabled={isLaunching}
+                    className="w-full mt-1 py-2 px-3 bg-gradient-to-r from-purple-700 to-indigo-700 hover:from-purple-600 hover:to-indigo-600 active:scale-[0.99] text-white rounded-lg text-xs font-semibold shadow-md shadow-purple-950/30 transition-all flex items-center justify-center gap-2"
                   >
-                    <span>🚀 Mở Trình duyệt Kênh (YouTube Studio)</span>
+                    <span>🚀 {isNative ? 'Open Edge Profile' : 'Mở Trình duyệt Kênh'}</span>
                   </button>
                 </div>
               );
@@ -279,7 +379,8 @@ export const NetworkView: React.FC<NetworkViewProps> = ({
                 <th className="py-3 px-4">Endpoint Name</th>
                 <th className="py-3 px-4">Protocol</th>
                 <th className="py-3 px-4">Host / Port</th>
-                <th className="py-3 px-4">Provider / Label</th>
+                <th className="py-3 px-4">Provider</th>
+                <th className="py-3 px-4">Expected Country</th>
                 <th className="py-3 px-4">Security Vault</th>
                 <th className="py-3 px-4 text-right">Actions</th>
               </tr>
@@ -287,9 +388,9 @@ export const NetworkView: React.FC<NetworkViewProps> = ({
             <tbody className="divide-y divide-surface-800/80">
               {endpoints.length === 0 ? (
                 <tr>
-                  <td colSpan={6} className="py-10 text-center text-slate-500">
+                  <td colSpan={7} className="py-10 text-center text-slate-500">
                     <Globe className="w-8 h-8 mx-auto mb-2 text-slate-600" />
-                    No network endpoints configured. Click "Add Network Endpoint" to add proxies or VPN connections.
+                    No network endpoints configured. Click "Add Network Endpoint" to add proxies.
                   </td>
                 </tr>
               ) : (
@@ -297,6 +398,9 @@ export const NetworkView: React.FC<NetworkViewProps> = ({
                   <tr key={ep.id} className="hover:bg-surface-850/40 transition-colors">
                     <td className="py-3.5 px-4 font-semibold text-slate-200">
                       {ep.name}
+                      {ep.username && (
+                        <div className="text-[10px] text-slate-500 font-mono mt-0.5">user: {ep.username}</div>
+                      )}
                     </td>
                     <td className="py-3.5 px-4">
                       <span className="font-mono px-2 py-0.5 rounded text-[11px] bg-surface-800 text-blue-400 border border-surface-700">
@@ -308,6 +412,15 @@ export const NetworkView: React.FC<NetworkViewProps> = ({
                     </td>
                     <td className="py-3.5 px-4 text-slate-400">
                       {ep.provider_label || '—'}
+                    </td>
+                    <td className="py-3.5 px-4">
+                      {ep.expected_country ? (
+                        <span className="font-mono font-semibold text-amber-300 bg-amber-950/40 border border-amber-800/50 px-2 py-0.5 rounded text-[11px]">
+                          🇺🇸 {ep.expected_country}
+                        </span>
+                      ) : (
+                        <span className="text-slate-500 text-[11px]">—</span>
+                      )}
                     </td>
                     <td className="py-3.5 px-4">
                       {ep.has_credentials ? (
@@ -340,7 +453,7 @@ export const NetworkView: React.FC<NetworkViewProps> = ({
         isOpen={isAddOpen}
         onClose={() => setIsAddOpen(false)}
         title="Add Network Endpoint"
-        subtitle="Register a legitimate proxy or VPN connection for environment network isolation"
+        subtitle="Register an authenticated US proxy. Credentials are sealed in the native hardware vault."
       >
         <form onSubmit={handleCreate} className="space-y-4 text-xs">
           {formError && (
@@ -354,7 +467,7 @@ export const NetworkView: React.FC<NetworkViewProps> = ({
             <input
               type="text"
               required
-              placeholder="e.g. US-Residential-Static-01"
+              placeholder="e.g. J2Proxy-US-01"
               value={name}
               onChange={(e) => setName(e.target.value)}
               className="w-full px-3 py-2 bg-surface-850 border border-surface-750 rounded-lg text-slate-100 focus:outline-none focus:border-brand-accent font-medium"
@@ -369,8 +482,8 @@ export const NetworkView: React.FC<NetworkViewProps> = ({
                 onChange={(e) => setEndpointType(e.target.value)}
                 className="w-full px-3 py-2 bg-surface-850 border border-surface-750 rounded-lg text-slate-100 focus:outline-none focus:border-brand-accent"
               >
+                <option value="HTTP">HTTP/HTTPS Proxy (Recommended)</option>
                 <option value="SOCKS5">SOCKS5 Proxy</option>
-                <option value="HTTP">HTTP/HTTPS Proxy</option>
                 <option value="WIREGUARD">WireGuard VPN</option>
                 <option value="DIRECT">Direct Secondary Adapter</option>
               </select>
@@ -380,7 +493,7 @@ export const NetworkView: React.FC<NetworkViewProps> = ({
               <label className="block text-slate-300 font-medium mb-1">Provider Label (Optional)</label>
               <input
                 type="text"
-                placeholder="e.g. BrightData, Mullvad"
+                placeholder="e.g. J2Proxy, BrightData"
                 value={providerLabel}
                 onChange={(e) => setProviderLabel(e.target.value)}
                 className="w-full px-3 py-2 bg-surface-850 border border-surface-750 rounded-lg text-slate-100 focus:outline-none focus:border-brand-accent"
@@ -410,24 +523,70 @@ export const NetworkView: React.FC<NetworkViewProps> = ({
             </div>
           </div>
 
-          <div>
-            <label className="block text-slate-300 font-medium mb-1 flex items-center justify-between">
-              <span>Authentication Credentials / Secret (Optional)</span>
-              <span className="text-[10px] text-blue-400 font-mono flex items-center gap-1">
-                <Lock className="w-3 h-3" /> Sealed with Windows DPAPI
-              </span>
-            </label>
-            <input
-              type="password"
-              placeholder="user:password or auth token"
-              value={secret}
-              onChange={(e) => setSecret(e.target.value)}
-              className="w-full px-3 py-2 bg-surface-850 border border-surface-750 rounded-lg text-slate-100 font-mono focus:outline-none focus:border-brand-accent"
-            />
-            <p className="text-[10px] text-slate-500 mt-1">
-              Encrypted locally using your Windows user account master key. Never stored in plaintext.
-            </p>
+          <div className="grid grid-cols-2 gap-4">
+            <div>
+              <label className="block text-slate-300 font-medium mb-1">Username (Optional)</label>
+              <input
+                type="text"
+                placeholder="proxy_username"
+                value={username}
+                onChange={(e) => setUsername(e.target.value)}
+                className="w-full px-3 py-2 bg-surface-850 border border-surface-750 rounded-lg text-slate-100 font-mono focus:outline-none focus:border-brand-accent"
+              />
+            </div>
+            <div>
+              <label className="block text-slate-300 font-medium mb-1 flex items-center gap-1">
+                <span>Password / Secret</span>
+                <Lock className="w-3 h-3 text-blue-400" />
+              </label>
+              <input
+                type="password"
+                placeholder="sealed in keychain"
+                value={secret}
+                onChange={(e) => setSecret(e.target.value)}
+                className="w-full px-3 py-2 bg-surface-850 border border-surface-750 rounded-lg text-slate-100 font-mono focus:outline-none focus:border-brand-accent"
+              />
+            </div>
           </div>
+
+          <div className="grid grid-cols-2 gap-4">
+            <div>
+              <label className="block text-slate-300 font-medium mb-1">Expected Country Code</label>
+              <input
+                type="text"
+                placeholder="US"
+                maxLength={3}
+                value={expectedCountry}
+                onChange={(e) => setExpectedCountry(e.target.value.toUpperCase())}
+                className="w-full px-3 py-2 bg-surface-850 border border-surface-750 rounded-lg text-slate-100 font-mono focus:outline-none focus:border-brand-accent"
+              />
+              <p className="text-[10px] text-slate-500 mt-1">Used to validate egress country during BROWSER_EGRESS_VERIFIED check.</p>
+            </div>
+            <div>
+              <label className="block text-slate-300 font-medium mb-1">Expected IP (Optional)</label>
+              <input
+                type="text"
+                placeholder="104.21.xxx.xxx"
+                value={expectedIp}
+                onChange={(e) => setExpectedIp(e.target.value)}
+                className="w-full px-3 py-2 bg-surface-850 border border-surface-750 rounded-lg text-slate-100 font-mono focus:outline-none focus:border-brand-accent"
+              />
+            </div>
+          </div>
+
+          <div>
+            <label className="block text-slate-300 font-medium mb-1">Subscription Expiry (Optional)</label>
+            <input
+              type="date"
+              value={expiresAt}
+              onChange={(e) => setExpiresAt(e.target.value)}
+              className="w-full px-3 py-2 bg-surface-850 border border-surface-750 rounded-lg text-slate-100 focus:outline-none focus:border-brand-accent"
+            />
+          </div>
+
+          <p className="text-[10px] text-slate-500 leading-relaxed">
+            ⚠️ Credentials are encrypted using your device's hardware vault (Apple Keychain / Windows DPAPI). Never stored in plaintext. The proxy bridge binds exclusively to 127.0.0.1 — no external access.
+          </p>
 
           <div className="flex items-center justify-end gap-3 pt-4 border-t border-surface-800">
             <button
@@ -443,7 +602,7 @@ export const NetworkView: React.FC<NetworkViewProps> = ({
               className="px-4 py-2 bg-brand-accent hover:bg-blue-600 text-white rounded-lg font-semibold shadow-sm transition-colors flex items-center gap-1.5"
             >
               {loadingKey === 'create' && <RefreshCw className="w-3.5 h-3.5 animate-spin" />}
-              <span>Save & Seal Endpoint</span>
+              <span>Save &amp; Seal Endpoint</span>
             </button>
           </div>
         </form>

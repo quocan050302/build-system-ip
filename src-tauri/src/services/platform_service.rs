@@ -276,12 +276,16 @@ impl PlatformService {
         match target_triple {
             "macos-aarch64" => {
                 caps.push("Apple Silicon Native Virtualization".to_string());
+                caps.push("Microsoft Edge Native Browser Isolation".to_string());
+                caps.push("Supervised Localhost Authenticated Proxy Bridge".to_string());
                 caps.push("UTM Virtual Machine Manager".to_string());
                 caps.push("Ubuntu ARM64 Native Guest Virtualization".to_string());
                 caps.push("Apple Keychain Secret Sealing".to_string());
             }
             "windows-x86_64" => {
                 caps.push("Microsoft Hyper-V Type-1 Hypervisor".to_string());
+                caps.push("Microsoft Edge & Chromium Native Isolation".to_string());
+                caps.push("Supervised Localhost Authenticated Proxy Bridge".to_string());
                 caps.push("VHDX Dynamic Persistent Disks".to_string());
                 caps.push("Windows DPAPI Hardware-bound Vault".to_string());
                 caps.push("VMConnect Virtual Machine Console".to_string());

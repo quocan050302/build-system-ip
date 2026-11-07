@@ -138,5 +138,51 @@ pub fn run_migrations(conn: &mut Connection) -> Result<()> {
         tx.commit()?;
     }
 
+    if current_version < 3 {
+        let tx = conn.transaction()?;
+        tx.execute_batch(
+            "
+            ALTER TABLE environments ADD COLUMN execution_mode TEXT NOT NULL DEFAULT 'VM';
+            ALTER TABLE environments ADD COLUMN startup_url TEXT NOT NULL DEFAULT 'https://studio.youtube.com';
+            ALTER TABLE environments ADD COLUMN preferred_language TEXT NOT NULL DEFAULT 'en-US';
+            ALTER TABLE environments ADD COLUMN us_content_preferences INTEGER NOT NULL DEFAULT 1;
+
+            ALTER TABLE browser_profiles ADD COLUMN startup_url TEXT NOT NULL DEFAULT 'https://studio.youtube.com';
+            ALTER TABLE browser_profiles ADD COLUMN preferred_language TEXT NOT NULL DEFAULT 'en-US';
+            ALTER TABLE browser_profiles ADD COLUMN executable_path TEXT;
+            ALTER TABLE browser_profiles ADD COLUMN active_pid INTEGER;
+            ALTER TABLE browser_profiles ADD COLUMN proxy_bridge_port INTEGER;
+            ALTER TABLE browser_profiles ADD COLUMN last_launched_at TEXT;
+            ALTER TABLE browser_profiles ADD COLUMN session_status TEXT NOT NULL DEFAULT 'STOPPED';
+
+            ALTER TABLE network_endpoints ADD COLUMN username TEXT;
+            ALTER TABLE network_endpoints ADD COLUMN expected_country TEXT;
+            ALTER TABLE network_endpoints ADD COLUMN expected_ip TEXT;
+            ALTER TABLE network_endpoints ADD COLUMN expires_at TEXT;
+
+            ALTER TABLE network_checks ADD COLUMN observed_country TEXT;
+            ALTER TABLE network_checks ADD COLUMN dns_leak_status TEXT NOT NULL DEFAULT 'UNVERIFIED';
+            ALTER TABLE network_checks ADD COLUMN webrtc_status TEXT NOT NULL DEFAULT 'UNVERIFIED';
+            ALTER TABLE network_checks ADD COLUMN proxy_auth_status TEXT;
+            ALTER TABLE network_checks ADD COLUMN session_id TEXT;
+            ALTER TABLE network_checks ADD COLUMN error_details TEXT;
+
+            ALTER TABLE channels ADD COLUMN platform TEXT NOT NULL DEFAULT 'YouTube';
+            ALTER TABLE channels ADD COLUMN workspace_name TEXT NOT NULL DEFAULT 'Alexa Creator Studio';
+            ALTER TABLE channels ADD COLUMN account_handle TEXT;
+            ALTER TABLE channels ADD COLUMN profile_url TEXT;
+            ALTER TABLE channels ADD COLUMN analytics_url TEXT;
+            ALTER TABLE channels ADD COLUMN gumroad_url TEXT;
+            ALTER TABLE channels ADD COLUMN utm_source TEXT;
+            ALTER TABLE channels ADD COLUMN utm_medium TEXT;
+            ALTER TABLE channels ADD COLUMN utm_campaign TEXT;
+
+            INSERT INTO schema_version (version, applied_at)
+            VALUES (3, datetime('now'));
+            "
+        )?;
+        tx.commit()?;
+    }
+
     Ok(())
 }

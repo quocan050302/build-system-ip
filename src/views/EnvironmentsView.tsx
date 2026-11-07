@@ -8,7 +8,10 @@ import {
   ShieldAlert, 
   Layers, 
   RefreshCw,
-  Terminal
+  Terminal,
+  Globe,
+  FolderOpen,
+  CheckCircle2,
 } from 'lucide-react';
 import { 
   EnvironmentRecord, 
@@ -34,6 +37,9 @@ interface EnvironmentsViewProps {
   onShutdownEnvironment: (id: string, force: boolean) => Promise<void>;
   onOpenConsole?: (id: string) => Promise<void>;
   onLaunchBrowser?: (id: string) => Promise<void>;
+  onLaunchNativeBrowser?: (id: string, url?: string) => Promise<void>;
+  onStopBrowser?: (id: string) => Promise<void>;
+  onVerifyBrowserEgress?: (id: string) => Promise<void>;
   onDeleteEnvironment: (id: string, deleteDisks: boolean) => Promise<void>;
   onCheckNetwork: (id: string) => Promise<void>;
 }
@@ -50,6 +56,9 @@ export const EnvironmentsView: React.FC<EnvironmentsViewProps> = ({
   onShutdownEnvironment,
   onOpenConsole,
   onLaunchBrowser,
+  onLaunchNativeBrowser,
+  onStopBrowser,
+  onVerifyBrowserEgress,
   onDeleteEnvironment,
   onCheckNetwork,
 }) => {
@@ -71,10 +80,15 @@ export const EnvironmentsView: React.FC<EnvironmentsViewProps> = ({
   const [newRamMb, setNewRamMb] = useState(2048);
   const [newDiskMb, setNewDiskMb] = useState(20480);
   const [newIsoPath, setNewIsoPath] = useState('');
-  const [newBrowser, setNewBrowser] = useState('chrome');
+  const [newBrowser, setNewBrowser] = useState('edge');
   const [newEndpointId, setNewEndpointId] = useState('');
   const [newChannelId, setNewChannelId] = useState('');
+  const [newExecutionMode, setNewExecutionMode] = useState<'VM' | 'NATIVE_BROWSER'>(isMac ? 'NATIVE_BROWSER' : 'VM');
+  const [newStartupUrl, setNewStartupUrl] = useState('https://www.tiktok.com/');
+  const [newPreferredLanguage, setNewPreferredLanguage] = useState('en-US');
   const [formError, setFormError] = useState<string | null>(null);
+
+  const isNativeMode = newExecutionMode === 'NATIVE_BROWSER';
 
   const filteredEnvironments = environments.filter((env) => {
     const matchesSearch = 
@@ -103,17 +117,20 @@ export const EnvironmentsView: React.FC<EnvironmentsViewProps> = ({
       setIsActionLoading('create');
       await onCreateEnvironment({
         name: newName.trim(),
-        hypervisor_type: newHypervisor || (hypervisorInfo?.name.includes('UTM') ? 'UTM' : hypervisorInfo?.name.includes('Hyper-V') ? 'Hyper-V' : 'VirtualBox'),
-        guest_os: newGuestOs,
-        cpu_count: Number(newCpu),
-        memory_mb: Number(newRamMb),
-        disk_size_mb: Number(newDiskMb),
-        iso_path: newIsoPath.trim() ? newIsoPath.trim() : null,
+        hypervisor_type: isNativeMode ? 'NativeBrowser' : (newHypervisor || (hypervisorInfo?.name.includes('UTM') ? 'UTM' : hypervisorInfo?.name.includes('Hyper-V') ? 'Hyper-V' : 'VirtualBox')),
+        guest_os: isNativeMode ? 'macOS_Host' : newGuestOs,
+        cpu_count: isNativeMode ? 0 : Number(newCpu),
+        memory_mb: isNativeMode ? 0 : Number(newRamMb),
+        disk_size_mb: isNativeMode ? 0 : Number(newDiskMb),
+        iso_path: isNativeMode ? null : (newIsoPath.trim() ? newIsoPath.trim() : null),
         browser_type: newBrowser,
         network_endpoint_id: newEndpointId || null,
         channel_id: newChannelId || null,
         host_platform: platformInfo?.target_triple || (isMac ? 'macos-aarch64' : 'windows-x86_64'),
         vm_architecture: platformInfo?.arch || (isMac ? 'aarch64' : 'x86_64'),
+        execution_mode: newExecutionMode,
+        startup_url: newStartupUrl.trim() || null,
+        preferred_language: newPreferredLanguage || null,
       });
       setIsCreateOpen(false);
       setNewName('');
@@ -209,7 +226,9 @@ export const EnvironmentsView: React.FC<EnvironmentsViewProps> = ({
                 </tr>
               ) : (
                 filteredEnvironments.map((env) => {
-                  const isRunning = env.status === 'RUNNING';
+                  const isNativeBrowser = env.execution_mode === 'NATIVE_BROWSER' || env.hypervisor_type === 'NativeBrowser';
+                  const isBrowserRunning = env.browser_session_status === 'RUNNING';
+                  const isRunning = env.status === 'RUNNING' || isBrowserRunning;
                   const isLoading = isActionLoading === env.id;
 
                   return (
@@ -217,10 +236,25 @@ export const EnvironmentsView: React.FC<EnvironmentsViewProps> = ({
                       {/* Name & Status */}
                       <td className="py-3.5 px-4">
                         <div className="flex items-center gap-2.5">
-                          <StatusBadge status={env.status} />
+                          <StatusBadge status={isBrowserRunning ? 'RUNNING' : env.status} />
                           <div>
                             <span className="font-semibold text-slate-100 block">{env.name}</span>
-                            <span className="text-[11px] text-slate-400 font-mono">{env.vm_identifier}</span>
+                            <div className="flex items-center gap-1.5 mt-0.5">
+                              {isNativeBrowser ? (
+                                <span className="text-[10px] px-1.5 py-0.5 rounded bg-blue-950/60 border border-blue-800/60 text-blue-300 font-medium">
+                                  🌐 Native Edge
+                                </span>
+                              ) : (
+                                <span className="text-[10px] px-1.5 py-0.5 rounded bg-surface-800 border border-surface-700 text-slate-400 font-medium">
+                                  💻 VM
+                                </span>
+                              )}
+                              {isBrowserRunning && env.proxy_bridge_port && (
+                                <span className="text-[10px] font-mono text-emerald-400">
+                                  bridge:{env.proxy_bridge_port}
+                                </span>
+                              )}
+                            </div>
                           </div>
                         </div>
                       </td>
@@ -232,17 +266,31 @@ export const EnvironmentsView: React.FC<EnvironmentsViewProps> = ({
                           <div className="text-[11px] text-slate-400 font-mono">
                             {env.vm_architecture || (isMac ? 'aarch64' : 'x86_64')} • {env.guest_os}
                           </div>
+                          {env.startup_url && (
+                            <div className="text-[10px] text-slate-500 truncate max-w-[140px]" title={env.startup_url}>
+                              {env.startup_url}
+                            </div>
+                          )}
                         </div>
                       </td>
 
                       {/* Allocations */}
                       <td className="py-3.5 px-4 font-mono text-slate-300">
-                        <div className="space-y-0.5">
-                          <div>{env.cpu_count} vCPU • {(env.memory_mb / 1024).toFixed(1)} GB RAM</div>
-                          <div className="text-[11px] text-slate-400 truncate max-w-xs" title={env.disk_path}>
-                            {env.disk_path.split(/[/\\]/).pop()}
+                        {isNativeBrowser ? (
+                          <div className="space-y-0.5">
+                            <div className="text-blue-300 text-[11px]">Microsoft Edge</div>
+                            <div className="text-[11px] text-slate-400 truncate max-w-xs" title={env.browser_profile_path || undefined}>
+                              {env.browser_profile_path?.split(/[/\\]/).slice(-2).join('/') || 'Profile path not set'}
+                            </div>
                           </div>
-                        </div>
+                        ) : (
+                          <div className="space-y-0.5">
+                            <div>{env.cpu_count} vCPU • {(env.memory_mb / 1024).toFixed(1)} GB RAM</div>
+                            <div className="text-[11px] text-slate-400 truncate max-w-xs" title={env.disk_path}>
+                              {env.disk_path.split(/[/\\]/).pop()}
+                            </div>
+                          </div>
+                        )}
                       </td>
 
                       {/* Channel */}
@@ -259,88 +307,156 @@ export const EnvironmentsView: React.FC<EnvironmentsViewProps> = ({
 
                       {/* Network Status */}
                       <td className="py-3.5 px-4">
-                        {env.last_observed_ipv4 ? (
-                          <div className="space-y-0.5">
-                            <span className="font-mono text-emerald-400 font-medium block">
+                        <div className="space-y-1">
+                          {env.last_network_status === 'BROWSER_EGRESS_VERIFIED' ? (
+                            <div className="flex items-center gap-1 text-emerald-400">
+                              <CheckCircle2 className="w-3 h-3" />
+                              <span className="text-[11px] font-semibold">Browser Egress Verified</span>
+                            </div>
+                          ) : env.last_network_status === 'PROXY_EGRESS_VERIFIED' ? (
+                            <span className="text-[11px] text-blue-400 font-medium">Proxy Egress Verified</span>
+                          ) : null}
+                          {env.last_observed_country && (
+                            <span className="text-[11px] font-mono text-slate-300">
+                              🌍 {env.last_observed_country}
+                            </span>
+                          )}
+                          {env.last_observed_ipv4 ? (
+                            <span className="font-mono text-emerald-400 font-medium block text-[11px]">
                               {env.last_observed_ipv4}
                             </span>
-                            <span className="text-[10px] text-slate-400">
-                              Verified: {new Date(env.last_checked_at || '').toLocaleTimeString()}
-                            </span>
-                          </div>
-                        ) : env.network_endpoint_name ? (
-                          <div className="space-y-0.5">
-                            <span className="text-slate-300 block">{env.network_endpoint_name}</span>
-                            <span className="text-[10px] text-amber-400/90 font-mono">Egress unverified</span>
-                          </div>
-                        ) : (
-                          <span className="text-slate-500 italic">Direct NAT</span>
-                        )}
+                          ) : env.network_endpoint_name ? (
+                            <div className="space-y-0.5">
+                              <span className="text-slate-300 block text-[11px]">{env.network_endpoint_name}</span>
+                              <span className="text-[10px] text-amber-400/90 font-mono">Egress unverified</span>
+                            </div>
+                          ) : (
+                            <span className="text-slate-500 italic text-[11px]">Direct NAT</span>
+                          )}
+                        </div>
                       </td>
 
                       {/* Action Controls */}
                       <td className="py-3.5 px-4 text-right">
-                        <div className="flex items-center justify-end gap-1.5">
-                          {/* VM Lifecycle Buttons */}
-                          {isRunning ? (
-                            <button
-                              onClick={() => handleAction(() => onShutdownEnvironment(env.id, false), env.id)}
-                              disabled={Boolean(isLoading)}
-                              title="Graceful ACPI Shutdown"
-                              className="p-1.5 bg-amber-950/40 hover:bg-amber-900/60 text-amber-300 border border-amber-800/60 rounded-md transition-colors"
-                            >
-                              <Square className="w-3.5 h-3.5" />
-                            </button>
+                        <div className="flex items-center justify-end gap-1.5 flex-wrap">
+                          {isNativeBrowser ? (
+                            <>
+                              {/* Native Browser: Launch / Stop */}
+                              {isBrowserRunning ? (
+                                onStopBrowser && (
+                                  <button
+                                    onClick={() => handleAction(() => onStopBrowser(env.id), env.id)}
+                                    disabled={Boolean(isLoading)}
+                                    title="Stop Browser Session"
+                                    className="p-1.5 bg-amber-950/40 hover:bg-amber-900/60 text-amber-300 border border-amber-800/60 rounded-md transition-colors"
+                                  >
+                                    <Square className="w-3.5 h-3.5" />
+                                  </button>
+                                )
+                              ) : (
+                                onLaunchNativeBrowser && (
+                                  <button
+                                    onClick={() => handleAction(() => onLaunchNativeBrowser(env.id, env.startup_url || undefined), `launch-${env.id}`)}
+                                    disabled={Boolean(isLoading)}
+                                    title="Launch Microsoft Edge"
+                                    className="px-2 py-1 bg-blue-950/50 hover:bg-blue-900/70 text-blue-300 border border-blue-800/80 rounded-md transition-colors flex items-center gap-1 font-medium text-[11px]"
+                                  >
+                                    <Globe className="w-3 h-3" />
+                                    <span>Edge</span>
+                                  </button>
+                                )
+                              )}
+
+                              {/* Verify Browser Egress */}
+                              {onVerifyBrowserEgress && (
+                                <button
+                                  onClick={() => handleAction(() => onVerifyBrowserEgress(env.id), `egress-${env.id}`)}
+                                  disabled={Boolean(isLoading) || !isBrowserRunning}
+                                  title={isBrowserRunning ? "Verify Browser Egress via Proxy Bridge" : "Launch browser first"}
+                                  className={`p-1.5 rounded-md border transition-colors ${
+                                    isBrowserRunning
+                                      ? 'bg-emerald-950/40 hover:bg-emerald-900/60 text-emerald-300 border-emerald-800/60'
+                                      : 'opacity-40 cursor-not-allowed bg-surface-800 text-slate-600 border-surface-700'
+                                  }`}
+                                >
+                                  <ShieldAlert className="w-3.5 h-3.5" />
+                                </button>
+                              )}
+
+                              {/* Open Profile Folder */}
+                              <button
+                                onClick={() => handleAction(async () => { alert('Profile folder: ' + (env.browser_profile_path || 'N/A')); }, `folder-${env.id}`)}
+                                disabled={Boolean(isLoading)}
+                                title="Show Profile Folder"
+                                className="p-1.5 bg-surface-800 hover:bg-surface-750 text-slate-400 border border-surface-700 rounded-md transition-colors"
+                              >
+                                <FolderOpen className="w-3.5 h-3.5" />
+                              </button>
+                            </>
                           ) : (
-                            <button
-                              onClick={() => handleAction(() => onStartEnvironment(env.id), env.id)}
-                              disabled={Boolean(isLoading)}
-                              title="Start Virtual Machine"
-                              className="p-1.5 bg-emerald-950/40 hover:bg-emerald-900/60 text-emerald-300 border border-emerald-800/60 rounded-md transition-colors"
-                            >
-                              <Play className="w-3.5 h-3.5" />
-                            </button>
-                          )}
+                            <>
+                              {/* VM Lifecycle Buttons */}
+                              {isRunning ? (
+                                <button
+                                  onClick={() => handleAction(() => onShutdownEnvironment(env.id, false), env.id)}
+                                  disabled={Boolean(isLoading)}
+                                  title="Graceful ACPI Shutdown"
+                                  className="p-1.5 bg-amber-950/40 hover:bg-amber-900/60 text-amber-300 border border-amber-800/60 rounded-md transition-colors"
+                                >
+                                  <Square className="w-3.5 h-3.5" />
+                                </button>
+                              ) : (
+                                <button
+                                  onClick={() => handleAction(() => onStartEnvironment(env.id), env.id)}
+                                  disabled={Boolean(isLoading)}
+                                  title="Start Virtual Machine"
+                                  className="p-1.5 bg-emerald-950/40 hover:bg-emerald-900/60 text-emerald-300 border border-emerald-800/60 rounded-md transition-colors"
+                                >
+                                  <Play className="w-3.5 h-3.5" />
+                                </button>
+                              )}
 
-                          {/* Open VM Console */}
-                          {onOpenConsole && (
-                            <button
-                              onClick={() => handleAction(() => onOpenConsole(env.id), env.id)}
-                              disabled={Boolean(isLoading)}
-                              title="Open Hypervisor VM Console"
-                              className="p-1.5 bg-surface-800 hover:bg-surface-750 text-blue-300 border border-surface-700 rounded-md transition-colors"
-                            >
-                              <Terminal className="w-3.5 h-3.5" />
-                            </button>
-                          )}
+                              {/* Open VM Console */}
+                              {onOpenConsole && (
+                                <button
+                                  onClick={() => handleAction(() => onOpenConsole(env.id), env.id)}
+                                  disabled={Boolean(isLoading)}
+                                  title="Open Hypervisor VM Console"
+                                  className="p-1.5 bg-surface-800 hover:bg-surface-750 text-blue-300 border border-surface-700 rounded-md transition-colors"
+                                >
+                                  <Terminal className="w-3.5 h-3.5" />
+                                </button>
+                              )}
 
-                          {/* Launch Isolated Browser */}
-                          {onLaunchBrowser && (
-                            <button
-                              onClick={() => handleAction(() => onLaunchBrowser(env.id), `launch-${env.id}`)}
-                              disabled={Boolean(isLoading)}
-                              title="🚀 Mở Trình duyệt Kênh (YouTube Studio)"
-                              className="px-2 py-1 bg-rose-950/50 hover:bg-rose-900/70 text-rose-300 border border-rose-800/80 rounded-md transition-colors flex items-center gap-1 font-medium text-[11px]"
-                            >
-                              <span>🚀 Studio</span>
-                            </button>
-                          )}
+                              {/* Launch Isolated Browser */}
+                              {onLaunchBrowser && (
+                                <button
+                                  onClick={() => handleAction(() => onLaunchBrowser(env.id), `launch-${env.id}`)}
+                                  disabled={Boolean(isLoading)}
+                                  title="🚀 Launch Browser"
+                                  className="px-2 py-1 bg-rose-950/50 hover:bg-rose-900/70 text-rose-300 border border-rose-800/80 rounded-md transition-colors flex items-center gap-1 font-medium text-[11px]"
+                                >
+                                  <span>🚀 Studio</span>
+                                </button>
+                              )}
 
-                          {/* Network Diagnostic Trigger */}
-                          <button
-                            onClick={() => handleAction(() => onCheckNetwork(env.id), env.id)}
-                            disabled={Boolean(isLoading)}
-                            title="Verify Guest Network Egress"
-                            className="p-1.5 bg-surface-800 hover:bg-surface-750 text-slate-300 border border-surface-700 rounded-md transition-colors"
-                          >
-                            <ShieldAlert className="w-3.5 h-3.5" />
-                          </button>
+                              {/* Network Diagnostic Trigger */}
+                              <button
+                                onClick={() => handleAction(() => onCheckNetwork(env.id), env.id)}
+                                disabled={Boolean(isLoading)}
+                                title="Verify Guest Network Egress"
+                                className="p-1.5 bg-surface-800 hover:bg-surface-750 text-slate-300 border border-surface-700 rounded-md transition-colors"
+                              >
+                                <ShieldAlert className="w-3.5 h-3.5" />
+                              </button>
+                            </>
+                          )}
 
                           {/* Delete Environment Button */}
                           <button
                             onClick={() => setSelectedEnvForDelete(env)}
                             disabled={Boolean(isLoading) || isRunning}
-                            title={isRunning ? 'Stop VM before deleting' : 'Delete Environment'}
+                            title={isRunning ? 'Stop before deleting' : 'Delete Environment'}
                             className={`p-1.5 rounded-md border transition-colors ${
                               isRunning
                                 ? 'opacity-40 cursor-not-allowed border-surface-800 text-slate-600'
@@ -365,7 +481,7 @@ export const EnvironmentsView: React.FC<EnvironmentsViewProps> = ({
         isOpen={isCreateOpen}
         onClose={() => setIsCreateOpen(false)}
         title="Create Isolated Environment"
-        subtitle="Provision dedicated VM storage, isolated guest profile, and network mapping"
+        subtitle="Provision an isolated browser environment with optional VM or native Edge mode"
         maxWidth="max-w-2xl"
       >
         <form onSubmit={handleCreateSubmit} className="space-y-4 text-xs">
@@ -375,13 +491,46 @@ export const EnvironmentsView: React.FC<EnvironmentsViewProps> = ({
             </div>
           )}
 
+          {/* Execution Mode Selector */}
+          {isMac && (
+            <div className="p-3 bg-surface-850 border border-surface-750 rounded-lg">
+              <label className="block text-slate-300 font-medium mb-2">Execution Mode</label>
+              <div className="grid grid-cols-2 gap-3">
+                <button
+                  type="button"
+                  onClick={() => setNewExecutionMode('NATIVE_BROWSER')}
+                  className={`p-3 rounded-lg border text-left transition-colors ${
+                    isNativeMode
+                      ? 'bg-blue-950/60 border-blue-700/80 text-blue-200'
+                      : 'bg-surface-800 border-surface-700 text-slate-400 hover:border-slate-600'
+                  }`}
+                >
+                  <div className="font-semibold mb-0.5">🌐 Native Browser</div>
+                  <div className="text-[10px] opacity-70">Microsoft Edge + Proxy Bridge (macOS)</div>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setNewExecutionMode('VM')}
+                  className={`p-3 rounded-lg border text-left transition-colors ${
+                    !isNativeMode
+                      ? 'bg-purple-950/60 border-purple-700/80 text-purple-200'
+                      : 'bg-surface-800 border-surface-700 text-slate-400 hover:border-slate-600'
+                  }`}
+                >
+                  <div className="font-semibold mb-0.5">💻 Virtual Machine</div>
+                  <div className="text-[10px] opacity-70">UTM / Hyper-V isolated guest VM</div>
+                </button>
+              </div>
+            </div>
+          )}
+
           <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
             <div>
               <label className="block text-slate-300 font-medium mb-1">Environment Name *</label>
               <input
                 type="text"
                 required
-                placeholder="e.g. ChannelAlpha_Prod"
+                placeholder="e.g. AlexaStudio_Edge_US"
                 value={newName}
                 onChange={(e) => setNewName(e.target.value)}
                 className="w-full px-3 py-2 bg-surface-850 border border-surface-750 rounded-lg text-slate-100 focus:outline-none focus:border-brand-accent font-mono"
@@ -389,42 +538,78 @@ export const EnvironmentsView: React.FC<EnvironmentsViewProps> = ({
               <p className="text-[10px] text-slate-500 mt-1">Alphanumeric, hyphens and underscores only.</p>
             </div>
 
-            <div>
-              <label className="block text-slate-300 font-medium mb-1">Hypervisor Engine</label>
-              <select
-                value={newHypervisor}
-                onChange={(e) => setNewHypervisor(e.target.value)}
-                className="w-full px-3 py-2 bg-surface-850 border border-surface-750 rounded-lg text-slate-100 focus:outline-none focus:border-brand-accent"
-              >
-                {isMac ? (
-                  <>
-                    <option value="UTM">UTM (Apple Silicon Native Virtualization)</option>
-                    <option value="VirtualBox">VirtualBox (Fallback)</option>
-                  </>
-                ) : (
-                  <>
-                    <option value="Hyper-V">Microsoft Hyper-V (Windows 11 Pro)</option>
-                    <option value="VirtualBox">Oracle VM VirtualBox</option>
-                  </>
-                )}
-              </select>
-            </div>
+            {!isNativeMode && (
+              <div>
+                <label className="block text-slate-300 font-medium mb-1">Hypervisor Engine</label>
+                <select
+                  value={newHypervisor}
+                  onChange={(e) => setNewHypervisor(e.target.value)}
+                  className="w-full px-3 py-2 bg-surface-850 border border-surface-750 rounded-lg text-slate-100 focus:outline-none focus:border-brand-accent"
+                >
+                  {isMac ? (
+                    <>
+                      <option value="UTM">UTM (Apple Silicon Native Virtualization)</option>
+                      <option value="VirtualBox">VirtualBox (Fallback)</option>
+                    </>
+                  ) : (
+                    <>
+                      <option value="Hyper-V">Microsoft Hyper-V (Windows 11 Pro)</option>
+                      <option value="VirtualBox">Oracle VM VirtualBox</option>
+                    </>
+                  )}
+                </select>
+              </div>
+            )}
 
-            <div>
-              <label className="block text-slate-300 font-medium mb-1">Guest Operating System</label>
-              <select
-                value={newGuestOs}
-                onChange={(e) => setNewGuestOs(e.target.value)}
-                className="w-full px-3 py-2 bg-surface-850 border border-surface-750 rounded-lg text-slate-100 focus:outline-none focus:border-brand-accent"
-              >
-                {isMac ? (
-                  <>
-                    <option value="Ubuntu_ARM64">Ubuntu Linux 22.04 ARM64 (Recommended)</option>
-                    <option value="Debian_ARM64">Debian 12 ARM64</option>
-                    <option value="Fedora_ARM64">Fedora 40 ARM64</option>
-                  </>
-                ) : (
-                  <>
+            {isNativeMode ? (
+              <>
+                <div>
+                  <label className="block text-slate-300 font-medium mb-1">Startup URL</label>
+                  <select
+                    value={newStartupUrl}
+                    onChange={(e) => setNewStartupUrl(e.target.value)}
+                    className="w-full px-3 py-2 bg-surface-850 border border-surface-750 rounded-lg text-slate-100 focus:outline-none focus:border-brand-accent"
+                  >
+                    <option value="https://www.tiktok.com/tiktokstudio">TikTok Studio</option>
+                    <option value="https://www.tiktok.com/">TikTok</option>
+                    <option value="https://www.instagram.com/">Instagram</option>
+                    <option value="https://www.facebook.com/">Facebook</option>
+                    <option value="https://business.facebook.com/">Meta Business Suite</option>
+                    <option value="https://gumroad.com/">Gumroad</option>
+                    <option value="">Custom (enter below)</option>
+                  </select>
+                </div>
+
+                <div>
+                  <label className="block text-slate-300 font-medium mb-1">Preferred Language</label>
+                  <select
+                    value={newPreferredLanguage}
+                    onChange={(e) => setNewPreferredLanguage(e.target.value)}
+                    className="w-full px-3 py-2 bg-surface-850 border border-surface-750 rounded-lg text-slate-100 focus:outline-none focus:border-brand-accent"
+                  >
+                    <option value="en-US">English (United States)</option>
+                    <option value="en-GB">English (United Kingdom)</option>
+                    <option value="vi-VN">Vietnamese</option>
+                  </select>
+                </div>
+              </>
+            ) : (
+              <>
+                <div>
+                  <label className="block text-slate-300 font-medium mb-1">Guest Operating System</label>
+                  <select
+                    value={newGuestOs}
+                    onChange={(e) => setNewGuestOs(e.target.value)}
+                    className="w-full px-3 py-2 bg-surface-850 border border-surface-750 rounded-lg text-slate-100 focus:outline-none focus:border-brand-accent"
+                  >
+                    {isMac ? (
+                      <>
+                        <option value="Ubuntu_ARM64">Ubuntu Linux 22.04 ARM64 (Recommended)</option>
+                        <option value="Debian_ARM64">Debian 12 ARM64</option>
+                        <option value="Fedora_ARM64">Fedora 40 ARM64</option>
+                      </>
+                    ) : (
+                      <>
                     <option value="Ubuntu_64">Ubuntu Linux 22.04 x64 (Recommended)</option>
                     <option value="Windows11_64">Windows 11 Guest (x64)</option>
                     <option value="Debian_64">Debian 12 x64</option>
@@ -503,6 +688,8 @@ export const EnvironmentsView: React.FC<EnvironmentsViewProps> = ({
                 className="w-full px-3 py-2 bg-surface-850 border border-surface-750 rounded-lg text-slate-100 focus:outline-none focus:border-brand-accent font-mono"
               />
             </div>
+              </>
+            )}
 
             <div>
               <label className="block text-slate-300 font-medium mb-1">Network Proxy Endpoint (Optional)</label>
