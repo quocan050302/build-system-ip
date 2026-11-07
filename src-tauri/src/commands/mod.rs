@@ -67,11 +67,7 @@ pub fn start_environment(id: String, state: State<AppState>) -> Result<(), Strin
 }
 
 #[tauri::command]
-pub fn shutdown_environment(
-    id: String,
-    force: bool,
-    state: State<AppState>,
-) -> Result<(), String> {
+pub fn shutdown_environment(id: String, force: bool, state: State<AppState>) -> Result<(), String> {
     state.vm_service.shutdown_environment(&id, force)
 }
 
@@ -121,10 +117,7 @@ pub fn launch_browser_with_url(
 }
 
 #[tauri::command]
-pub fn stop_browser_profile(
-    environment_id: String,
-    state: State<AppState>,
-) -> Result<(), String> {
+pub fn stop_browser_profile(environment_id: String, state: State<AppState>) -> Result<(), String> {
     state.profile_service.stop_browser_session(&environment_id)
 }
 

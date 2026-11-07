@@ -15,9 +15,18 @@ impl HyperVAdapter {
 
     fn run_powershell(&self, script: &str) -> Result<String, HypervisorError> {
         let output = Command::new("powershell")
-            .args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script])
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-Command",
+                script,
+            ])
             .output()
-            .map_err(|e| HypervisorError::ExecutionFailed(format!("Failed to execute PowerShell: {}", e)))?;
+            .map_err(|e| {
+                HypervisorError::ExecutionFailed(format!("Failed to execute PowerShell: {}", e))
+            })?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -92,7 +101,11 @@ impl HypervisorAdapter for HyperVAdapter {
             if feature_enabled && service_running && has_permission {
                 // Query version
                 let version_script = "[System.Environment]::OSVersion.Version.ToString()";
-                let ver = self.run_powershell(version_script).unwrap_or_else(|_| "10.0".to_string()).trim().to_string();
+                let ver = self
+                    .run_powershell(version_script)
+                    .unwrap_or_else(|_| "10.0".to_string())
+                    .trim()
+                    .to_string();
 
                 Ok(HypervisorInfo {
                     name: "Microsoft Hyper-V".to_string(),
@@ -111,7 +124,11 @@ impl HypervisorAdapter for HyperVAdapter {
 
                 Ok(HypervisorInfo {
                     name: "Microsoft Hyper-V".to_string(),
-                    version: if !has_permission { "Permission Required".to_string() } else { "Unavailable".to_string() },
+                    version: if !has_permission {
+                        "Permission Required".to_string()
+                    } else {
+                        "Unavailable".to_string()
+                    },
                     available: false,
                     executable_path: Some(reason.to_string()),
                 })
@@ -124,7 +141,9 @@ impl HypervisorAdapter for HyperVAdapter {
                 name: "Microsoft Hyper-V".to_string(),
                 version: "N/A".to_string(),
                 available: false,
-                executable_path: Some("Microsoft Hyper-V is only supported on Windows hosts".to_string()),
+                executable_path: Some(
+                    "Microsoft Hyper-V is only supported on Windows hosts".to_string(),
+                ),
             })
         }
     }
@@ -192,8 +211,13 @@ impl HypervisorAdapter for HyperVAdapter {
         #[cfg(windows)]
         {
             // Validate UUID or alphanumeric name to prevent injection
-            if !vm_identifier.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_') {
-                return Err(HypervisorError::InvalidConfiguration("Invalid VM identifier".to_string()));
+            if !vm_identifier
+                .chars()
+                .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
+            {
+                return Err(HypervisorError::InvalidConfiguration(
+                    "Invalid VM identifier".to_string(),
+                ));
             }
 
             let script = format!(
@@ -221,7 +245,11 @@ impl HypervisorAdapter for HyperVAdapter {
             os_type: "Hyper-V Guest x64".to_string(),
             cpu_count: 2,
             memory_mb: 4096,
-            disk_path: Some(format!("{}\\environments\\{}.vhdx", self.data_dir.to_string_lossy(), vm_identifier)),
+            disk_path: Some(format!(
+                "{}\\environments\\{}.vhdx",
+                self.data_dir.to_string_lossy(),
+                vm_identifier
+            )),
             console_type: Some("vmconnect".to_string()),
             architecture: "x86_64".to_string(),
         })
@@ -230,7 +258,12 @@ impl HypervisorAdapter for HyperVAdapter {
     fn create_vm(&self, spec: &CreateVmSpec) -> Result<String, HypervisorError> {
         #[cfg(windows)]
         {
-            if spec.name.is_empty() || !spec.name.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_') {
+            if spec.name.is_empty()
+                || !spec
+                    .name
+                    .chars()
+                    .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
+            {
                 return Err(HypervisorError::InvalidConfiguration(
                     "Environment VM name must only contain alphanumeric characters, hyphens, or underscores".to_string(),
                 ));
@@ -239,7 +272,10 @@ impl HypervisorAdapter for HyperVAdapter {
             // Ensure parent directory exists
             if let Some(parent) = Path::new(&spec.disk_path).parent() {
                 std::fs::create_dir_all(parent).map_err(|e| {
-                    HypervisorError::ExecutionFailed(format!("Failed to create disk directory: {}", e))
+                    HypervisorError::ExecutionFailed(format!(
+                        "Failed to create disk directory: {}",
+                        e
+                    ))
                 })?;
             }
 
@@ -295,7 +331,9 @@ impl HypervisorAdapter for HyperVAdapter {
         #[cfg(not(windows))]
         {
             let _ = vm_identifier;
-            Err(HypervisorError::ExecutionFailed("Not on Windows".to_string()))
+            Err(HypervisorError::ExecutionFailed(
+                "Not on Windows".to_string(),
+            ))
         }
     }
 
@@ -314,7 +352,9 @@ impl HypervisorAdapter for HyperVAdapter {
         #[cfg(not(windows))]
         {
             let _ = (vm_identifier, force);
-            Err(HypervisorError::ExecutionFailed("Not on Windows".to_string()))
+            Err(HypervisorError::ExecutionFailed(
+                "Not on Windows".to_string(),
+            ))
         }
     }
 
@@ -336,7 +376,9 @@ impl HypervisorAdapter for HyperVAdapter {
         #[cfg(not(windows))]
         {
             let _ = (vm_identifier, delete_disks);
-            Err(HypervisorError::ExecutionFailed("Not on Windows".to_string()))
+            Err(HypervisorError::ExecutionFailed(
+                "Not on Windows".to_string(),
+            ))
         }
     }
 
@@ -346,19 +388,27 @@ impl HypervisorAdapter for HyperVAdapter {
             Command::new("vmconnect.exe")
                 .args(["localhost", vm_identifier])
                 .spawn()
-                .map_err(|e| HypervisorError::ExecutionFailed(format!("Failed to spawn vmconnect.exe: {}", e)))?;
+                .map_err(|e| {
+                    HypervisorError::ExecutionFailed(format!(
+                        "Failed to spawn vmconnect.exe: {}",
+                        e
+                    ))
+                })?;
             Ok(())
         }
 
         #[cfg(not(windows))]
         {
             let _ = vm_identifier;
-            Err(HypervisorError::NotFound("vmconnect is only available on Windows".to_string()))
+            Err(HypervisorError::NotFound(
+                "vmconnect is only available on Windows".to_string(),
+            ))
         }
     }
 
     fn get_system_resources(&self) -> Result<HostResources, HypervisorError> {
-        let platform_svc = crate::services::platform_service::PlatformService::new(self.data_dir.clone());
+        let platform_svc =
+            crate::services::platform_service::PlatformService::new(self.data_dir.clone());
         let (total_mem, avail_mem, total_disk, avail_disk) = platform_svc.query_system_resources();
 
         Ok(HostResources {

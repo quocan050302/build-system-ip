@@ -59,8 +59,8 @@ pub struct NetworkCheckRecord {
     pub dns_summary: Option<String>,
     pub dns_leak_status: String, // "UNVERIFIED", "REMOTE_PROXY_DNS"
     pub webrtc_status: String,   // "UNVERIFIED", "NON_PROXIED_UDP_DISABLED"
-    pub check_source: String,    // "GUEST_AGENT", "PROXY_PROBE", "BROWSER_SESSION", "HOST_PROBE", "DIRECT_PROBE"
-    pub status: String,          // "NOT_CONFIGURED", "ENDPOINT_CONFIGURED", "ENDPOINT_REACHABLE", "PROXY_EGRESS_VERIFIED", "BROWSER_EGRESS_VERIFIED", "AUTH_FAILED", "CONNECTION_FAILED", "VERIFICATION_UNAVAILABLE", "NOT_CHECKED", "GUEST_EGRESS_OBSERVED"
+    pub check_source: String, // "GUEST_AGENT", "PROXY_PROBE", "BROWSER_SESSION", "HOST_PROBE", "DIRECT_PROBE"
+    pub status: String, // "NOT_CONFIGURED", "ENDPOINT_CONFIGURED", "ENDPOINT_REACHABLE", "PROXY_EGRESS_VERIFIED", "BROWSER_EGRESS_VERIFIED", "AUTH_FAILED", "CONNECTION_FAILED", "VERIFICATION_UNAVAILABLE", "NOT_CHECKED", "GUEST_EGRESS_OBSERVED"
     pub error_message: Option<String>,
     pub checked_at: String,
     pub latency_ms: Option<u32>,
@@ -113,6 +113,44 @@ impl NetworkService {
         &self.secret_store
     }
 
+    /// Pure helper: evaluates whether an observed country satisfies an optional expected-country
+    /// constraint, following the strict semantics used throughout this service.
+    ///
+    /// Returns `Ok(())` when no constraint is set, or when the observed country is a
+    /// case-insensitive match for the expected one.
+    ///
+    /// Returns `Err(message)` when:
+    /// - `observed` is empty or `"UNKNOWN"` and an expected country is set (cannot confirm).
+    /// - `observed` is a non-matching country code (mismatch).
+    ///
+    /// This function is intentionally `pub` so that integration tests can exercise the country
+    /// validation logic without triggering real network I/O.
+    pub fn evaluate_country_match(
+        observed: &str,
+        expected_country: Option<&str>,
+    ) -> Result<(), String> {
+        if let Some(exp_c) = expected_country {
+            let is_match = !observed.is_empty()
+                && observed != "UNKNOWN"
+                && observed.eq_ignore_ascii_case(exp_c);
+            if !is_match {
+                let msg = if observed == "UNKNOWN" || observed.is_empty() {
+                    format!(
+                        "Geolocation returned UNKNOWN country — cannot confirm expected '{}'. Treating as UNVERIFIED.",
+                        exp_c
+                    )
+                } else {
+                    format!(
+                        "Country mismatch: expected '{}', observed '{}'",
+                        exp_c, observed
+                    )
+                };
+                return Err(msg);
+            }
+        }
+        Ok(())
+    }
+
     pub fn create_endpoint(
         &self,
         req: CreateEndpointRequest,
@@ -148,11 +186,22 @@ impl NetworkService {
         }
 
         if matches!(ep_type.as_str(), "WIREGUARD" | "DIRECT")
-            && (req.username.as_ref().map(|s| !s.trim().is_empty()).unwrap_or(false)
-                || req.credentials_secret.as_ref().map(|s| !s.trim().is_empty()).unwrap_or(false))
+            && (req
+                .username
+                .as_ref()
+                .map(|s| !s.trim().is_empty())
+                .unwrap_or(false)
+                || req
+                    .credentials_secret
+                    .as_ref()
+                    .map(|s| !s.trim().is_empty())
+                    .unwrap_or(false))
             && ep_type == "DIRECT"
         {
-            return Err("DIRECT network adapter does not support proxy authentication credentials".to_string());
+            return Err(
+                "DIRECT network adapter does not support proxy authentication credentials"
+                    .to_string(),
+            );
         }
 
         let id = Uuid::new_v4().to_string();
@@ -441,7 +490,10 @@ impl NetworkService {
 
         let resp_str = String::from_utf8_lossy(&response);
         let first_line = resp_str.lines().next().unwrap_or("");
-        if first_line.contains(" 407 ") || first_line.ends_with(" 407") || resp_str.contains("407 Proxy Authentication") {
+        if first_line.contains(" 407 ")
+            || first_line.ends_with(" 407")
+            || resp_str.contains("407 Proxy Authentication")
+        {
             return Err("AUTH_FAILED: Proxy Authentication Failed (HTTP 407)".to_string());
         }
 
@@ -456,7 +508,10 @@ impl NetworkService {
                     return Ok((ip.to_string(), country, latency));
                 }
             }
-            if body.split('.').count() == 4 && body.len() <= 45 && body.chars().all(|c| c.is_ascii_digit() || c == '.') {
+            if body.split('.').count() == 4
+                && body.len() <= 45
+                && body.chars().all(|c| c.is_ascii_digit() || c == '.')
+            {
                 return Ok((body.to_string(), None, latency));
             }
         }
@@ -644,7 +699,12 @@ impl NetworkService {
         }
 
         // If no network endpoint is configured
-        if ep_id_opt.is_none() || ep_host.as_ref().map(|h| h.trim().is_empty()).unwrap_or(true) {
+        if ep_id_opt.is_none()
+            || ep_host
+                .as_ref()
+                .map(|h| h.trim().is_empty())
+                .unwrap_or(true)
+        {
             if is_native_browser {
                 let record = NetworkCheckRecord {
                     id: check_id,
@@ -652,12 +712,16 @@ impl NetworkService {
                     observed_ipv4: None,
                     observed_ipv6: None,
                     observed_country: None,
-                    dns_summary: Some("No proxy endpoint configured for native browser environment".to_string()),
+                    dns_summary: Some(
+                        "No proxy endpoint configured for native browser environment".to_string(),
+                    ),
                     dns_leak_status: "UNVERIFIED".to_string(),
                     webrtc_status: "UNVERIFIED".to_string(),
                     check_source: "BACKEND_CONFIG_CHECK".to_string(),
                     status: "NOT_CONFIGURED".to_string(),
-                    error_message: Some("No US proxy endpoint is assigned to this environment.".to_string()),
+                    error_message: Some(
+                        "No US proxy endpoint is assigned to this environment.".to_string(),
+                    ),
                     checked_at: now,
                     latency_ms: None,
                     session_id: None,
@@ -711,12 +775,17 @@ impl NetworkService {
                         observed_ipv4: None,
                         observed_ipv6: None,
                         observed_country: None,
-                        dns_summary: Some("Failed to unseal proxy credentials from vault".to_string()),
+                        dns_summary: Some(
+                            "Failed to unseal proxy credentials from vault".to_string(),
+                        ),
                         dns_leak_status: "UNVERIFIED".to_string(),
                         webrtc_status: "UNVERIFIED".to_string(),
                         check_source: "PROXY_PROBE".to_string(),
                         status: "AUTH_FAILED".to_string(),
-                        error_message: Some(format!("Vault credential retrieval failed: {}", safe_err)),
+                        error_message: Some(format!(
+                            "Vault credential retrieval failed: {}",
+                            safe_err
+                        )),
                         checked_at: now,
                         latency_ms: None,
                         session_id: None,
@@ -754,71 +823,91 @@ impl NetworkService {
                     Err("TCP handshake succeeded; full egress verification requires browser session or HTTP proxy probe".to_string())
                 };
 
-                let (observed_ipv4, observed_country, status, dns_info, error_message, final_latency) =
-                    match egress_probe_result {
-                        Ok((real_ip, country_opt, real_latency)) => {
-                            let country_str = country_opt.clone().unwrap_or_else(|| "UNKNOWN".to_string());
-                            let mut err_msg = None;
-                            let mut final_status = "PROXY_EGRESS_VERIFIED".to_string();
+                let (
+                    observed_ipv4,
+                    observed_country,
+                    status,
+                    dns_info,
+                    error_message,
+                    final_latency,
+                ) = match egress_probe_result {
+                    Ok((real_ip, country_opt, real_latency)) => {
+                        let country_str =
+                            country_opt.clone().unwrap_or_else(|| "UNKNOWN".to_string());
+                        let mut err_msg = None;
+                        let mut final_status = "PROXY_EGRESS_VERIFIED".to_string();
 
-                            if let Some(ref exp_c) = expected_country {
-                                if country_str != "UNKNOWN" && !country_str.eq_ignore_ascii_case(exp_c) {
-                                    final_status = "CONNECTION_FAILED".to_string();
-                                    err_msg = Some(format!(
-                                        "Proxy country mismatch: expected '{}', but proxy egress resolved to '{}'",
-                                        exp_c, country_str
-                                    ));
-                                }
+                        if let Some(ref exp_c) = expected_country {
+                            // IMPORTANT: "UNKNOWN" is NOT a valid country match — treat as failure.
+                            let is_country_match = !country_str.is_empty()
+                                && country_str != "UNKNOWN"
+                                && country_str.eq_ignore_ascii_case(exp_c);
+                            if !is_country_match {
+                                final_status = "CONNECTION_FAILED".to_string();
+                                err_msg = Some(
+                                    if country_str == "UNKNOWN" || country_str.is_empty() {
+                                        format!(
+                                            "Geolocation returned UNKNOWN country — cannot confirm expected '{}'. Treating as UNVERIFIED.",
+                                            exp_c
+                                        )
+                                    } else {
+                                        format!(
+                                            "Proxy country mismatch: expected '{}', but proxy egress resolved to '{}'",
+                                            exp_c, country_str
+                                        )
+                                    },
+                                );
                             }
-                            if let Some(ref exp_ip) = expected_ip {
-                                if &real_ip != exp_ip {
-                                    err_msg = Some(format!(
-                                        "Observed proxy IP ({}) differs from expected IP ({})",
-                                        real_ip, exp_ip
-                                    ));
-                                }
+                        }
+                        if let Some(ref exp_ip) = expected_ip {
+                            if &real_ip != exp_ip {
+                                err_msg = Some(format!(
+                                    "Observed proxy IP ({}) differs from expected IP ({})",
+                                    real_ip, exp_ip
+                                ));
                             }
+                        }
 
-                            let note = format!(
+                        let note = format!(
                                 "Backend proxy probe via {}:{} -> Observed IP: {} (Country: {}, {}ms). Launch browser to verify in-browser egress.",
                                 host, port, real_ip, country_str, real_latency
                             );
-                            (
-                                Some(real_ip),
-                                Some(country_str),
-                                final_status,
-                                note,
-                                err_msg,
-                                Some(real_latency),
-                            )
-                        }
-                        Err(ref err) if err.contains("407") || err.contains("AUTH_FAILED") => {
-                            let safe_err = redact_sensitive_str(err);
-                            (
-                                None,
-                                None,
-                                "AUTH_FAILED".to_string(),
-                                "Proxy rejected credentials (HTTP 407)".to_string(),
-                                Some(safe_err),
-                                Some(tcp_latency),
-                            )
-                        }
-                        Err(ref err) => {
-                            let safe_err = redact_sensitive_str(err);
-                            let note = format!(
-                                "Endpoint {}:{} TCP handshake succeeded ({}ms). Egress probe note: {}",
-                                host, port, tcp_latency, safe_err
-                            );
-                            (
-                                None,
-                                None,
-                                "ENDPOINT_REACHABLE".to_string(),
-                                note,
-                                None,
-                                Some(tcp_latency),
-                            )
-                        }
-                    };
+                        (
+                            Some(real_ip),
+                            Some(country_str),
+                            final_status,
+                            note,
+                            err_msg,
+                            Some(real_latency),
+                        )
+                    }
+                    Err(ref err) if err.contains("407") || err.contains("AUTH_FAILED") => {
+                        let safe_err = redact_sensitive_str(err);
+                        (
+                            None,
+                            None,
+                            "AUTH_FAILED".to_string(),
+                            "Proxy rejected credentials (HTTP 407)".to_string(),
+                            Some(safe_err),
+                            Some(tcp_latency),
+                        )
+                    }
+                    Err(ref err) => {
+                        let safe_err = redact_sensitive_str(err);
+                        let note = format!(
+                            "Endpoint {}:{} TCP handshake succeeded ({}ms). Egress probe note: {}",
+                            host, port, tcp_latency, safe_err
+                        );
+                        (
+                            None,
+                            None,
+                            "ENDPOINT_REACHABLE".to_string(),
+                            note,
+                            None,
+                            Some(tcp_latency),
+                        )
+                    }
+                };
 
                 let record = NetworkCheckRecord {
                     id: check_id,
@@ -843,7 +932,11 @@ impl NetworkService {
                     .log(
                         Some(environment_id),
                         "NETWORK_REACHABILITY_CHECK",
-                        if status == "AUTH_FAILED" { "WARN" } else { "INFO" },
+                        if status == "AUTH_FAILED" {
+                            "WARN"
+                        } else {
+                            "INFO"
+                        },
                         &format!(
                             "Endpoint '{:?}' ({}:{}) backend check status: {}",
                             ep_name, host, port, status
@@ -881,9 +974,24 @@ impl NetworkService {
         }
     }
 
-    /// Real Browser Network Verification (Phase 3).
-    /// Only reports `BROWSER_EGRESS_VERIFIED` when the browser session is actively running for `environment_id`
-    /// and traffic through the session's supervised proxy bridge is verified.
+    /// Proxy-bridge egress verification for a running browser session (Phase 3).
+    ///
+    /// This function performs a **backend** HTTP probe through the local proxy bridge
+    /// (`probe_via_local_bridge`).  Because the probe originates from the Rust process — not from
+    /// Microsoft Edge itself — the highest status it can return is `PROXY_EGRESS_VERIFIED`.
+    ///
+    /// `BROWSER_EGRESS_VERIFIED` requires actual browser-origin verification via the Chrome
+    /// DevTools Protocol (CDP) and is **not yet implemented**.  That path currently returns
+    /// `VERIFICATION_UNAVAILABLE` as a placeholder until CDP integration is added.
+    ///
+    /// Status hierarchy:
+    /// - Browser not running          → `VERIFICATION_UNAVAILABLE`
+    /// - No proxy configured          → `NOT_CONFIGURED`
+    /// - No bridge port               → `VERIFICATION_UNAVAILABLE`
+    /// - Bridge probe fails           → `CONNECTION_FAILED` or `AUTH_FAILED`
+    /// - Bridge probe succeeds + country matches → `PROXY_EGRESS_VERIFIED`
+    /// - Direct fallback detected     → `CONNECTION_FAILED`
+    /// - Country mismatch / UNKNOWN   → `CONNECTION_FAILED`
     pub fn verify_browser_egress(
         &self,
         environment_id: &str,
@@ -910,7 +1018,7 @@ impl NetworkService {
                     dns_summary: Some("Browser session is not running".to_string()),
                     dns_leak_status: "UNVERIFIED".to_string(),
                     webrtc_status: "UNVERIFIED".to_string(),
-                    check_source: "BROWSER_VERIFIER".to_string(),
+                    check_source: "PROXY_BRIDGE_PROBE".to_string(),
                     status: "VERIFICATION_UNAVAILABLE".to_string(),
                     error_message: Some(
                         "Cannot report BROWSER_EGRESS_VERIFIED: Microsoft Edge session is not running for this environment. Launch the browser first."
@@ -964,7 +1072,9 @@ impl NetworkService {
                         observed_ipv4: None,
                         observed_ipv6: None,
                         observed_country: None,
-                        dns_summary: Some("No proxy configured for running browser session".to_string()),
+                        dns_summary: Some(
+                            "No proxy configured for running browser session".to_string(),
+                        ),
                         dns_leak_status: "UNVERIFIED".to_string(),
                         webrtc_status: "NON_PROXIED_UDP_DISABLED".to_string(),
                         check_source: "BROWSER_SESSION".to_string(),
@@ -993,7 +1103,7 @@ impl NetworkService {
                     dns_summary: Some("No active proxy bridge bound to browser session".to_string()),
                     dns_leak_status: "UNVERIFIED".to_string(),
                     webrtc_status: "UNVERIFIED".to_string(),
-                    check_source: "BROWSER_SESSION".to_string(),
+                    check_source: "PROXY_BRIDGE_PROBE".to_string(),
                     status: "VERIFICATION_UNAVAILABLE".to_string(),
                     error_message: Some(
                         "Browser session does not have an active local proxy bridge. Restart the browser session to bind the proxy."
@@ -1018,7 +1128,9 @@ impl NetworkService {
                     .unwrap_or(false);
 
                 if !is_loopback_proxy {
-                    if let Ok((direct_ip, _, _)) = Self::probe_direct_egress(Duration::from_millis(2000)) {
+                    if let Ok((direct_ip, _, _)) =
+                        Self::probe_direct_egress(Duration::from_millis(2000))
+                    {
                         if direct_ip == probe_res.observed_ipv4 {
                             let err = format!(
                                 "Unexpected direct network fallback detected! Browser egress IP ({}) matches host direct IP.",
@@ -1033,7 +1145,7 @@ impl NetworkService {
                                 dns_summary: Some("Direct fallback leak detected".to_string()),
                                 dns_leak_status: "UNVERIFIED".to_string(),
                                 webrtc_status: "NON_PROXIED_UDP_DISABLED".to_string(),
-                                check_source: "BROWSER_SESSION".to_string(),
+                                check_source: "PROXY_BRIDGE_PROBE".to_string(),
                                 status: "CONNECTION_FAILED".to_string(),
                                 error_message: Some(err),
                                 checked_at: now,
@@ -1051,13 +1163,24 @@ impl NetworkService {
                     .clone()
                     .unwrap_or_else(|| "UNKNOWN".to_string());
 
-                // Check expected country match
+                // Check expected country match.
+                // IMPORTANT: "UNKNOWN" is NOT a valid match — treat as failure when expected_country is set.
                 if let Some(ref exp_c) = expected_country {
-                    if country_code != "UNKNOWN" && !country_code.eq_ignore_ascii_case(exp_c) {
-                        let err = format!(
-                            "Browser egress country mismatch: expected '{}', observed '{}'",
-                            exp_c, country_code
-                        );
+                    let is_country_match = !country_code.is_empty()
+                        && country_code != "UNKNOWN"
+                        && country_code.eq_ignore_ascii_case(exp_c);
+                    if !is_country_match {
+                        let err = if country_code == "UNKNOWN" || country_code.is_empty() {
+                            format!(
+                                "Geolocation returned UNKNOWN country — cannot confirm expected '{}'. Treating as UNVERIFIED.",
+                                exp_c
+                            )
+                        } else {
+                            format!(
+                                "Proxy bridge egress country mismatch: expected '{}', observed '{}'",
+                                exp_c, country_code
+                            )
+                        };
                         let record = NetworkCheckRecord {
                             id: check_id,
                             environment_id: environment_id.to_string(),
@@ -1067,7 +1190,7 @@ impl NetworkService {
                             dns_summary: Some(probe_res.dns_summary),
                             dns_leak_status: "REMOTE_PROXY_DNS".to_string(),
                             webrtc_status: "NON_PROXIED_UDP_DISABLED".to_string(),
-                            check_source: "BROWSER_SESSION".to_string(),
+                            check_source: "PROXY_BRIDGE_PROBE".to_string(),
                             status: "CONNECTION_FAILED".to_string(),
                             error_message: Some(err),
                             checked_at: now,
@@ -1083,7 +1206,7 @@ impl NetworkService {
                 if let Some(ref exp_ip) = expected_ip {
                     if &probe_res.observed_ipv4 != exp_ip {
                         let err = format!(
-                            "Browser egress IP mismatch: expected '{}', observed '{}'",
+                            "Proxy bridge egress IP mismatch: expected '{}', observed '{}'",
                             exp_ip, probe_res.observed_ipv4
                         );
                         let record = NetworkCheckRecord {
@@ -1095,7 +1218,7 @@ impl NetworkService {
                             dns_summary: Some(probe_res.dns_summary),
                             dns_leak_status: "REMOTE_PROXY_DNS".to_string(),
                             webrtc_status: "NON_PROXIED_UDP_DISABLED".to_string(),
-                            check_source: "BROWSER_SESSION".to_string(),
+                            check_source: "PROXY_BRIDGE_PROBE".to_string(),
                             status: "CONNECTION_FAILED".to_string(),
                             error_message: Some(err),
                             checked_at: now,
@@ -1107,6 +1230,8 @@ impl NetworkService {
                     }
                 }
 
+                // Backend bridge probe succeeded — this is PROXY_EGRESS_VERIFIED, not BROWSER_EGRESS_VERIFIED.
+                // True BROWSER_EGRESS_VERIFIED requires CDP/DevTools Protocol verification (not yet implemented).
                 let record = NetworkCheckRecord {
                     id: check_id,
                     environment_id: environment_id.to_string(),
@@ -1119,8 +1244,8 @@ impl NetworkService {
                     )),
                     dns_leak_status: "REMOTE_PROXY_DNS".to_string(),
                     webrtc_status: "NON_PROXIED_UDP_DISABLED".to_string(),
-                    check_source: "BROWSER_SESSION".to_string(),
-                    status: "BROWSER_EGRESS_VERIFIED".to_string(),
+                    check_source: "PROXY_BRIDGE_PROBE".to_string(),
+                    status: "PROXY_EGRESS_VERIFIED".to_string(),
                     error_message: None,
                     checked_at: now,
                     latency_ms: Some(probe_res.latency_ms),
@@ -1132,10 +1257,10 @@ impl NetworkService {
                 self.audit_service
                     .log(
                         Some(environment_id),
-                        "BROWSER_EGRESS_VERIFIED",
+                        "PROXY_EGRESS_VERIFIED",
                         "INFO",
                         &format!(
-                            "Verified browser session ({}) egress IP: {} (country: {}, latency: {}ms)",
+                            "Proxy bridge probe for session ({}) confirmed egress IP: {} (country: {}, latency: {}ms). Note: browser-origin verification requires CDP (not yet implemented).",
                             session_tag, probe_res.observed_ipv4, country_code, probe_res.latency_ms
                         ),
                     )
@@ -1158,10 +1283,12 @@ impl NetworkService {
                     observed_ipv4: None,
                     observed_ipv6: None,
                     observed_country: None,
-                    dns_summary: Some("Browser proxy bridge verification failed (direct fallback blocked)".to_string()),
+                    dns_summary: Some(
+                        "Proxy bridge verification failed (direct fallback blocked)".to_string(),
+                    ),
                     dns_leak_status: "UNVERIFIED".to_string(),
                     webrtc_status: "NON_PROXIED_UDP_DISABLED".to_string(),
-                    check_source: "BROWSER_SESSION".to_string(),
+                    check_source: "PROXY_BRIDGE_PROBE".to_string(),
                     status: status.clone(),
                     error_message: Some(safe_err.clone()),
                     checked_at: now,
@@ -1174,9 +1301,12 @@ impl NetworkService {
                 self.audit_service
                     .log(
                         Some(environment_id),
-                        "BROWSER_EGRESS_FAILED",
+                        "PROXY_BRIDGE_EGRESS_FAILED",
                         "ERROR",
-                        &format!("Browser egress verification failed ({}): {}", status, safe_err),
+                        &format!(
+                            "Proxy bridge egress verification failed ({}): {}",
+                            status, safe_err
+                        ),
                     )
                     .ok();
 

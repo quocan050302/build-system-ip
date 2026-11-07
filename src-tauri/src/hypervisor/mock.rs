@@ -35,6 +35,12 @@ impl MockHypervisorAdapter {
     }
 }
 
+impl Default for MockHypervisorAdapter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl HypervisorAdapter for MockHypervisorAdapter {
     fn detect(&self) -> Result<HypervisorInfo, HypervisorError> {
         Ok(HypervisorInfo {
@@ -51,50 +57,70 @@ impl HypervisorAdapter for MockHypervisorAdapter {
 
     fn list_vms(&self) -> Result<Vec<VmSummary>, HypervisorError> {
         if !self.available {
-            return Err(HypervisorError::NotFound("Mock hypervisor is not available".to_string()));
+            return Err(HypervisorError::NotFound(
+                "Mock hypervisor is not available".to_string(),
+            ));
         }
         let map = self.vms.lock().unwrap();
-        let summaries = map.iter().map(|(id, vm)| VmSummary {
-            identifier: id.clone(),
-            name: vm.spec.name.clone(),
-            state: vm.state.clone(),
-            os_type: vm.spec.guest_os.clone(),
-            cpu_count: vm.spec.cpu_count,
-            memory_mb: vm.spec.memory_mb,
-        }).collect();
+        let summaries = map
+            .iter()
+            .map(|(id, vm)| VmSummary {
+                identifier: id.clone(),
+                name: vm.spec.name.clone(),
+                state: vm.state.clone(),
+                os_type: vm.spec.guest_os.clone(),
+                cpu_count: vm.spec.cpu_count,
+                memory_mb: vm.spec.memory_mb,
+            })
+            .collect();
         Ok(summaries)
     }
 
     fn get_vm_state(&self, vm_identifier: &str) -> Result<VmState, HypervisorError> {
         if !self.available {
-            return Err(HypervisorError::NotFound("Mock hypervisor is not available".to_string()));
+            return Err(HypervisorError::NotFound(
+                "Mock hypervisor is not available".to_string(),
+            ));
         }
         let map = self.vms.lock().unwrap();
         match map.get(vm_identifier) {
             Some(vm) => Ok(vm.state.clone()),
-            None => Err(HypervisorError::VmNotFound(format!("VM {} not found", vm_identifier))),
+            None => Err(HypervisorError::VmNotFound(format!(
+                "VM {} not found",
+                vm_identifier
+            ))),
         }
     }
 
     fn create_vm(&self, spec: &CreateVmSpec) -> Result<String, HypervisorError> {
         if !self.available {
-            return Err(HypervisorError::NotFound("Mock hypervisor is not available".to_string()));
+            return Err(HypervisorError::NotFound(
+                "Mock hypervisor is not available".to_string(),
+            ));
         }
         let mut map = self.vms.lock().unwrap();
         if map.values().any(|v| v.spec.name == spec.name) {
-            return Err(HypervisorError::InvalidConfiguration(format!("VM with name '{}' already exists", spec.name)));
+            return Err(HypervisorError::InvalidConfiguration(format!(
+                "VM with name '{}' already exists",
+                spec.name
+            )));
         }
         let vm_id = format!("vbox-mock-{}", uuid::Uuid::new_v4());
-        map.insert(vm_id.clone(), MockVm {
-            spec: spec.clone(),
-            state: VmState::Stopped,
-        });
+        map.insert(
+            vm_id.clone(),
+            MockVm {
+                spec: spec.clone(),
+                state: VmState::Stopped,
+            },
+        );
         Ok(vm_id)
     }
 
     fn start_vm(&self, vm_identifier: &str) -> Result<(), HypervisorError> {
         if !self.available {
-            return Err(HypervisorError::NotFound("Mock hypervisor is not available".to_string()));
+            return Err(HypervisorError::NotFound(
+                "Mock hypervisor is not available".to_string(),
+            ));
         }
         let mut map = self.vms.lock().unwrap();
         match map.get_mut(vm_identifier) {
@@ -105,36 +131,46 @@ impl HypervisorAdapter for MockHypervisorAdapter {
                 vm.state = VmState::Running;
                 Ok(())
             }
-            None => Err(HypervisorError::VmNotFound(format!("VM {} not found", vm_identifier))),
+            None => Err(HypervisorError::VmNotFound(format!(
+                "VM {} not found",
+                vm_identifier
+            ))),
         }
     }
 
     fn shutdown_vm(&self, vm_identifier: &str, force: bool) -> Result<(), HypervisorError> {
         if !self.available {
-            return Err(HypervisorError::NotFound("Mock hypervisor is not available".to_string()));
+            return Err(HypervisorError::NotFound(
+                "Mock hypervisor is not available".to_string(),
+            ));
         }
         let mut map = self.vms.lock().unwrap();
         match map.get_mut(vm_identifier) {
             Some(vm) => {
-                if force {
-                    vm.state = VmState::Stopped;
-                } else {
-                    vm.state = VmState::Stopped;
-                }
+                // Both graceful and forced shutdown result in Stopped state in the mock.
+                let _ = force;
+                vm.state = VmState::Stopped;
                 Ok(())
             }
-            None => Err(HypervisorError::VmNotFound(format!("VM {} not found", vm_identifier))),
+            None => Err(HypervisorError::VmNotFound(format!(
+                "VM {} not found",
+                vm_identifier
+            ))),
         }
     }
 
     fn delete_vm(&self, vm_identifier: &str, _delete_disks: bool) -> Result<(), HypervisorError> {
         if !self.available {
-            return Err(HypervisorError::NotFound("Mock hypervisor is not available".to_string()));
+            return Err(HypervisorError::NotFound(
+                "Mock hypervisor is not available".to_string(),
+            ));
         }
         let mut map = self.vms.lock().unwrap();
         if let Some(vm) = map.get(vm_identifier) {
             if vm.state == VmState::Running || vm.state == VmState::Starting {
-                return Err(HypervisorError::ExecutionFailed("Cannot delete a running VM. Stop it first.".to_string()));
+                return Err(HypervisorError::ExecutionFailed(
+                    "Cannot delete a running VM. Stop it first.".to_string(),
+                ));
             }
         }
         map.remove(vm_identifier);
@@ -148,7 +184,9 @@ impl HypervisorAdapter for MockHypervisorAdapter {
     fn get_vm_details(&self, vm_identifier: &str) -> Result<VmDetails, HypervisorError> {
         let state = self.get_vm_state(vm_identifier)?;
         let map = self.vms.lock().unwrap();
-        let vm = map.get(vm_identifier).ok_or_else(|| HypervisorError::VmNotFound(vm_identifier.to_string()))?;
+        let vm = map
+            .get(vm_identifier)
+            .ok_or_else(|| HypervisorError::VmNotFound(vm_identifier.to_string()))?;
 
         Ok(VmDetails {
             identifier: vm_identifier.to_string(),

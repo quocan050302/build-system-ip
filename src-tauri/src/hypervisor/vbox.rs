@@ -29,7 +29,8 @@ impl VirtualBoxAdapter {
         }
 
         // Standard Windows installation directory
-        let default_win_path = PathBuf::from("C:\\Program Files\\Oracle\\VirtualBox\\VBoxManage.exe");
+        let default_win_path =
+            PathBuf::from("C:\\Program Files\\Oracle\\VirtualBox\\VBoxManage.exe");
         if default_win_path.exists() {
             return Some(default_win_path);
         }
@@ -67,13 +68,14 @@ impl VirtualBoxAdapter {
 
     fn run_vbox_cmd(&self, args: &[&str]) -> Result<String, HypervisorError> {
         let exe = self.find_executable().ok_or_else(|| {
-            HypervisorError::NotFound("VirtualBox VBoxManage executable not found on system".to_string())
+            HypervisorError::NotFound(
+                "VirtualBox VBoxManage executable not found on system".to_string(),
+            )
         })?;
 
-        let output = Command::new(exe)
-            .args(args)
-            .output()
-            .map_err(|e| HypervisorError::ExecutionFailed(format!("Failed to spawn VBoxManage: {}", e)))?;
+        let output = Command::new(exe).args(args).output().map_err(|e| {
+            HypervisorError::ExecutionFailed(format!("Failed to spawn VBoxManage: {}", e))
+        })?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -118,7 +120,9 @@ impl HypervisorAdapter for VirtualBoxAdapter {
 
     fn list_vms(&self) -> Result<Vec<VmSummary>, HypervisorError> {
         let output = self.run_vbox_cmd(&["list", "vms"])?;
-        let running_output = self.run_vbox_cmd(&["list", "runningvms"]).unwrap_or_default();
+        let running_output = self
+            .run_vbox_cmd(&["list", "runningvms"])
+            .unwrap_or_default();
 
         let mut vms = Vec::new();
         for line in output.lines() {
@@ -138,7 +142,11 @@ impl HypervisorAdapter for VirtualBoxAdapter {
                         vms.push(VmSummary {
                             identifier: uuid.to_string(),
                             name: name.to_string(),
-                            state: if is_running { VmState::Running } else { VmState::Stopped },
+                            state: if is_running {
+                                VmState::Running
+                            } else {
+                                VmState::Stopped
+                            },
                             os_type: "Unknown".to_string(),
                             cpu_count: 2,
                             memory_mb: 2048,
@@ -171,7 +179,12 @@ impl HypervisorAdapter for VirtualBoxAdapter {
 
     fn create_vm(&self, spec: &CreateVmSpec) -> Result<String, HypervisorError> {
         // Validate inputs
-        if spec.name.is_empty() || !spec.name.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_') {
+        if spec.name.is_empty()
+            || !spec
+                .name
+                .chars()
+                .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
+        {
             return Err(HypervisorError::InvalidConfiguration(
                 "Environment VM name must only contain alphanumeric characters, hyphens, or underscores".to_string()
             ));
@@ -298,7 +311,8 @@ impl HypervisorAdapter for VirtualBoxAdapter {
         let state = self.get_vm_state(vm_identifier).unwrap_or(VmState::Unknown);
         if state == VmState::Running || state == VmState::Starting {
             return Err(HypervisorError::ExecutionFailed(
-                "Cannot delete a running virtual machine. Please shut down or stop it first.".to_string(),
+                "Cannot delete a running virtual machine. Please shut down or stop it first."
+                    .to_string(),
             ));
         }
 
@@ -319,7 +333,12 @@ impl HypervisorAdapter for VirtualBoxAdapter {
         Command::new(exe)
             .args(["startvm", vm_identifier, "--type", "gui"])
             .spawn()
-            .map_err(|e| HypervisorError::ExecutionFailed(format!("Failed to open VirtualBox console: {}", e)))?;
+            .map_err(|e| {
+                HypervisorError::ExecutionFailed(format!(
+                    "Failed to open VirtualBox console: {}",
+                    e
+                ))
+            })?;
 
         Ok(())
     }
@@ -335,15 +354,29 @@ impl HypervisorAdapter for VirtualBoxAdapter {
 
         for line in output.lines() {
             if line.starts_with("name=") {
-                name = line.trim_start_matches("name=").trim_matches('"').to_string();
+                name = line
+                    .trim_start_matches("name=")
+                    .trim_matches('"')
+                    .to_string();
             } else if line.starts_with("Ostype=") {
-                os_type = line.trim_start_matches("Ostype=").trim_matches('"').to_string();
+                os_type = line
+                    .trim_start_matches("Ostype=")
+                    .trim_matches('"')
+                    .to_string();
             } else if line.starts_with("cpus=") {
-                if let Ok(c) = line.trim_start_matches("cpus=").trim_matches('"').parse::<u32>() {
+                if let Ok(c) = line
+                    .trim_start_matches("cpus=")
+                    .trim_matches('"')
+                    .parse::<u32>()
+                {
                     cpu_count = c;
                 }
             } else if line.starts_with("memory=") {
-                if let Ok(m) = line.trim_start_matches("memory=").trim_matches('"').parse::<u64>() {
+                if let Ok(m) = line
+                    .trim_start_matches("memory=")
+                    .trim_matches('"')
+                    .parse::<u64>()
+                {
                     memory_mb = m;
                 }
             }
@@ -364,7 +397,7 @@ impl HypervisorAdapter for VirtualBoxAdapter {
 
     fn get_system_resources(&self) -> Result<HostResources, HypervisorError> {
         let platform_svc = crate::services::platform_service::PlatformService::new(
-            crate::services::platform_service::PlatformService::resolve_default_data_dir()
+            crate::services::platform_service::PlatformService::resolve_default_data_dir(),
         );
         let (total_mem, avail_mem, total_disk, avail_disk) = platform_svc.query_system_resources();
 

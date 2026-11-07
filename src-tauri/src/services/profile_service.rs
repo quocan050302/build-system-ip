@@ -337,7 +337,12 @@ impl SystemBrowserLauncher {
                     if !raw.is_empty() {
                         let version_token = raw
                             .split_whitespace()
-                            .find(|tok| tok.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false))
+                            .find(|tok| {
+                                tok.chars()
+                                    .next()
+                                    .map(|c| c.is_ascii_digit())
+                                    .unwrap_or(false)
+                            })
                             .unwrap_or(&raw);
                         return Some(version_token.to_string());
                     }
@@ -393,7 +398,11 @@ impl SystemBrowserLauncher {
             .or_else(|| trimmed.strip_prefix("http://"))
             .unwrap_or("");
         let host_part = after_scheme.split('/').next().unwrap_or("");
-        if host_part.is_empty() || !host_part.contains('.') && !host_part.starts_with("localhost") && !host_part.starts_with("127.0.0.1") {
+        if host_part.is_empty()
+            || !host_part.contains('.')
+                && !host_part.starts_with("localhost")
+                && !host_part.starts_with("127.0.0.1")
+        {
             return Err(BrowserError::InvalidUrl(
                 url.to_string(),
                 "URL must include a valid hostname".to_string(),
@@ -482,6 +491,12 @@ impl SystemBrowserLauncher {
         }
         // In dry_run mode (unit tests), status string governs running state
         proc_entry.session.status == "RUNNING"
+    }
+}
+
+impl Default for SystemBrowserLauncher {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -592,7 +607,7 @@ impl BrowserLauncher for SystemBrowserLauncher {
                     ));
                 }
             }
-            for (_, proc_entry) in map.iter_mut() {
+            for proc_entry in map.values_mut() {
                 if Self::refresh_process_state(proc_entry)
                     && proc_entry.session.profile_path == config.profile_dir.to_string_lossy()
                 {
@@ -812,8 +827,15 @@ impl ProfileService {
         if trimmed.is_empty() {
             return Err(format!("{} cannot be empty", label));
         }
-        if trimmed.contains("..") || trimmed.contains('/') || trimmed.contains('\\') || trimmed.contains('\0') {
-            return Err(format!("Path traversal or directory separators are not permitted in {}", label));
+        if trimmed.contains("..")
+            || trimmed.contains('/')
+            || trimmed.contains('\\')
+            || trimmed.contains('\0')
+        {
+            return Err(format!(
+                "Path traversal or directory separators are not permitted in {}",
+                label
+            ));
         }
         Ok(())
     }
@@ -842,8 +864,8 @@ impl ProfileService {
         Self::validate_identifier(browser_type, "Browser type")?;
 
         let norm_browser = SystemBrowserLauncher::normalize_browser_type(browser_type);
-        let valid_url = SystemBrowserLauncher::validate_startup_url(startup_url)
-            .map_err(|e| e.to_string())?;
+        let valid_url =
+            SystemBrowserLauncher::validate_startup_url(startup_url).map_err(|e| e.to_string())?;
 
         let env_profile_dir = self
             .base_data_dir
@@ -873,7 +895,10 @@ impl ProfileService {
             .map_err(|e| e.to_string())?;
 
         if path_conflict {
-            return Err("Profile path conflict: another environment is already assigned this profile path".to_string());
+            return Err(
+                "Profile path conflict: another environment is already assigned this profile path"
+                    .to_string(),
+            );
         }
 
         let id = Uuid::new_v4().to_string();
@@ -1071,9 +1096,13 @@ impl ProfileService {
         None
     }
 
-    pub fn update_startup_url(&self, environment_id: &str, startup_url: &str) -> Result<(), String> {
-        let valid_url = SystemBrowserLauncher::validate_startup_url(startup_url)
-            .map_err(|e| e.to_string())?;
+    pub fn update_startup_url(
+        &self,
+        environment_id: &str,
+        startup_url: &str,
+    ) -> Result<(), String> {
+        let valid_url =
+            SystemBrowserLauncher::validate_startup_url(startup_url).map_err(|e| e.to_string())?;
         let now = Utc::now().to_rfc3339();
         self.db
             .with_conn(|conn| {
@@ -1176,8 +1205,8 @@ impl ProfileService {
         };
 
         let target_url = override_url.unwrap_or(&env_startup_url);
-        let valid_url = SystemBrowserLauncher::validate_startup_url(target_url)
-            .map_err(|e| e.to_string())?;
+        let valid_url =
+            SystemBrowserLauncher::validate_startup_url(target_url).map_err(|e| e.to_string())?;
 
         // If an endpoint is assigned, we MUST route through the supervised localhost proxy bridge
         // and NEVER fall back silently to a direct host connection!
@@ -1318,7 +1347,10 @@ impl ProfileService {
         Ok(())
     }
 
-    pub fn get_browser_session_status(&self, environment_id: &str) -> Result<BrowserStatus, String> {
+    pub fn get_browser_session_status(
+        &self,
+        environment_id: &str,
+    ) -> Result<BrowserStatus, String> {
         let status = self
             .launcher
             .status(environment_id)
@@ -1332,7 +1364,12 @@ impl ProfileService {
     pub fn open_profile_folder(&self, environment_id: &str) -> Result<String, String> {
         let profile = self
             .get_profile_by_environment(environment_id)?
-            .ok_or_else(|| format!("No browser profile found for environment {}", environment_id))?;
+            .ok_or_else(|| {
+                format!(
+                    "No browser profile found for environment {}",
+                    environment_id
+                )
+            })?;
 
         let path = PathBuf::from(&profile.profile_path);
         self.validate_path(&path)?;

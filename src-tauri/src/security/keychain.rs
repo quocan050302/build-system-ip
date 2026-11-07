@@ -38,7 +38,9 @@ impl MacOsKeychainSecretStore {
                 "-U",
             ])
             .output()
-            .map_err(|e| SecurityError::EncryptionFailed(format!("Failed to execute security CLI: {}", e)))?;
+            .map_err(|e| {
+                SecurityError::EncryptionFailed(format!("Failed to execute security CLI: {}", e))
+            })?;
 
         if !output.status.success() {
             let err = String::from_utf8_lossy(&output.stderr);
@@ -68,7 +70,9 @@ impl MacOsKeychainSecretStore {
                 "-w",
             ])
             .output()
-            .map_err(|e| SecurityError::DecryptionFailed(format!("Failed to query macOS Keychain: {}", e)))?;
+            .map_err(|e| {
+                SecurityError::DecryptionFailed(format!("Failed to query macOS Keychain: {}", e))
+            })?;
 
         if !output.status.success() {
             let err = String::from_utf8_lossy(&output.stderr);
@@ -79,7 +83,9 @@ impl MacOsKeychainSecretStore {
             )));
         }
 
-        let pass = String::from_utf8_lossy(&output.stdout).trim_end_matches(['\r', '\n']).to_string();
+        let pass = String::from_utf8_lossy(&output.stdout)
+            .trim_end_matches(['\r', '\n'])
+            .to_string();
         Ok(pass)
     }
 
@@ -99,7 +105,9 @@ impl MacOsKeychainSecretStore {
                 &self.service_name,
             ])
             .output()
-            .map_err(|e| SecurityError::DecryptionFailed(format!("Failed to delete Keychain item: {}", e)))?;
+            .map_err(|e| {
+                SecurityError::DecryptionFailed(format!("Failed to delete Keychain item: {}", e))
+            })?;
 
         if !output.status.success() {
             let err = String::from_utf8_lossy(&output.stderr);
@@ -124,6 +132,12 @@ impl MacOsKeychainSecretStore {
         let _ = self.delete_secret(test_key);
 
         Ok(retrieved == test_val)
+    }
+}
+
+impl Default for MacOsKeychainSecretStore {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

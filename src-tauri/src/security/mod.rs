@@ -38,6 +38,12 @@ impl MockSecretStore {
     }
 }
 
+impl Default for MockSecretStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SecretStore for MockSecretStore {
     fn store_secret(&self, key: &str, secret: &str) -> Result<String, SecurityError> {
         let id = if key.is_empty() {
@@ -53,9 +59,9 @@ impl SecretStore for MockSecretStore {
     fn retrieve_secret(&self, reference: &str) -> Result<String, SecurityError> {
         let id = reference.strip_prefix("mock:").unwrap_or(reference);
         let map = self.storage.lock().unwrap();
-        map.get(id)
-            .cloned()
-            .ok_or_else(|| SecurityError::DecryptionFailed(format!("Mock secret not found: {}", id)))
+        map.get(id).cloned().ok_or_else(|| {
+            SecurityError::DecryptionFailed(format!("Mock secret not found: {}", id))
+        })
     }
 
     fn delete_secret(&self, reference: &str) -> Result<(), SecurityError> {

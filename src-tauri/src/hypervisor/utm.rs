@@ -66,7 +66,9 @@ impl UTMAdapter {
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .spawn()
-            .map_err(|e| HypervisorError::ExecutionFailed(format!("Failed to spawn utmctl: {}", e)))?;
+            .map_err(|e| {
+                HypervisorError::ExecutionFailed(format!("Failed to spawn utmctl: {}", e))
+            })?;
 
         let start = std::time::Instant::now();
         let timeout = std::time::Duration::from_secs(3);
@@ -77,13 +79,17 @@ impl UTMAdapter {
                     if start.elapsed() >= timeout {
                         let _ = child.kill();
                         return Err(HypervisorError::ExecutionFailed(
-                            "utmctl command timed out. Ensure UTM.app is open and responding.".to_string(),
+                            "utmctl command timed out. Ensure UTM.app is open and responding."
+                                .to_string(),
                         ));
                     }
                     std::thread::sleep(std::time::Duration::from_millis(50));
                 }
                 Err(e) => {
-                    return Err(HypervisorError::ExecutionFailed(format!("Error waiting for utmctl: {}", e)));
+                    return Err(HypervisorError::ExecutionFailed(format!(
+                        "Error waiting for utmctl: {}",
+                        e
+                    )));
                 }
             }
         };
@@ -144,11 +150,17 @@ impl HypervisorAdapter for UTMAdapter {
 
             if info_plist.exists() {
                 if let Ok(plist_output) = Command::new("defaults")
-                    .args(["read", &info_plist.to_string_lossy(), "CFBundleShortVersionString"])
+                    .args([
+                        "read",
+                        &info_plist.to_string_lossy(),
+                        "CFBundleShortVersionString",
+                    ])
                     .output()
                 {
                     if plist_output.status.success() {
-                        version = String::from_utf8_lossy(&plist_output.stdout).trim().to_string();
+                        version = String::from_utf8_lossy(&plist_output.stdout)
+                            .trim()
+                            .to_string();
                     }
                 }
             }
@@ -236,7 +248,11 @@ impl HypervisorAdapter for UTMAdapter {
             os_type: "Ubuntu Linux ARM64".to_string(),
             cpu_count: 4,
             memory_mb: 4096,
-            disk_path: Some(format!("{}/environments/{}.utm", self.data_dir.to_string_lossy(), vm_identifier)),
+            disk_path: Some(format!(
+                "{}/environments/{}.utm",
+                self.data_dir.to_string_lossy(),
+                vm_identifier
+            )),
             console_type: Some("utm-gui".to_string()),
             architecture: "aarch64".to_string(),
         })
@@ -244,18 +260,26 @@ impl HypervisorAdapter for UTMAdapter {
 
     fn create_vm(&self, spec: &CreateVmSpec) -> Result<String, HypervisorError> {
         // Validate name
-        if spec.name.is_empty() || !spec.name.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_') {
+        if spec.name.is_empty()
+            || !spec
+                .name
+                .chars()
+                .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
+        {
             return Err(HypervisorError::InvalidConfiguration(
                 "Environment VM name must only contain alphanumeric characters, hyphens, or underscores".to_string(),
             ));
         }
 
         // On macOS Apple Silicon UTM, create the environment bundle directory and persistent disk
-        let env_dir = Path::new(&spec.disk_path)
-            .parent()
-            .ok_or_else(|| HypervisorError::InvalidConfiguration("Invalid disk path".to_string()))?;
+        let env_dir = Path::new(&spec.disk_path).parent().ok_or_else(|| {
+            HypervisorError::InvalidConfiguration("Invalid disk path".to_string())
+        })?;
         std::fs::create_dir_all(env_dir).map_err(|e| {
-            HypervisorError::ExecutionFailed(format!("Failed to create environment directory: {}", e))
+            HypervisorError::ExecutionFailed(format!(
+                "Failed to create environment directory: {}",
+                e
+            ))
         })?;
 
         // Allocate persistent sparse disk image using macOS qemu-img or hdiutil or raw file
@@ -263,11 +287,17 @@ impl HypervisorAdapter for UTMAdapter {
         if !disk_file.exists() {
             // Allocate initial raw disk file placeholder or use qemu-img if available
             let f = std::fs::File::create(disk_file).map_err(|e| {
-                HypervisorError::ExecutionFailed(format!("Failed to create persistent disk file: {}", e))
+                HypervisorError::ExecutionFailed(format!(
+                    "Failed to create persistent disk file: {}",
+                    e
+                ))
             })?;
             // Set sparse size
             f.set_len(spec.disk_size_mb * 1024 * 1024).map_err(|e| {
-                HypervisorError::ExecutionFailed(format!("Failed to allocate disk file length: {}", e))
+                HypervisorError::ExecutionFailed(format!(
+                    "Failed to allocate disk file length: {}",
+                    e
+                ))
             })?;
         }
 
@@ -334,10 +364,9 @@ impl HypervisorAdapter for UTMAdapter {
 
     fn open_vm_console(&self, _vm_identifier: &str) -> Result<(), HypervisorError> {
         if let Some(app) = self.find_utm_app() {
-            Command::new("open")
-                .arg(app)
-                .spawn()
-                .map_err(|e| HypervisorError::ExecutionFailed(format!("Failed to open UTM console: {}", e)))?;
+            Command::new("open").arg(app).spawn().map_err(|e| {
+                HypervisorError::ExecutionFailed(format!("Failed to open UTM console: {}", e))
+            })?;
             Ok(())
         } else {
             Err(HypervisorError::NotFound(
@@ -347,7 +376,8 @@ impl HypervisorAdapter for UTMAdapter {
     }
 
     fn get_system_resources(&self) -> Result<HostResources, HypervisorError> {
-        let platform_svc = crate::services::platform_service::PlatformService::new(self.data_dir.clone());
+        let platform_svc =
+            crate::services::platform_service::PlatformService::new(self.data_dir.clone());
         let (total_mem, avail_mem, total_disk, avail_disk) = platform_svc.query_system_resources();
 
         Ok(HostResources {

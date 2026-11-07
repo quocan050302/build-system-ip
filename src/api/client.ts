@@ -388,7 +388,7 @@ function mockHandler<T>(cmd: string, args?: Record<string, unknown>): Promise<T>
         } as unknown as T);
       }
       env.last_observed_country = 'US';
-      env.last_network_status = 'BROWSER_EGRESS_VERIFIED';
+      env.last_network_status = 'PROXY_EGRESS_VERIFIED';
       env.last_checked_at = new Date().toISOString();
       return Promise.resolve({
         id: `check-${Date.now()}`,
@@ -400,7 +400,7 @@ function mockHandler<T>(cmd: string, args?: Record<string, unknown>): Promise<T>
         dns_leak_status: 'REMOTE_PROXY_DNS',
         webrtc_status: 'NON_PROXIED_UDP_DISABLED',
         check_source: 'BROWSER_SESSION',
-        status: 'BROWSER_EGRESS_VERIFIED',
+        status: 'PROXY_EGRESS_VERIFIED',
         error_message: null,
         checked_at: new Date().toISOString(),
         latency_ms: 85,

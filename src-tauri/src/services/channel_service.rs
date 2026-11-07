@@ -10,7 +10,7 @@ pub struct ChannelRecord {
     pub id: String,
     pub youtube_channel_id: String,
     pub display_name: String,
-    pub platform: String,       // "YouTube", "TikTok", "Instagram", "Facebook", "Gumroad"
+    pub platform: String, // "YouTube", "TikTok", "Instagram", "Facebook", "Gumroad"
     pub workspace_name: String, // e.g. "Alexa Creator Studio"
     pub account_handle: Option<String>,
     pub profile_url: Option<String>,
@@ -158,7 +158,10 @@ impl ChannelService {
             .map_err(|e| e.to_string())?;
 
         if id_exists {
-            return Err(format!("A channel with ID '{}' is already registered", clean_id));
+            return Err(format!(
+                "A channel with ID '{}' is already registered",
+                clean_id
+            ));
         }
 
         let valid_status = match req.authorization_status.as_str() {
@@ -429,11 +432,7 @@ impl ChannelService {
         Ok(())
     }
 
-    pub fn update_channel_id(
-        &self,
-        id: &str,
-        new_youtube_channel_id: &str,
-    ) -> Result<(), String> {
+    pub fn update_channel_id(&self, id: &str, new_youtube_channel_id: &str) -> Result<(), String> {
         let clean_id = new_youtube_channel_id.trim();
         if clean_id.is_empty() {
             return Err("Channel / Account ID cannot be empty".to_string());
@@ -445,8 +444,7 @@ impl ChannelService {
                 let mut stmt = conn.prepare(
                     "SELECT COUNT(1) FROM channels WHERE youtube_channel_id = ?1 AND id != ?2",
                 )?;
-                let count: i64 =
-                    stmt.query_row(rusqlite::params![clean_id, id], |r| r.get(0))?;
+                let count: i64 = stmt.query_row(rusqlite::params![clean_id, id], |r| r.get(0))?;
                 Ok(count > 0)
             })
             .map_err(|e| e.to_string())?;
@@ -519,10 +517,7 @@ impl ChannelService {
     pub fn delete_channel(&self, id: &str) -> Result<(), String> {
         self.db
             .with_conn(|conn| {
-                conn.execute(
-                    "DELETE FROM channels WHERE id = ?1",
-                    rusqlite::params![id],
-                )
+                conn.execute("DELETE FROM channels WHERE id = ?1", rusqlite::params![id])
             })
             .map_err(|e| e.to_string())?;
 
