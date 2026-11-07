@@ -13,7 +13,7 @@ mod win_dpapi {
 
     pub fn encrypt_bytes(data: &[u8]) -> Result<Vec<u8>, SecurityError> {
         unsafe {
-            let mut input_blob = CRYPT_INTEGER_BLOB {
+            let input_blob = CRYPT_INTEGER_BLOB {
                 cbData: data.len() as u32,
                 pbData: data.as_ptr() as *mut u8,
             };
@@ -47,7 +47,7 @@ mod win_dpapi {
 
     pub fn decrypt_bytes(encrypted: &[u8]) -> Result<Vec<u8>, SecurityError> {
         unsafe {
-            let mut input_blob = CRYPT_INTEGER_BLOB {
+            let input_blob = CRYPT_INTEGER_BLOB {
                 cbData: encrypted.len() as u32,
                 pbData: encrypted.as_ptr() as *mut u8,
             };

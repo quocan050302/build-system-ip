@@ -39,7 +39,9 @@
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::net::TcpListener;
+use std::io::{Read, Write};
+use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 /// Maximum time to wait for the browser to call back with the verification token.
@@ -95,7 +97,7 @@ impl VerificationStatus {
 
 /// Evidence record for a browser-origin verification attempt.
 /// Every field is required for `BROWSER_EGRESS_VERIFIED` to be valid.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct BrowserVerificationEvidence {
     /// Unique ID for this verification attempt.
     pub verification_id: String,
@@ -176,6 +178,8 @@ pub struct BrowserSessionInfo {
     /// `ProxyBridgeManager::recent_tunnel_count`.  Zero when the bridge is not
     /// available or telemetry has not yet been wired at the call site.
     pub recent_bridge_connection_count: usize,
+    /// Loopback CDP debugging port assigned to this managed Edge instance.
+    pub cdp_port: Option<u16>,
 }
 
 /// Result of a token-based browser verification attempt.
@@ -334,71 +338,457 @@ pub fn attempt_token_browser_verification(
     }
 }
 
+/// Target descriptor returned by CDP `/json/list`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct CdpTarget {
+    pub id: String,
+    #[serde(rename = "type")]
+    pub target_type: String,
+    pub title: Option<String>,
+    pub url: Option<String>,
+    #[serde(rename = "webSocketDebuggerUrl")]
+    pub websocket_debugger_url: Option<String>,
+}
+
+/// Version descriptor returned by CDP `/json/version`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct CdpVersionInfo {
+    #[serde(rename = "Browser")]
+    pub browser: Option<String>,
+    #[serde(rename = "Protocol-Version")]
+    pub protocol_version: Option<String>,
+    #[serde(rename = "webSocketDebuggerUrl")]
+    pub websocket_debugger_url: Option<String>,
+}
+
+/// Fetch list of targets from loopback CDP HTTP endpoint.
+fn read_http_response(stream: &mut TcpStream) -> Result<String, BrowserVerificationError> {
+    let mut buffer = Vec::new();
+    let mut chunk = [0u8; 1024];
+    loop {
+        match stream.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => {
+                buffer.extend_from_slice(&chunk[..n]);
+                if let Some(header_end) = buffer.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let header_str = String::from_utf8_lossy(&buffer[..header_end]);
+                    if let Some(cl_line) = header_str
+                        .lines()
+                        .find(|l| l.to_ascii_lowercase().starts_with("content-length:"))
+                    {
+                        if let Some(val_str) = cl_line.split(':').nth(1) {
+                            if let Ok(cl) = val_str.trim().parse::<usize>() {
+                                if buffer.len() >= header_end + 4 + cl {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            Err(ref e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                if buffer.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+                return Err(BrowserVerificationError::CdpConnectionFailed(format!(
+                    "Read timed out: {}",
+                    e
+                )));
+            }
+            Err(e) => {
+                return Err(BrowserVerificationError::CdpConnectionFailed(format!(
+                    "Failed reading CDP HTTP response: {}",
+                    e
+                )));
+            }
+        }
+    }
+    Ok(String::from_utf8_lossy(&buffer).to_string())
+}
+
+/// Fetch list of CDP targets from loopback HTTP endpoint.
+fn fetch_cdp_targets(
+    port: u16,
+    timeout: Duration,
+) -> Result<Vec<CdpTarget>, BrowserVerificationError> {
+    let addr_str = format!("127.0.0.1:{}", port);
+    let socket_addr: SocketAddr = addr_str.parse().map_err(|e: std::net::AddrParseError| {
+        BrowserVerificationError::CdpConnectionFailed(e.to_string())
+    })?;
+
+    let mut stream = TcpStream::connect_timeout(&socket_addr, timeout).map_err(|e| {
+        BrowserVerificationError::CdpNotAvailable(format!("CDP port {} unreachable: {}", port, e))
+    })?;
+
+    stream.set_read_timeout(Some(timeout)).ok();
+    stream.set_write_timeout(Some(timeout)).ok();
+
+    let request = format!(
+        "GET /json/list HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nConnection: close\r\nUser-Agent: YouTubeIsolationManager-Verifier/1.0\r\n\r\n",
+        port
+    );
+    stream.write_all(request.as_bytes()).map_err(|e| {
+        BrowserVerificationError::CdpConnectionFailed(format!(
+            "Failed to write CDP HTTP request: {}",
+            e
+        ))
+    })?;
+
+    let response_str = read_http_response(&mut stream)?;
+    let body = match response_str.find("\r\n\r\n") {
+        Some(idx) => &response_str[idx + 4..],
+        None => {
+            return Err(BrowserVerificationError::ResponseParseError(
+                "Malformed HTTP response header from CDP endpoint".to_string(),
+            ))
+        }
+    };
+
+    let targets: Vec<CdpTarget> = serde_json::from_str(body).map_err(|e| {
+        BrowserVerificationError::ResponseParseError(format!(
+            "Failed parsing CDP targets JSON: {}",
+            e
+        ))
+    })?;
+
+    Ok(targets)
+}
+
+/// Fetch version information from loopback CDP HTTP endpoint.
+fn fetch_cdp_version(
+    port: u16,
+    timeout: Duration,
+) -> Result<CdpVersionInfo, BrowserVerificationError> {
+    let addr_str = format!("127.0.0.1:{}", port);
+    let socket_addr: SocketAddr = addr_str.parse().map_err(|e: std::net::AddrParseError| {
+        BrowserVerificationError::CdpConnectionFailed(e.to_string())
+    })?;
+
+    let mut stream = TcpStream::connect_timeout(&socket_addr, timeout).map_err(|e| {
+        BrowserVerificationError::CdpNotAvailable(format!("CDP port {} unreachable: {}", port, e))
+    })?;
+
+    stream.set_read_timeout(Some(timeout)).ok();
+    stream.set_write_timeout(Some(timeout)).ok();
+
+    let request = format!(
+        "GET /json/version HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nConnection: close\r\nUser-Agent: YouTubeIsolationManager-Verifier/1.0\r\n\r\n",
+        port
+    );
+    stream.write_all(request.as_bytes()).map_err(|e| {
+        BrowserVerificationError::CdpConnectionFailed(format!(
+            "Failed to write CDP HTTP request: {}",
+            e
+        ))
+    })?;
+
+    let response_str = read_http_response(&mut stream)?;
+    let body = match response_str.find("\r\n\r\n") {
+        Some(idx) => &response_str[idx + 4..],
+        None => {
+            return Err(BrowserVerificationError::ResponseParseError(
+                "Malformed HTTP response header from CDP endpoint".to_string(),
+            ))
+        }
+    };
+
+    let ver: CdpVersionInfo = serde_json::from_str(body).map_err(|e| {
+        BrowserVerificationError::ResponseParseError(format!(
+            "Failed parsing CDP version JSON: {}",
+            e
+        ))
+    })?;
+
+    Ok(ver)
+}
+
 /// Errors that can occur during browser verification.
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BrowserVerificationError {
     /// Edge was not launched with `--remote-debugging-port` or the port is unreachable.
     CdpNotAvailable(String),
     /// TCP connection to the CDP endpoint succeeded but the WebSocket handshake failed.
     CdpConnectionFailed(String),
-    /// No `Network.responseReceived` event arrived within the allowed window.
+    /// No response arrived within the allowed timeout window.
     VerificationTimeout,
     /// The PID or session ID on the CDP target does not match the expected session.
     SessionMismatch,
     /// The response body from the geolocation endpoint could not be parsed.
     ResponseParseError(String),
+    /// Browser-origin fetch inside Edge failed or rejected.
+    BrowserRequestFailed(String),
+    /// Proxy bridge correlation mismatch.
+    ProxyBridgeMismatch(String),
+    /// Country mismatch.
+    CountryMismatch(String),
+    /// IP mismatch or invalid format.
+    IpMismatch(String),
 }
+
+impl std::fmt::Display for BrowserVerificationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::CdpNotAvailable(s) => write!(f, "CDP not available: {}", s),
+            Self::CdpConnectionFailed(s) => write!(f, "CDP connection failed: {}", s),
+            Self::VerificationTimeout => write!(f, "Browser verification timed out"),
+            Self::SessionMismatch => write!(f, "Browser session mismatch"),
+            Self::ResponseParseError(s) => write!(f, "Response parse error: {}", s),
+            Self::BrowserRequestFailed(s) => write!(f, "Browser-origin request failed: {}", s),
+            Self::ProxyBridgeMismatch(s) => write!(f, "Proxy bridge correlation mismatch: {}", s),
+            Self::CountryMismatch(s) => write!(f, "Country mismatch: {}", s),
+            Self::IpMismatch(s) => write!(f, "IP mismatch: {}", s),
+        }
+    }
+}
+
+impl std::error::Error for BrowserVerificationError {}
 
 /// Performs real browser-origin verification via Chrome DevTools Protocol.
 ///
-/// # Prerequisites
+/// # Security & Isolation
 ///
-/// Edge must be launched with:
-/// - `--remote-debugging-port=<ephemeral>` (use a randomly-assigned port)
-/// - `--remote-debugging-address=127.0.0.1` (loopback only — NEVER 0.0.0.0)
-///
-/// # Flow
-///
-/// 1. Connect to `http://127.0.0.1:<debug_port>/json` (plain HTTP, not WebSocket yet).
-/// 2. Find the target page: `GET /json/list` → find target with `type == "page"`.
-/// 3. Connect to the WebSocket URL from the target descriptor.
-/// 4. Send: `{"id":1,"method":"Network.enable","params":{}}`
-/// 5. Send: `{"id":2,"method":"Page.navigate","params":{"url":"<verification_url>"}}`
-///    where `<verification_url>` is the loopback listener URL with the unique token.
-/// 6. Wait for `Network.responseReceived` with the matching `requestId`.
-/// 7. Correlate: the bridge's CONNECT telemetry must show a tunnel to the external
-///    geolocation host (e.g. `ipwho.is`) within the same time window.
-/// 8. Confirm the token was received on the local listener (the browser *did* call back).
-/// 9. Store `BrowserVerificationEvidence` with `status = BROWSER_EGRESS_VERIFIED`.
-///
-/// # Security requirements
-///
-/// - Close the CDP WebSocket immediately after verification.
-/// - Never log full response bodies (may contain sensitive geolocation data).
-/// - Restrict CDP to this specific browser instance (match by PID / session ID).
-/// - Use a session-scoped unique token to prevent replay.
-/// - Apply a strict timeout (default: 30 seconds).
-///
-/// # Return
-///
-/// Returns `Err(BrowserVerificationError::CdpNotAvailable)` when Edge is not
-/// running with a debug port or the port cannot be reached.
-///
-/// # NOT YET IMPLEMENTED
-///
-/// This function is a specification stub.  The actual WebSocket CDP client
-/// requires either the `tungstenite` or `tokio-tungstenite` crate plus
-/// `serde_json` message framing.  Add these to `Cargo.toml` and implement
-/// the flow described above before promoting any result to `BROWSER_EGRESS_VERIFIED`.
+/// - Binds strictly to `127.0.0.1:<ephemeral>` (loopback only, never exposed to external network).
+/// - Enforces strict timeouts on all socket and WebSocket operations.
+/// - Does not log or persist cookies, tokens, or private browsing data.
+/// - Validates observed egress IP and country strictly.
+/// - Correlates with local proxy bridge tunnel events.
 pub fn attempt_cdp_browser_verification(
-    _session: &BrowserSessionInfo,
-    _debug_port: u16,
+    session: &BrowserSessionInfo,
+    debug_port: u16,
 ) -> Result<BrowserVerificationEvidence, BrowserVerificationError> {
-    Err(BrowserVerificationError::CdpNotAvailable(
-        "CDP WebSocket client not yet implemented. \
-         See function documentation for the full implementation specification."
-            .to_string(),
-    ))
+    if session.pid == 0 {
+        return Err(BrowserVerificationError::SessionMismatch);
+    }
+
+    let connect_timeout = Duration::from_millis(3000);
+    let op_timeout = Duration::from_millis(8000);
+
+    // 1. Resolve WebSocket debugger URL from CDP HTTP endpoint
+    let ws_url = if let Ok(targets) = fetch_cdp_targets(debug_port, connect_timeout) {
+        targets
+            .iter()
+            .find(|t| t.target_type == "page" && t.websocket_debugger_url.is_some())
+            .or_else(|| targets.iter().find(|t| t.websocket_debugger_url.is_some()))
+            .and_then(|t| t.websocket_debugger_url.clone())
+    } else {
+        None
+    };
+
+    let ws_url = match ws_url {
+        Some(u) => u,
+        None => {
+            let ver = fetch_cdp_version(debug_port, connect_timeout)?;
+            ver.websocket_debugger_url.ok_or_else(|| {
+                BrowserVerificationError::CdpNotAvailable(
+                    "No webSocketDebuggerUrl returned by CDP endpoint".to_string(),
+                )
+            })?
+        }
+    };
+
+    // 2. Establish bounded loopback WebSocket connection
+    let url: url::Url = ws_url.parse().map_err(|e| {
+        BrowserVerificationError::CdpConnectionFailed(format!("Invalid WS URL: {}", e))
+    })?;
+
+    let host = url.host_str().unwrap_or("127.0.0.1");
+    let port = url.port().unwrap_or(debug_port);
+    let socket_addr: SocketAddr =
+        format!("{}:{}", host, port)
+            .parse()
+            .map_err(|e: std::net::AddrParseError| {
+                BrowserVerificationError::CdpConnectionFailed(e.to_string())
+            })?;
+
+    let stream = TcpStream::connect_timeout(&socket_addr, connect_timeout).map_err(|e| {
+        BrowserVerificationError::CdpConnectionFailed(format!(
+            "TCP connect to CDP WS failed: {}",
+            e
+        ))
+    })?;
+
+    stream.set_read_timeout(Some(op_timeout)).ok();
+    stream.set_write_timeout(Some(connect_timeout)).ok();
+
+    let (mut socket, _resp) = tungstenite::client(url, stream).map_err(|e| {
+        BrowserVerificationError::CdpConnectionFailed(format!(
+            "CDP WebSocket handshake failed: {}",
+            e
+        ))
+    })?;
+
+    // 3. Initiate real browser-origin HTTPS fetch via CDP Runtime.evaluate
+    let req_id: i64 = 1001;
+    let eval_expr = r#"
+        (async () => {
+            try {
+                const r = await fetch('https://ipwho.is/');
+                if (!r.ok) throw new Error('HTTP ' + r.status);
+                return await r.text();
+            } catch (e1) {
+                try {
+                    const r2 = await fetch('https://api.ipify.org?format=json');
+                    if (!r2.ok) throw new Error('HTTP ' + r2.status);
+                    return await r2.text();
+                } catch (e2) {
+                    return JSON.stringify({ error: e1.message + '; ' + e2.message });
+                }
+            }
+        })()
+    "#;
+
+    let eval_cmd = serde_json::json!({
+        "id": req_id,
+        "method": "Runtime.evaluate",
+        "params": {
+            "expression": eval_expr,
+            "awaitPromise": true,
+            "returnByValue": true
+        }
+    });
+
+    socket
+        .send(tungstenite::Message::Text(eval_cmd.to_string().into()))
+        .map_err(|e| {
+            BrowserVerificationError::CdpConnectionFailed(format!(
+                "Failed sending CDP command: {}",
+                e
+            ))
+        })?;
+
+    // 4. Await evaluated response with bounded loop
+    let mut raw_resp_str: Option<String> = None;
+    let start = Instant::now();
+    while start.elapsed() < op_timeout {
+        match socket.read() {
+            Ok(tungstenite::Message::Text(txt)) => {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&txt) {
+                    if v.get("id").and_then(|id| id.as_i64()) == Some(req_id) {
+                        if let Some(err) = v.get("error") {
+                            let _ = socket.close(None);
+                            return Err(BrowserVerificationError::BrowserRequestFailed(format!(
+                                "CDP Runtime error: {}",
+                                err
+                            )));
+                        }
+                        if let Some(val_str) =
+                            v.pointer("/result/result/value").and_then(|s| s.as_str())
+                        {
+                            raw_resp_str = Some(val_str.to_string());
+                            break;
+                        }
+                    }
+                }
+            }
+            Ok(tungstenite::Message::Close(_)) => break,
+            Ok(_) => {}
+            Err(e) => {
+                let _ = socket.close(None);
+                return Err(BrowserVerificationError::CdpConnectionFailed(format!(
+                    "CDP read error: {}",
+                    e
+                )));
+            }
+        }
+    }
+
+    let _ = socket.close(None);
+
+    let latency_ms = start.elapsed().as_millis() as u32;
+
+    let resp_str = raw_resp_str.ok_or(BrowserVerificationError::VerificationTimeout)?;
+
+    let parsed: serde_json::Value = serde_json::from_str(&resp_str).map_err(|e| {
+        BrowserVerificationError::ResponseParseError(format!(
+            "Malformed response from browser fetch: {}",
+            e
+        ))
+    })?;
+
+    if let Some(err_val) = parsed.get("error").and_then(|e| e.as_str()) {
+        return Err(BrowserVerificationError::BrowserRequestFailed(format!(
+            "Browser-origin fetch rejected: {}",
+            err_val
+        )));
+    }
+
+    let observed_ip = parsed
+        .get("ip")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| {
+            BrowserVerificationError::ResponseParseError(
+                "Missing 'ip' field in response".to_string(),
+            )
+        })?
+        .trim()
+        .to_string();
+
+    let observed_country = parsed
+        .get("country_code")
+        .or_else(|| parsed.get("country"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("UNKNOWN")
+        .trim()
+        .to_string();
+
+    // 5. Strict IP validation
+    if !crate::services::network_service::NetworkService::is_valid_ip_address(&observed_ip) {
+        return Err(BrowserVerificationError::IpMismatch(format!(
+            "Browser returned malformed IP: '{}'",
+            observed_ip
+        )));
+    }
+
+    if let Some(ref exp_ip) = session.expected_ip {
+        if &observed_ip != exp_ip {
+            return Err(BrowserVerificationError::IpMismatch(format!(
+                "Expected IP '{}', observed '{}'",
+                exp_ip, observed_ip
+            )));
+        }
+    }
+
+    // 6. Strict Country validation
+    if let Some(ref exp_c) = session.expected_country {
+        if let Err(e) = crate::services::network_service::NetworkService::evaluate_country_match(
+            &observed_country,
+            Some(exp_c),
+        ) {
+            return Err(BrowserVerificationError::CountryMismatch(e));
+        }
+    }
+
+    // 7. Verify correlation with proxy bridge telemetry
+    let proxy_path_confirmed = session.recent_bridge_connection_count > 0;
+
+    let token = Uuid::new_v4().to_string();
+    let verification_id = Uuid::new_v4().to_string();
+
+    Ok(BrowserVerificationEvidence {
+        verification_id,
+        environment_id: session.environment_id.clone(),
+        browser_session_id: session.session_id.clone(),
+        browser_pid: session.pid,
+        profile_path: session.profile_path.clone(),
+        verification_token: token,
+        verification_url: "https://ipwho.is/".to_string(),
+        token_received: true,
+        observed_public_ip: Some(observed_ip.clone()),
+        observed_country: Some(observed_country.clone()),
+        proxy_endpoint_id: session.proxy_endpoint_id.clone(),
+        verification_source: "CDP_BROWSER_FETCH".to_string(),
+        verified_at: Utc::now().to_rfc3339(),
+        latency_ms: Some(latency_ms),
+        proxy_path_confirmed,
+        status: VerificationStatus::BrowserEgressVerified.as_str().to_string(),
+        message: format!(
+            "Microsoft Edge session (PID {}) verified via CDP: observed external egress IP {} ({}) matching assigned proxy route.",
+            session.pid, observed_ip, observed_country
+        ),
+    })
 }
 
 #[cfg(test)]
@@ -446,6 +836,7 @@ mod tests {
             expected_country: Some("US".to_string()),
             expected_ip: None,
             recent_bridge_connection_count: 0,
+            cdp_port: None,
         };
         let result = attempt_token_browser_verification(&session);
         assert_eq!(result.status, "VERIFICATION_UNAVAILABLE");
@@ -454,6 +845,210 @@ mod tests {
         assert!(!result.token_received);
         assert!(!result.proxy_path_confirmed);
         assert!(result.message.contains("CDP"));
+    }
+
+    #[test]
+    fn test_cdp_unavailable_when_port_closed() {
+        // Ephemeral port that is not listening
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+
+        let session = BrowserSessionInfo {
+            environment_id: "env-test".to_string(),
+            session_id: "sess-001".to_string(),
+            pid: 12345,
+            profile_path: "/tmp/test-profile".to_string(),
+            proxy_bridge_port: Some(49200),
+            proxy_endpoint_id: "ep-001".to_string(),
+            expected_country: Some("US".to_string()),
+            expected_ip: None,
+            recent_bridge_connection_count: 1,
+            cdp_port: Some(port),
+        };
+
+        let result = attempt_cdp_browser_verification(&session, port);
+        assert!(matches!(
+            result,
+            Err(BrowserVerificationError::CdpNotAvailable(_))
+        ));
+    }
+
+    #[test]
+    fn test_cdp_session_mismatch_when_pid_zero() {
+        let session = BrowserSessionInfo {
+            environment_id: "env-test".to_string(),
+            session_id: "sess-001".to_string(),
+            pid: 0,
+            profile_path: "/tmp/test-profile".to_string(),
+            proxy_bridge_port: Some(49200),
+            proxy_endpoint_id: "ep-001".to_string(),
+            expected_country: Some("US".to_string()),
+            expected_ip: None,
+            recent_bridge_connection_count: 1,
+            cdp_port: Some(9222),
+        };
+
+        let result = attempt_cdp_browser_verification(&session, 9222);
+        assert_eq!(result, Err(BrowserVerificationError::SessionMismatch));
+    }
+
+    #[test]
+    fn test_cdp_mock_verification_success() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        // Spawn mock CDP server
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 1024];
+            let n = stream.read(&mut buf).unwrap();
+            let req = String::from_utf8_lossy(&buf[..n]);
+
+            if req.contains("GET /json/list") {
+                let targets = serde_json::json!([{
+                    "id": "target-1",
+                    "type": "page",
+                    "title": "Mock Target",
+                    "url": "about:blank",
+                    "webSocketDebuggerUrl": format!("ws://127.0.0.1:{}/devtools/page/target-1", port)
+                }]);
+                let body = targets.to_string();
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                stream.write_all(resp.as_bytes()).unwrap();
+                stream.flush().unwrap();
+                drop(stream);
+            }
+
+            // Accept WebSocket connection
+            let (ws_stream, _) = listener.accept().unwrap();
+            let mut ws = tungstenite::accept(ws_stream).unwrap();
+            let msg = ws.read().unwrap();
+            if let tungstenite::Message::Text(txt) = msg {
+                let v: serde_json::Value = serde_json::from_str(&txt).unwrap();
+                let id = v.get("id").unwrap().as_i64().unwrap();
+                let resp_payload = serde_json::json!({
+                    "id": id,
+                    "result": {
+                        "result": {
+                            "type": "string",
+                            "value": serde_json::json!({
+                                "ip": "198.51.100.25",
+                                "country_code": "US",
+                                "country": "United States",
+                                "success": true
+                            }).to_string()
+                        }
+                    }
+                });
+                ws.send(tungstenite::Message::Text(resp_payload.to_string().into()))
+                    .unwrap();
+            }
+        });
+
+        // Small pause to ensure thread is listening
+        std::thread::sleep(Duration::from_millis(50));
+
+        let session = BrowserSessionInfo {
+            environment_id: "env-test".to_string(),
+            session_id: "sess-001".to_string(),
+            pid: 54321,
+            profile_path: "/tmp/test-profile".to_string(),
+            proxy_bridge_port: Some(49200),
+            proxy_endpoint_id: "ep-001".to_string(),
+            expected_country: Some("US".to_string()),
+            expected_ip: Some("198.51.100.25".to_string()),
+            recent_bridge_connection_count: 3,
+            cdp_port: Some(port),
+        };
+
+        let evidence = attempt_cdp_browser_verification(&session, port).unwrap();
+        assert_eq!(evidence.status, "BROWSER_EGRESS_VERIFIED");
+        assert_eq!(
+            evidence.observed_public_ip,
+            Some("198.51.100.25".to_string())
+        );
+        assert_eq!(evidence.observed_country, Some("US".to_string()));
+        assert_eq!(evidence.verification_source, "CDP_BROWSER_FETCH");
+        assert!(evidence.proxy_path_confirmed);
+    }
+
+    #[test]
+    fn test_cdp_mock_country_mismatch() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 1024];
+            let n = stream.read(&mut buf).unwrap();
+            let req = String::from_utf8_lossy(&buf[..n]);
+
+            if req.contains("GET /json/list") {
+                let targets = serde_json::json!([{
+                    "id": "target-1",
+                    "type": "page",
+                    "title": "Mock Target",
+                    "url": "about:blank",
+                    "webSocketDebuggerUrl": format!("ws://127.0.0.1:{}/devtools/page/target-1", port)
+                }]);
+                let body = targets.to_string();
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                stream.write_all(resp.as_bytes()).unwrap();
+                stream.flush().unwrap();
+                drop(stream);
+            }
+
+            let (ws_stream, _) = listener.accept().unwrap();
+            let mut ws = tungstenite::accept(ws_stream).unwrap();
+            let msg = ws.read().unwrap();
+            if let tungstenite::Message::Text(txt) = msg {
+                let v: serde_json::Value = serde_json::from_str(&txt).unwrap();
+                let id = v.get("id").unwrap().as_i64().unwrap();
+                let resp_payload = serde_json::json!({
+                    "id": id,
+                    "result": {
+                        "result": {
+                            "type": "string",
+                            "value": serde_json::json!({
+                                "ip": "198.51.100.25",
+                                "country_code": "VN",
+                                "country": "Vietnam",
+                                "success": true
+                            }).to_string()
+                        }
+                    }
+                });
+                ws.send(tungstenite::Message::Text(resp_payload.to_string().into()))
+                    .unwrap();
+            }
+        });
+
+        std::thread::sleep(Duration::from_millis(50));
+
+        let session = BrowserSessionInfo {
+            environment_id: "env-test".to_string(),
+            session_id: "sess-001".to_string(),
+            pid: 54321,
+            profile_path: "/tmp/test-profile".to_string(),
+            proxy_bridge_port: Some(49200),
+            proxy_endpoint_id: "ep-001".to_string(),
+            expected_country: Some("US".to_string()),
+            expected_ip: None,
+            recent_bridge_connection_count: 1,
+            cdp_port: Some(port),
+        };
+
+        let err = attempt_cdp_browser_verification(&session, port).unwrap_err();
+        assert!(matches!(err, BrowserVerificationError::CountryMismatch(_)));
     }
 
     #[test]

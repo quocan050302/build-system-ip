@@ -318,6 +318,24 @@ impl ProxyBridgeManager {
         0
     }
 
+    /// Check whether a tunnel to target_host was completed within the last since_secs seconds.
+    /// Used by browser verification to correlate browser-origin requests with bridge traffic.
+    pub fn has_recent_tunnel_to(
+        &self,
+        environment_id: &str,
+        target_host: &str,
+        since_secs: u64,
+    ) -> bool {
+        if let Ok(map) = self.bridges.lock() {
+            if let Some(instance) = map.get(environment_id) {
+                return instance
+                    .telemetry
+                    .has_recent_connection_to(target_host, since_secs);
+            }
+        }
+        false
+    }
+
     pub fn stop_bridge(&self, environment_id: &str) -> bool {
         if let Ok(mut map) = self.bridges.lock() {
             if let Some(instance) = map.remove(environment_id) {
@@ -1003,4 +1021,134 @@ pub fn probe_via_local_bridge(
     }
 
     Err("Proxy bridge did not return a valid public IP response".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpStream;
+    use std::time::Duration;
+
+    #[test]
+    fn test_proxy_bridge_config_validation() {
+        let valid = UpstreamProxyConfig {
+            environment_id: "env-1".to_string(),
+            endpoint_id: "ep-1".to_string(),
+            protocol: "HTTP".to_string(),
+            host: "proxy.us-east.example.com".to_string(),
+            port: 8080,
+            username: Some("user123".to_string()),
+            password: Some("pass123".to_string()),
+            connect_timeout: Duration::from_secs(5),
+        };
+        assert!(ProxyBridgeManager::validate_config(&valid).is_ok());
+
+        let socks = UpstreamProxyConfig {
+            protocol: "SOCKS5".to_string(),
+            ..valid.clone()
+        };
+        assert!(ProxyBridgeManager::validate_config(&socks).is_ok());
+
+        let empty_host = UpstreamProxyConfig {
+            host: "".to_string(),
+            ..valid.clone()
+        };
+        assert!(ProxyBridgeManager::validate_config(&empty_host).is_err());
+
+        let invalid_port = UpstreamProxyConfig {
+            port: 0,
+            ..valid.clone()
+        };
+        assert!(ProxyBridgeManager::validate_config(&invalid_port).is_err());
+
+        let bad_proto = UpstreamProxyConfig {
+            protocol: "FTP".to_string(),
+            ..valid.clone()
+        };
+        assert!(ProxyBridgeManager::validate_config(&bad_proto).is_err());
+    }
+
+    #[test]
+    fn test_proxy_bridge_fail_closed_on_unreachable_upstream() {
+        let mgr = ProxyBridgeManager::new();
+
+        // Configure bridge with an unreachable upstream port on localhost
+        let config = UpstreamProxyConfig {
+            environment_id: "env-fail-closed".to_string(),
+            endpoint_id: "ep-fail-closed".to_string(),
+            protocol: "HTTP".to_string(),
+            host: "127.0.0.1".to_string(),
+            port: 1, // Port 1 is reserved/closed
+            username: None,
+            password: None,
+            connect_timeout: Duration::from_millis(500),
+        };
+
+        let status = mgr.start_or_replace_bridge(config).unwrap();
+        assert!(status.running);
+        assert!(status.local_port > 0);
+
+        // Attempt to connect through bridge using CONNECT
+        let bridge_addr = format!("127.0.0.1:{}", status.local_port);
+        let mut client =
+            TcpStream::connect_timeout(&bridge_addr.parse().unwrap(), Duration::from_secs(2))
+                .expect("Should connect to local bridge");
+
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        client
+            .set_write_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+
+        let req = "CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n";
+        client.write_all(req.as_bytes()).unwrap();
+
+        let mut resp = Vec::new();
+        client.read_to_end(&mut resp).unwrap();
+        let resp_str = String::from_utf8_lossy(&resp);
+
+        // Crucial security invariant: must return 502 Bad Gateway and fail closed.
+        // It must NEVER attempt direct connection or allow traffic to escape.
+        assert!(
+            resp_str.contains("502 Bad Gateway"),
+            "Expected 502 Bad Gateway but got: {}",
+            resp_str
+        );
+        assert!(
+            resp_str.contains("direct fallback blocked"),
+            "Response must explicitly confirm direct fallback blocked: {}",
+            resp_str
+        );
+
+        // Verify telemetry recorded the connection failure
+        let bridge_status = mgr.get_bridge_status("env-fail-closed").unwrap();
+        assert!(bridge_status.connection_failures >= 1);
+
+        mgr.stop_bridge("env-fail-closed");
+        assert!(mgr.get_bridge_status("env-fail-closed").is_none());
+    }
+
+    #[test]
+    fn test_proxy_bridge_telemetry_tunnel_tracking() {
+        let telemetry = BridgeTelemetry::new(50);
+        telemetry.record_event(BridgeConnectionEvent {
+            timestamp: Utc::now().to_rfc3339(),
+            target_host: "api.ipwho.is:443".to_string(),
+            completed: true,
+            latency_ms: Some(45),
+        });
+        telemetry.record_event(BridgeConnectionEvent {
+            timestamp: Utc::now().to_rfc3339(),
+            target_host: "api.ipify.org:443".to_string(),
+            completed: true,
+            latency_ms: Some(52),
+        });
+
+        assert!(telemetry.has_recent_connection_to("api.ipwho.is", 60));
+        assert!(telemetry.has_recent_connection_to("api.ipify.org", 60));
+        assert!(!telemetry.has_recent_connection_to("unknown.domain.org", 60));
+        assert_eq!(telemetry.recent_events(60).len(), 2);
+    }
 }

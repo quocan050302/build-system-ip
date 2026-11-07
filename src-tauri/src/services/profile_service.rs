@@ -53,6 +53,8 @@ pub struct BrowserLaunchConfig {
     pub proxy_bridge_port: Option<u16>,
     pub preferred_language: String,
     pub us_content_preferences: bool,
+    #[serde(default)]
+    pub custom_cdp_port: Option<u16>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -62,6 +64,8 @@ pub enum BrowserStatus {
         started_at: String,
         proxy_bridge_port: Option<u16>,
         startup_url: String,
+        #[serde(default)]
+        cdp_port: Option<u16>,
     },
     Stopped,
     Error(String),
@@ -95,6 +99,8 @@ pub struct BrowserSession {
     pub preferred_language: String,
     pub started_at: String,
     pub status: String,
+    #[serde(default)]
+    pub cdp_port: Option<u16>,
 }
 
 pub trait BrowserLauncher: Send + Sync {
@@ -638,6 +644,7 @@ impl BrowserLauncher for SystemBrowserLauncher {
 
         let profile_path_str = config.profile_dir.to_string_lossy().to_string();
         let now = Utc::now().to_rfc3339();
+        let mut cdp_port = config.custom_cdp_port;
 
         let (child_opt, pid) = if self.dry_run_spawn {
             (None, 42000 + (Uuid::new_v4().as_u128() % 1000) as u32)
@@ -654,6 +661,22 @@ impl BrowserLauncher for SystemBrowserLauncher {
                 cmd.arg(format!("--accept-lang={},en", config.preferred_language));
                 cmd.arg("--force-webrtc-ip-handling-policy=disable_non_proxied_udp");
                 cmd.arg("--enforce-webrtc-ip-permission-check");
+
+                // Assign loopback CDP port for native browser-origin verification
+                if cdp_port.is_none() {
+                    if let Ok(listener) = std::net::TcpListener::bind("127.0.0.1:0") {
+                        if let Ok(addr) = listener.local_addr() {
+                            let p = addr.port();
+                            drop(listener);
+                            cmd.arg(format!("--remote-debugging-port={}", p));
+                            cmd.arg("--remote-debugging-address=127.0.0.1");
+                            cdp_port = Some(p);
+                        }
+                    }
+                } else if let Some(p) = cdp_port {
+                    cmd.arg(format!("--remote-debugging-port={}", p));
+                    cmd.arg("--remote-debugging-address=127.0.0.1");
+                }
 
                 if let Some(ref proxy) = config.proxy_server {
                     cmd.arg(format!("--proxy-server={}", proxy));
@@ -693,6 +716,7 @@ impl BrowserLauncher for SystemBrowserLauncher {
             preferred_language: config.preferred_language,
             started_at: now,
             status: "RUNNING".to_string(),
+            cdp_port,
         };
 
         {
@@ -743,6 +767,7 @@ impl BrowserLauncher for SystemBrowserLauncher {
                     started_at: proc_entry.session.started_at.clone(),
                     proxy_bridge_port: proc_entry.session.proxy_bridge_port,
                     startup_url: proc_entry.session.startup_url.clone(),
+                    cdp_port: proc_entry.session.cdp_port,
                 });
             }
         }
@@ -1289,6 +1314,7 @@ impl ProfileService {
             proxy_bridge_port: bridge_port_opt,
             preferred_language,
             us_content_preferences,
+            custom_cdp_port: None,
         };
 
         let session = match self.launcher.launch(launch_cfg) {

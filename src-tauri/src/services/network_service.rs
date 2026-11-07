@@ -3,9 +3,7 @@ use crate::hypervisor::HypervisorAdapter;
 use crate::security::redaction::redact_sensitive_str;
 use crate::security::{get_secret_store, SecretStore};
 use crate::services::audit_service::AuditService;
-use crate::services::browser_verification::{
-    attempt_token_browser_verification, BrowserSessionInfo,
-};
+use crate::services::browser_verification::{attempt_cdp_browser_verification, BrowserSessionInfo};
 use crate::services::profile_service::{BrowserStatus, ProfileService};
 use crate::services::proxy_bridge::probe_via_local_bridge;
 use crate::services::vm_service::VmService;
@@ -248,7 +246,7 @@ impl NetworkService {
 
     /// Validates that a string is a syntactically valid IPv4 or IPv6 address.
     /// Uses the standard library's `std::net` parsers — no string heuristics.
-    fn is_valid_ip_address(addr: &str) -> bool {
+    pub fn is_valid_ip_address(addr: &str) -> bool {
         use std::net::{Ipv4Addr, Ipv6Addr};
         addr.parse::<Ipv4Addr>().is_ok() || addr.parse::<Ipv6Addr>().is_ok()
     }
@@ -1116,12 +1114,13 @@ impl NetworkService {
 
         // 1. Verify browser session is actively running for this environment
         let browser_status = profile_service.get_browser_session_status(environment_id)?;
-        let (pid, bridge_port_opt) = match browser_status {
+        let (pid, bridge_port_opt, cdp_port_opt) = match browser_status {
             BrowserStatus::Running {
                 pid,
                 proxy_bridge_port,
+                cdp_port,
                 ..
-            } => (pid, proxy_bridge_port),
+            } => (pid, proxy_bridge_port, cdp_port),
             _ => {
                 let record = NetworkCheckRecord {
                     id: check_id,
@@ -1408,48 +1407,77 @@ impl NetworkService {
                     proxy_endpoint_id: _ep_id.clone(),
                     expected_country: expected_country.clone(),
                     expected_ip: expected_ip.clone(),
-                    // `recent_bridge_connection_count` is populated from ProxyBridgeManager::recent_tunnel_count
-                    // when the bridge manager is accessible from NetworkService.  NetworkService does not
-                    // currently hold an Arc<ProxyBridgeManager>; wiring that is a future step.
-                    // The field defaults to 0 here so the architecture compiles and is complete.
-                    recent_bridge_connection_count: 0,
+                    // Real telemetry from the active shared ProxyBridgeManager instance
+                    recent_bridge_connection_count: profile_service
+                        .proxy_bridge_manager()
+                        .recent_tunnel_count(environment_id, 300),
+                    cdp_port: cdp_port_opt,
                 };
-                let _browser_evidence = attempt_token_browser_verification(&bridge_session);
-                // _browser_evidence.status == "VERIFICATION_UNAVAILABLE" until CDP is wired.
-                // The backend probe result below is correctly labeled PROXY_EGRESS_VERIFIED.
+
+                // Attempt real CDP browser-origin verification if Edge has an active loopback debug port
+                let cdp_evidence = if let Some(cdp_port) = cdp_port_opt {
+                    attempt_cdp_browser_verification(&bridge_session, cdp_port).ok()
+                } else {
+                    None
+                };
+
+                let (final_status, check_source, audit_msg) = if let Some(ref evidence) =
+                    cdp_evidence
+                {
+                    (
+                        "BROWSER_EGRESS_VERIFIED".to_string(),
+                        "BROWSER_SESSION".to_string(),
+                        format!(
+                            "Edge browser-origin egress verified via CDP for session ({}): external IP {}, country {}.",
+                            session_tag,
+                            evidence.observed_public_ip.as_deref().unwrap_or(""),
+                            evidence.observed_country.as_deref().unwrap_or("")
+                        ),
+                    )
+                } else {
+                    (
+                        "PROXY_EGRESS_VERIFIED".to_string(),
+                        "PROXY_BRIDGE_PROBE".to_string(),
+                        format!(
+                            "Proxy bridge probe for session ({}) confirmed egress IP: {} (country: {}, latency: {}ms). Note: browser-origin verification requires active CDP session.",
+                            session_tag, probe_res.observed_ipv4, country_code, probe_res.latency_ms
+                        ),
+                    )
+                };
 
                 let record = NetworkCheckRecord {
                     id: check_id,
                     environment_id: environment_id.to_string(),
-                    observed_ipv4: Some(probe_res.observed_ipv4.clone()),
+                    observed_ipv4: cdp_evidence
+                        .as_ref()
+                        .and_then(|e| e.observed_public_ip.clone())
+                        .or(Some(probe_res.observed_ipv4.clone())),
                     observed_ipv6: probe_res.observed_ipv6,
-                    observed_country: Some(country_code.clone()),
+                    observed_country: cdp_evidence
+                        .as_ref()
+                        .and_then(|e| e.observed_country.clone())
+                        .or(Some(country_code.clone())),
                     dns_summary: Some(format!(
                         "{} (Bridge 127.0.0.1:{} -> '{}' [{}])",
                         probe_res.dns_summary, bridge_port, ep_name, session_tag
                     )),
                     dns_leak_status: "REMOTE_PROXY_DNS".to_string(),
                     webrtc_status: "NON_PROXIED_UDP_DISABLED".to_string(),
-                    check_source: "PROXY_BRIDGE_PROBE".to_string(),
-                    status: "PROXY_EGRESS_VERIFIED".to_string(),
+                    check_source,
+                    status: final_status.clone(),
                     error_message: None,
                     checked_at: now,
-                    latency_ms: Some(probe_res.latency_ms),
+                    latency_ms: cdp_evidence
+                        .as_ref()
+                        .and_then(|e| e.latency_ms)
+                        .or(Some(probe_res.latency_ms)),
                     session_id: Some(session_tag.clone()),
                 };
 
                 self.persist_network_check(&record)?;
 
                 self.audit_service
-                    .log(
-                        Some(environment_id),
-                        "PROXY_EGRESS_VERIFIED",
-                        "INFO",
-                        &format!(
-                            "Proxy bridge probe for session ({}) confirmed egress IP: {} (country: {}, latency: {}ms). Note: browser-origin verification requires CDP (not yet implemented).",
-                            session_tag, probe_res.observed_ipv4, country_code, probe_res.latency_ms
-                        ),
-                    )
+                    .log(Some(environment_id), &final_status, "INFO", &audit_msg)
                     .ok();
 
                 Ok(record)

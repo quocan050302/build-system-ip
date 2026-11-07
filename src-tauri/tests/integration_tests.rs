@@ -860,3 +860,43 @@ fn test_is_verification_stale_fresh_record() {
         "Current timestamp should not be stale for 1-hour max_age"
     );
 }
+
+#[test]
+fn test_browser_egress_verified_requires_cdp_success() {
+    // Without an active browser session with working CDP endpoint,
+    // verify_browser_egress must never return BROWSER_EGRESS_VERIFIED.
+    let (vm_service, network_service, _, profile_service, _, _temp) = setup_test_services();
+
+    let env = vm_service
+        .create_environment(CreateEnvironmentRequest {
+            name: "Env_BrowserEgressCdpGate".to_string(),
+            hypervisor_type: "VirtualBox".to_string(),
+            guest_os: "Ubuntu_64".to_string(),
+            cpu_count: 2,
+            memory_mb: 2048,
+            disk_size_mb: 10240,
+            iso_path: None,
+            browser_type: "edge".to_string(),
+            network_endpoint_id: None,
+            channel_id: None,
+            host_platform: None,
+            vm_architecture: None,
+            ..Default::default()
+        })
+        .unwrap();
+
+    let check = network_service
+        .verify_browser_egress(&env.id, &profile_service)
+        .unwrap();
+
+    // Invariant: BROWSER_EGRESS_VERIFIED is prohibited without verified CDP fetch
+    assert_ne!(
+        check.status, "BROWSER_EGRESS_VERIFIED",
+        "verify_browser_egress without CDP must not return BROWSER_EGRESS_VERIFIED"
+    );
+    assert_eq!(check.status, "VERIFICATION_UNAVAILABLE");
+
+    // Invariant: DNS/IPv6/WebRTC status must be honest, not falsely marked PASS/VERIFIED
+    assert_ne!(check.dns_leak_status, "VERIFIED");
+    assert_ne!(check.webrtc_status, "VERIFIED");
+}
