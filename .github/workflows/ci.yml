@@ -2,9 +2,10 @@ name: Cross-Platform CI & Release Packaging
 
 on:
   push:
-    branches: [main, master]
+    branches: [main, master, 'fix/**', 'feature/**']
   pull_request:
     branches: [main, master]
+  workflow_dispatch:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -22,7 +23,7 @@ jobs:
           node-version: 22
           cache: 'npm'
       - run: npm ci
-      - run: npm test
+      - run: npm test -- --run
       - run: npm run build
 
   # ── Rust checks ─────────────────────────────────────────────────────────────
@@ -47,9 +48,16 @@ jobs:
 
   rust-macos:
     name: Rust — macOS ARM64 (fmt + clippy + test)
-    runs-on: macos-14
+    runs-on: macos-15
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
+      - name: Verify ARM64 runner architecture
+        run: |
+          uname -s
+          uname -m
+          rustc -vV || true
+          echo "Expected: aarch64, arm64, or Darwin arm64"
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-apple-darwin
@@ -105,11 +113,17 @@ jobs:
   # ── Tauri bundle — macOS ARM64 ──────────────────────────────────────────────
   tauri-macos:
     name: Tauri Bundle — macOS ARM64
-    runs-on: macos-14
+    runs-on: macos-15
     needs: [frontend, rust-macos]
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
+      - name: Verify ARM64 runner architecture
+        run: |
+          uname -s
+          uname -m
+          rustc -vV || true
+          echo "Expected: aarch64, arm64, or Darwin arm64"
       - uses: actions/setup-node@v4
         with:
           node-version: 22

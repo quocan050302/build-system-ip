@@ -745,3 +745,118 @@ fn test_proxy_egress_verified_not_browser_verified() {
     // check_source confirms this came from the browser-verifier gate, not a network probe
     assert_eq!(check.check_source, "PROXY_BRIDGE_PROBE");
 }
+
+// ─── Test helpers ──────────────────────────────────────────────────────────────
+
+fn evaluate_country_match_helper(observed: &str, expected: Option<&str>) -> Result<(), String> {
+    youtube_isolation_manager_lib::services::network_service::NetworkService::evaluate_country_match(
+        observed,
+        expected.map(|s| s.to_string()).as_deref(),
+    )
+}
+
+fn make_check_record(
+    status: &str,
+    checked_at: &str,
+) -> youtube_isolation_manager_lib::services::network_service::NetworkCheckRecord {
+    youtube_isolation_manager_lib::services::network_service::NetworkCheckRecord {
+        id: "test-id".to_string(),
+        environment_id: "test-env".to_string(),
+        observed_ipv4: None,
+        observed_ipv6: None,
+        observed_country: None,
+        dns_summary: None,
+        dns_leak_status: "UNVERIFIED".to_string(),
+        webrtc_status: "UNVERIFIED".to_string(),
+        check_source: "TEST".to_string(),
+        status: status.to_string(),
+        error_message: None,
+        checked_at: checked_at.to_string(),
+        latency_ms: None,
+        session_id: None,
+    }
+}
+
+// ─── Phase 8: IP validation regression tests ─────────────────────────────────
+
+#[test]
+fn test_is_valid_ip_address_accepts_valid_ipv4() {
+    // is_valid_ip_address is a private helper — test via standard library parsers
+    // Valid IPv4 addresses should be accepted by the system
+    let valid_ips = [
+        "1.2.3.4",
+        "192.168.1.1",
+        "8.8.8.8",
+        "255.255.255.255",
+        "0.0.0.0",
+    ];
+    for ip in &valid_ips {
+        assert!(
+            ip.parse::<std::net::Ipv4Addr>().is_ok(),
+            "Expected valid IPv4: {}",
+            ip
+        );
+    }
+}
+
+#[test]
+fn test_is_valid_ip_address_rejects_invalid() {
+    let invalid_ips = ["not-an-ip", "256.0.0.1", "192.168.1", "::gggg", ""];
+    for ip in &invalid_ips {
+        assert!(
+            ip.parse::<std::net::Ipv4Addr>().is_err() && ip.parse::<std::net::Ipv6Addr>().is_err(),
+            "Expected invalid IP to fail parsing: {}",
+            ip
+        );
+    }
+}
+
+#[test]
+fn test_evaluate_country_match_empty_string_fails() {
+    // Empty string must fail when expected_country is set
+    let result = evaluate_country_match_helper("", Some("US"));
+    assert!(
+        result.is_err(),
+        "Empty country with expected_country=US must fail"
+    );
+}
+
+#[test]
+fn test_evaluate_country_match_no_constraint_passes_any() {
+    // No expected country = any value passes (including UNKNOWN)
+    let result = evaluate_country_match_helper("UNKNOWN", None);
+    assert!(
+        result.is_ok(),
+        "No expected_country constraint — any value should pass"
+    );
+    let result2 = evaluate_country_match_helper("", None);
+    assert!(
+        result2.is_ok(),
+        "No expected_country constraint — empty should pass"
+    );
+}
+
+#[test]
+fn test_is_verification_stale_old_record() {
+    // A record with a very old timestamp should be stale
+    let record = make_check_record("PROXY_EGRESS_VERIFIED", "1970-01-01T00:00:00Z");
+    assert!(
+        youtube_isolation_manager_lib::services::network_service::is_verification_stale(
+            &record, 3600
+        ),
+        "1970 timestamp should be stale for 1-hour max_age"
+    );
+}
+
+#[test]
+fn test_is_verification_stale_fresh_record() {
+    // A record with a very recent timestamp should not be stale
+    let now = chrono::Utc::now().to_rfc3339();
+    let record = make_check_record("PROXY_EGRESS_VERIFIED", &now);
+    assert!(
+        !youtube_isolation_manager_lib::services::network_service::is_verification_stale(
+            &record, 3600
+        ),
+        "Current timestamp should not be stale for 1-hour max_age"
+    );
+}

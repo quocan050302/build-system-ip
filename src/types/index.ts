@@ -112,6 +112,8 @@ export interface EnvironmentRecord {
   last_network_status?: string | null;
   last_network_error?: string | null;
   last_checked_at?: string | null;
+  last_dns_leak_status?: string | null;
+  last_webrtc_status?: string | null;
   channel_id?: string | null;
   channel_name?: string | null;
 }

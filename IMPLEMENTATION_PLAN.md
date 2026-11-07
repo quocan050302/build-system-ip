@@ -83,3 +83,42 @@ On Windows x64 (`x86_64-pc-windows-msvc`):
    - Hyper-V PowerShell management requires Administrator privileges or membership in the local `Hyper-V Administrators` group. The `PlatformService` reports permissions status directly to the user in Settings.
 3. **Guest Architecture Matching**:
    - On macOS Apple Silicon (ARM64), guest OS images must be ARM64 (e.g., Ubuntu Linux ARM64). Emulating x86_64 images is intentionally not permitted to prioritize virtualization performance over slow CPU emulation.
+
+---
+
+## Phase 6 — Proxy Verification Hardening (fix/macos-edge-us-proxy-verification-v2)
+
+### Status: IN PROGRESS
+
+### Changes delivered
+
+#### Defect fixes
+1. **FALSE BROWSER_EGRESS_VERIFIED** — `verify_browser_egress()` now returns `PROXY_EGRESS_VERIFIED` for backend bridge probes. `BROWSER_EGRESS_VERIFIED` is reserved for CDP-verified browser-origin evidence.
+2. **UNKNOWN country false pass** — `UNKNOWN` and empty geolocation results now fail when `expected_country` is set.
+3. **IP address validation** — `expected_ip` and observed IP are now validated with proper `std::net` parsers.
+
+#### New architecture
+- `src-tauri/src/services/browser_verification.rs` — CDP browser verification skeleton with `BrowserVerificationEvidence`, `VerificationStatus` enum, and token-based verification infrastructure.
+- `NetworkProtectionStatus` — structured DNS/IPv6/WebRTC status reporting.
+- `is_verification_stale()` — detects and marks cached verification results older than a configured threshold.
+
+#### CI improvements
+- `macos-14` → `macos-15` for more reliable ARM64 runner availability.
+- Feature branch triggers added (`fix/**`, `feature/**`).
+- Architecture verification step added to macOS jobs.
+- Bounded timeouts on all jobs.
+
+### Known remaining gaps
+
+| Gap | Severity | Recommended action |
+|---|---|---|
+| CDP browser-origin verification | HIGH | Implement WebSocket client for Chrome DevTools Protocol |
+| IPv6 bypass possible | HIGH | Add `--disable-ipv6` to Edge args or disable at VM network level |
+| WebRTC runtime not verified | MEDIUM | Use CDP to inject WebRTC test and verify behavior |
+| DNS routing not packet-verified | MEDIUM | Add network packet inspection or DNS query logging |
+| macOS ARM64 live Edge+Proxy test | HIGH | Manual test with real credentials required |
+
+### Production readiness
+`ENGINEERING_READY_LIVE_VERIFICATION_PENDING`
+
+Real Microsoft Edge + real J2Proxy credentials + macOS ARM64 hardware test required before `READY_FOR_PRODUCTION`.

@@ -143,3 +143,76 @@ If `expected_country` is configured (e.g., "US"):
 2. **WebRTC runtime verification**: Flag applied but not confirmed effective at runtime
 3. **True browser-origin verification**: Requires CDP integration with restricted access (future work)
 4. **Bridge port visibility**: Any local process can connect to the dynamic port if discovered; consider token-based access control
+
+---
+
+## 7. DNS, IPv6 and WebRTC Protection Status
+
+### 7.1 DNS
+
+| Scenario | Status | Notes |
+|---|---|---|
+| HTTP proxy (CONNECT) | UNVERIFIED | Proxy handles DNS on remote side; host resolver not used for CONNECT targets |
+| SOCKS5 (domain mode) | UNVERIFIED | Domain sent to upstream proxy for resolution; host DNS not invoked |
+| Host-side DNS resolver | RISK | If SOCKS5 is used in IP mode or HTTP proxy fails, host DNS may be used |
+| Verification method | UNVERIFIED | Runtime DNS verification requires packet capture or browser instrumentation |
+
+**Current limitation:** DNS routing is assumed to be remote (proxy-side) based on CONNECT/SOCKS5 semantics. This has not been independently verified with packet capture or DNS query monitoring.
+
+### 7.2 IPv6
+
+| Property | Status |
+|---|---|
+| Proxy bridge IPv6 support | NOT APPLICABLE — bridge is IPv4-only (127.0.0.1) |
+| Edge IPv6 connectivity | UNVERIFIED |
+| IPv6 bypass risk | PRESENT — if system has IPv6 and Edge uses it, traffic may bypass proxy |
+| Mitigation applied | NONE — no OS-level IPv6 disable applied |
+| Recommended action | Disable IPv6 at UTM VM network level, or add --disable-ipv6 to Edge launch args |
+
+**Current limitation:** The proxy bridge only listens on 127.0.0.1 (IPv4). If Microsoft Edge establishes IPv6 connections to social media endpoints, those connections will NOT route through the proxy bridge. IPv6 bypass is a confirmed risk that has not been mitigated in the current implementation.
+
+### 7.3 WebRTC
+
+| Property | Status |
+|---|---|
+| Launch flag applied | `--force-webrtc-ip-handling-policy=disable_non_proxied_udp` |
+| Flag effectiveness verified | UNVERIFIED — runtime test not performed |
+| WebRTC API available | Assumed present in Edge |
+| Non-proxied UDP disabled | Assumed via flag; not confirmed |
+
+**Current limitation:** The WebRTC policy flag is supplied at Edge launch. It is not verified at runtime that (a) Edge honored the flag, (b) the flag is effective for the specific Edge version installed, or (c) no WebRTC requests using non-proxied paths were actually made. Full verification requires injecting JavaScript via CDP to test `RTCPeerConnection` behavior.
+
+### 7.4 Protection Summary
+
+| Component | Verified | Evidence |
+|---|---|---|
+| Proxy bridge loopback binding | ✅ YES | Code: `TcpListener::bind("127.0.0.1:0")` |
+| Credential redaction in logs | ✅ YES | `redact_sensitive_str()` applied before all log calls |
+| No direct connection fallback | ✅ YES | Bridge returns 502 on upstream failure; no silent fallback |
+| DNS routing through proxy | ⚠️ ASSUMED | CONNECT/SOCKS5 semantics; not packet-verified |
+| IPv6 bypass prevention | ❌ NOT MITIGATED | No IPv6 disable; bridge is IPv4-only |
+| WebRTC non-proxied UDP disable | ⚠️ POLICY SET | Flag applied at launch; runtime not verified |
+| Browser-origin verification | ❌ NOT IMPLEMENTED | CDP integration pending |
+
+## 8. Legitimate Use Boundaries
+
+This system is designed for authorized management of social media accounts for content creators. The following are strictly NOT supported use cases:
+
+- Fabricating US residency or identity
+- Circumventing platform account restrictions or bans
+- Generating artificial engagement (likes, views, follows, comments)
+- Manipulating platform recommendation algorithms
+- Operating accounts without platform authorization
+- Claiming verified US audience reach based solely on proxy country match
+
+A verified US proxy exit point means:
+- Network traffic routes through a US IP address.
+- The platform's server observes a US IP for API requests.
+
+It does NOT mean:
+- The account holder is a US resident.
+- Platform content distribution will target US audiences.
+- Audience demographics will be US-based.
+- Any platform policy is satisfied or circumvented.
+
+**US PROXY VERIFIED ≠ US ACCOUNT REGION ≠ US AUDIENCE DISTRIBUTION**

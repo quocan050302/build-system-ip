@@ -3,6 +3,9 @@ use crate::hypervisor::HypervisorAdapter;
 use crate::security::redaction::redact_sensitive_str;
 use crate::security::{get_secret_store, SecretStore};
 use crate::services::audit_service::AuditService;
+use crate::services::browser_verification::{
+    attempt_token_browser_verification, BrowserSessionInfo,
+};
 use crate::services::profile_service::{BrowserStatus, ProfileService};
 use crate::services::proxy_bridge::probe_via_local_bridge;
 use crate::services::vm_service::VmService;
@@ -57,10 +60,10 @@ pub struct NetworkCheckRecord {
     pub observed_ipv6: Option<String>,
     pub observed_country: Option<String>,
     pub dns_summary: Option<String>,
-    pub dns_leak_status: String, // "UNVERIFIED", "REMOTE_PROXY_DNS"
-    pub webrtc_status: String,   // "UNVERIFIED", "NON_PROXIED_UDP_DISABLED"
+    pub dns_leak_status: String, // "UNVERIFIED", "REMOTE_PROXY_DNS", "HOST_DNS_DETECTED", "VERIFIED", "FAILED", "NOT_APPLICABLE"
+    pub webrtc_status: String, // "UNVERIFIED", "NON_PROXIED_UDP_DISABLED", "VERIFIED", "FAILED", "NOT_APPLICABLE", "POLICY_SET_UNVERIFIED"
     pub check_source: String, // "GUEST_AGENT", "PROXY_PROBE", "BROWSER_SESSION", "HOST_PROBE", "DIRECT_PROBE"
-    pub status: String, // "NOT_CONFIGURED", "ENDPOINT_CONFIGURED", "ENDPOINT_REACHABLE", "PROXY_EGRESS_VERIFIED", "BROWSER_EGRESS_VERIFIED", "AUTH_FAILED", "CONNECTION_FAILED", "VERIFICATION_UNAVAILABLE", "NOT_CHECKED", "GUEST_EGRESS_OBSERVED"
+    pub status: String, // "NOT_CONFIGURED", "ENDPOINT_CONFIGURED", "ENDPOINT_REACHABLE", "PROXY_EGRESS_VERIFIED", "BROWSER_EGRESS_VERIFIED", "AUTH_FAILED", "CONNECTION_FAILED", "VERIFICATION_UNAVAILABLE", "NOT_CHECKED", "GUEST_EGRESS_OBSERVED", "STALE"
     pub error_message: Option<String>,
     pub checked_at: String,
     pub latency_ms: Option<u32>,
@@ -72,6 +75,93 @@ pub struct DuplicateEgressWarning {
     pub ip_address: String,
     pub conflicting_environments: Vec<String>,
     pub message: String,
+}
+
+/// Aggregated DNS, IPv6, and WebRTC protection status for display in the UI.
+/// Each field uses one of: "VERIFIED", "FAILED", "UNVERIFIED", "NOT_APPLICABLE".
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NetworkProtectionStatus {
+    pub environment_id: String,
+    /// DNS leak status: whether DNS is resolving through the proxy (not host).
+    pub dns_status: String,
+    /// DNS notes: human-readable explanation of the dns_status.
+    pub dns_notes: String,
+    /// IPv6 leak status: whether IPv6 traffic could bypass the proxy.
+    pub ipv6_status: String,
+    /// IPv6 notes.
+    pub ipv6_notes: String,
+    /// WebRTC status: whether WebRTC is configured to prevent IP leak.
+    pub webrtc_status: String,
+    /// WebRTC notes.
+    pub webrtc_notes: String,
+    /// Overall protection rating: "FULLY_PROTECTED", "PARTIALLY_PROTECTED", "UNVERIFIED", "FAILED"
+    pub overall_status: String,
+    /// Timestamp of the assessment.
+    pub assessed_at: String,
+}
+
+impl NetworkProtectionStatus {
+    /// Build a NetworkProtectionStatus from an existing NetworkCheckRecord.
+    /// This translates stored status strings into the structured protection view.
+    pub fn from_check_record(record: &NetworkCheckRecord, environment_id: &str) -> Self {
+        let dns_status = match record.dns_leak_status.as_str() {
+            "REMOTE_PROXY_DNS" => "VERIFIED".to_string(),
+            "HOST_DNS_DETECTED" => "FAILED".to_string(),
+            "NOT_APPLICABLE" => "NOT_APPLICABLE".to_string(),
+            _ => "UNVERIFIED".to_string(),
+        };
+        let dns_notes = match record.dns_leak_status.as_str() {
+            "REMOTE_PROXY_DNS" => "DNS resolves through proxy (remote side). Host DNS not observed.".to_string(),
+            "HOST_DNS_DETECTED" => "ALERT: Host-side DNS resolution detected — potential DNS leak.".to_string(),
+            "NOT_APPLICABLE" => "DNS verification not applicable for this connection type.".to_string(),
+            _ => "DNS routing has not been independently verified. SOCKS5/HTTP proxy assumed to handle DNS remotely.".to_string(),
+        };
+
+        let ipv6_status = "UNVERIFIED".to_string();
+        let ipv6_notes = "IPv6 behavior has not been independently tested. The proxy bridge is IPv4-only. Edge may have IPv6 connectivity that bypasses the bridge. Recommended: disable IPv6 at the OS or network level, or verify --disable-ipv6 flag effect in Edge.".to_string();
+
+        let webrtc_status = match record.webrtc_status.as_str() {
+            "NON_PROXIED_UDP_DISABLED" => "POLICY_SET_UNVERIFIED".to_string(),
+            "VERIFIED" => "VERIFIED".to_string(),
+            "FAILED" => "FAILED".to_string(),
+            "NOT_APPLICABLE" => "NOT_APPLICABLE".to_string(),
+            _ => "UNVERIFIED".to_string(),
+        };
+        let webrtc_notes = match record.webrtc_status.as_str() {
+            "NON_PROXIED_UDP_DISABLED" => "Policy flag --force-webrtc-ip-handling-policy=disable_non_proxied_udp was set at launch. Actual WebRTC behavior has not been verified at runtime — the flag may not be effective in all Edge versions.".to_string(),
+            "VERIFIED" => "WebRTC configured and verified to not expose non-proxied IPs.".to_string(),
+            "FAILED" => "WebRTC check failed — non-proxied IP may be exposed.".to_string(),
+            "NOT_APPLICABLE" => "WebRTC not applicable for this environment.".to_string(),
+            _ => "WebRTC protection has not been verified.".to_string(),
+        };
+
+        // Overall: only FULLY_PROTECTED if DNS=VERIFIED, IPv6=VERIFIED, WebRTC=VERIFIED
+        let overall_status =
+            if dns_status == "FAILED" || webrtc_status == "FAILED" || ipv6_status == "FAILED" {
+                "FAILED".to_string()
+            } else if dns_status == "VERIFIED"
+                && ipv6_status == "VERIFIED"
+                && webrtc_status == "VERIFIED"
+            {
+                "FULLY_PROTECTED".to_string()
+            } else if dns_status == "VERIFIED" || webrtc_status == "POLICY_SET_UNVERIFIED" {
+                "PARTIALLY_PROTECTED".to_string()
+            } else {
+                "UNVERIFIED".to_string()
+            };
+
+        Self {
+            environment_id: environment_id.to_string(),
+            dns_status,
+            dns_notes,
+            ipv6_status,
+            ipv6_notes,
+            webrtc_status,
+            webrtc_notes,
+            overall_status,
+            assessed_at: chrono::Utc::now().to_rfc3339(),
+        }
+    }
 }
 
 pub struct NetworkService {
@@ -149,6 +239,13 @@ impl NetworkService {
             }
         }
         Ok(())
+    }
+
+    /// Validates that a string is a syntactically valid IPv4 or IPv6 address.
+    /// Uses the standard library's `std::net` parsers — no string heuristics.
+    fn is_valid_ip_address(addr: &str) -> bool {
+        use std::net::{Ipv4Addr, Ipv6Addr};
+        addr.parse::<Ipv4Addr>().is_ok() || addr.parse::<Ipv6Addr>().is_ok()
     }
 
     pub fn create_endpoint(
@@ -860,7 +957,19 @@ impl NetworkService {
                             }
                         }
                         if let Some(ref exp_ip) = expected_ip {
-                            if &real_ip != exp_ip {
+                            if !Self::is_valid_ip_address(exp_ip) {
+                                err_msg = Some(format!(
+                                    "Configured expected_ip '{}' is not a valid IP address — cannot verify",
+                                    exp_ip
+                                ));
+                                final_status = "CONNECTION_FAILED".to_string();
+                            } else if !Self::is_valid_ip_address(&real_ip) {
+                                err_msg = Some(format!(
+                                    "Observed IP '{}' from geolocation provider is not a valid IP — provider may be unreliable",
+                                    real_ip
+                                ));
+                                final_status = "CONNECTION_FAILED".to_string();
+                            } else if &real_ip != exp_ip {
                                 err_msg = Some(format!(
                                     "Observed proxy IP ({}) differs from expected IP ({})",
                                     real_ip, exp_ip
@@ -1203,8 +1312,57 @@ impl NetworkService {
                 }
 
                 // Check expected IP match if specified
+                // Validate expected_ip is a valid IP address before comparing
                 if let Some(ref exp_ip) = expected_ip {
-                    if &probe_res.observed_ipv4 != exp_ip {
+                    if !Self::is_valid_ip_address(exp_ip) {
+                        let err = format!(
+                            "Configured expected_ip '{}' is not a valid IP address — cannot verify",
+                            exp_ip
+                        );
+                        let record = NetworkCheckRecord {
+                            id: check_id,
+                            environment_id: environment_id.to_string(),
+                            observed_ipv4: Some(probe_res.observed_ipv4.clone()),
+                            observed_ipv6: probe_res.observed_ipv6.clone(),
+                            observed_country: Some(country_code.clone()),
+                            dns_summary: Some(probe_res.dns_summary.clone()),
+                            dns_leak_status: "UNVERIFIED".to_string(),
+                            webrtc_status: "UNVERIFIED".to_string(),
+                            check_source: "PROXY_BRIDGE_PROBE".to_string(),
+                            status: "CONNECTION_FAILED".to_string(),
+                            error_message: Some(err),
+                            checked_at: now.clone(),
+                            latency_ms: Some(probe_res.latency_ms),
+                            session_id: Some(session_tag.clone()),
+                        };
+                        self.persist_network_check(&record)?;
+                        return Ok(record);
+                    }
+                    if !Self::is_valid_ip_address(&probe_res.observed_ipv4) {
+                        let err = format!(
+                            "Observed IP '{}' from geolocation provider is not a valid IP — provider may be unreliable",
+                            probe_res.observed_ipv4
+                        );
+                        let record = NetworkCheckRecord {
+                            id: check_id,
+                            environment_id: environment_id.to_string(),
+                            observed_ipv4: None,
+                            observed_ipv6: None,
+                            observed_country: Some(country_code.clone()),
+                            dns_summary: Some(probe_res.dns_summary.clone()),
+                            dns_leak_status: "UNVERIFIED".to_string(),
+                            webrtc_status: "UNVERIFIED".to_string(),
+                            check_source: "PROXY_BRIDGE_PROBE".to_string(),
+                            status: "CONNECTION_FAILED".to_string(),
+                            error_message: Some(err),
+                            checked_at: now.clone(),
+                            latency_ms: Some(probe_res.latency_ms),
+                            session_id: Some(session_tag.clone()),
+                        };
+                        self.persist_network_check(&record)?;
+                        return Ok(record);
+                    }
+                    if probe_res.observed_ipv4 != *exp_ip {
                         let err = format!(
                             "Proxy bridge egress IP mismatch: expected '{}', observed '{}'",
                             exp_ip, probe_res.observed_ipv4
@@ -1232,6 +1390,24 @@ impl NetworkService {
 
                 // Backend bridge probe succeeded — this is PROXY_EGRESS_VERIFIED, not BROWSER_EGRESS_VERIFIED.
                 // True BROWSER_EGRESS_VERIFIED requires CDP/DevTools Protocol verification (not yet implemented).
+
+                // Attempt token-based browser verification (CDP not yet wired).
+                // This returns VERIFICATION_UNAVAILABLE until CDP Page.navigate is implemented.
+                // The evidence is logged for auditability even when unavailable.
+                let bridge_session = BrowserSessionInfo {
+                    environment_id: environment_id.to_string(),
+                    session_id: session_tag.clone(),
+                    pid,
+                    profile_path: String::new(), // Profile path available from BrowserStatus if extended
+                    proxy_bridge_port: Some(bridge_port),
+                    proxy_endpoint_id: _ep_id.clone(),
+                    expected_country: expected_country.clone(),
+                    expected_ip: expected_ip.clone(),
+                };
+                let _browser_evidence = attempt_token_browser_verification(&bridge_session);
+                // _browser_evidence.status == "VERIFICATION_UNAVAILABLE" until CDP is wired.
+                // The backend probe result below is correctly labeled PROXY_EGRESS_VERIFIED.
+
                 let record = NetworkCheckRecord {
                     id: check_id,
                     environment_id: environment_id.to_string(),
@@ -1401,6 +1577,69 @@ impl NetworkService {
             .map_err(|e| e.to_string())
     }
 
+    /// Returns the most recent network check for an environment, or `None` if no checks exist.
+    pub fn get_latest_network_check(
+        &self,
+        environment_id: &str,
+    ) -> Result<Option<NetworkCheckRecord>, String> {
+        self.db
+            .with_conn(|conn| {
+                let mut stmt = conn.prepare(
+                    "SELECT id, environment_id, observed_ipv4, observed_ipv6, dns_summary, check_source,
+                            status, checked_at, latency_ms, observed_country,
+                            COALESCE(dns_leak_status, 'UNVERIFIED'),
+                            COALESCE(webrtc_status, 'UNVERIFIED'),
+                            session_id, error_details
+                     FROM network_checks WHERE environment_id = ?1 ORDER BY checked_at DESC LIMIT 1",
+                )?;
+
+                let mut rows = stmt.query_map(rusqlite::params![environment_id], |row| {
+                    Ok(NetworkCheckRecord {
+                        id: row.get(0)?,
+                        environment_id: row.get(1)?,
+                        observed_ipv4: row.get(2)?,
+                        observed_ipv6: row.get(3)?,
+                        dns_summary: row.get(4)?,
+                        check_source: row.get(5)?,
+                        status: row.get(6)?,
+                        checked_at: row.get(7)?,
+                        latency_ms: row.get(8)?,
+                        observed_country: row.get(9)?,
+                        dns_leak_status: row.get(10)?,
+                        webrtc_status: row.get(11)?,
+                        session_id: row.get(12)?,
+                        error_message: row.get(13)?,
+                    })
+                })?;
+
+                if let Some(row) = rows.next() {
+                    Ok(Some(row?))
+                } else {
+                    Ok(None)
+                }
+            })
+            .map_err(|e| e.to_string())
+    }
+
+    /// Returns the most recent network check for an environment, tagged as STALE
+    /// if it is older than `max_age_secs`. Callers must re-verify before treating
+    /// a stale result as evidence of current network state.
+    pub fn get_latest_network_check_with_staleness(
+        &self,
+        environment_id: &str,
+        max_age_secs: u64,
+    ) -> Result<Option<NetworkCheckRecord>, String> {
+        let record = self.get_latest_network_check(environment_id)?;
+        if let Some(mut r) = record {
+            if crate::services::network_service::is_verification_stale(&r, max_age_secs) {
+                r.status = "STALE".to_string();
+            }
+            Ok(Some(r))
+        } else {
+            Ok(None)
+        }
+    }
+
     pub fn get_network_history(
         &self,
         environment_id: &str,
@@ -1443,5 +1682,42 @@ impl NetworkService {
                 Ok(checks)
             })
             .map_err(|e| e.to_string())
+    }
+
+    pub fn get_network_protection_status(
+        &self,
+        environment_id: &str,
+    ) -> Result<NetworkProtectionStatus, String> {
+        let latest = self.get_network_history(environment_id, 1)?;
+        if let Some(record) = latest.into_iter().next() {
+            Ok(NetworkProtectionStatus::from_check_record(
+                &record,
+                environment_id,
+            ))
+        } else {
+            Ok(NetworkProtectionStatus {
+                environment_id: environment_id.to_string(),
+                dns_status: "UNVERIFIED".to_string(),
+                dns_notes: "No network check has been performed yet.".to_string(),
+                ipv6_status: "UNVERIFIED".to_string(),
+                ipv6_notes: "No network check has been performed yet.".to_string(),
+                webrtc_status: "UNVERIFIED".to_string(),
+                webrtc_notes: "No network check has been performed yet.".to_string(),
+                overall_status: "UNVERIFIED".to_string(),
+                assessed_at: chrono::Utc::now().to_rfc3339(),
+            })
+        }
+    }
+}
+
+/// Returns true if a NetworkCheckRecord is stale (older than the given max_age_secs).
+/// Any persisted result must be re-verified for a new browser session.
+pub fn is_verification_stale(record: &NetworkCheckRecord, max_age_secs: u64) -> bool {
+    use chrono::DateTime;
+    if let Ok(checked) = record.checked_at.parse::<DateTime<chrono::Utc>>() {
+        let age = chrono::Utc::now().signed_duration_since(checked);
+        age.num_seconds() > max_age_secs as i64
+    } else {
+        true // Cannot parse timestamp — treat as stale
     }
 }

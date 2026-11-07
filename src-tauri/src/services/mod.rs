@@ -1,4 +1,5 @@
 pub mod audit_service;
+pub mod browser_verification;
 pub mod channel_service;
 pub mod network_service;
 pub mod platform_service;

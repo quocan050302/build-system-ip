@@ -138,14 +138,15 @@ export const NetworkView: React.FC<NetworkViewProps> = ({
   const getNetworkStatusBadge = (status?: string | null) => {
     switch (status) {
       case 'BROWSER_EGRESS_VERIFIED':
-        // Requires future CDP integration — kept for forward compatibility
-        return <span className="text-[10px] font-mono px-2 py-0.5 rounded-full border bg-emerald-950/80 text-emerald-300 border-emerald-700/80">🛡️ BROWSER VERIFIED</span>;
+        return <span className="text-[10px] font-mono px-2 py-0.5 rounded-full border bg-emerald-950/80 text-emerald-300 border-emerald-700/80">🟢 BROWSER VERIFIED (Edge-Origin)</span>;
       case 'PROXY_EGRESS_VERIFIED':
         return <span className="text-[10px] font-mono px-2 py-0.5 rounded-full border bg-blue-950/80 text-blue-300 border-blue-700/80">🔵 PROXY VERIFIED (Bridge)</span>;
+      case 'STALE':
+        return <span className="text-[10px] font-mono px-2 py-0.5 rounded-full border bg-amber-950/60 text-amber-400 border-amber-700/60">🕐 STALE — Re-verify required</span>;
       case 'VERIFICATION_UNAVAILABLE':
         return <span className="text-[10px] font-mono px-2 py-0.5 rounded-full border bg-yellow-950/60 text-yellow-400 border-yellow-700/60">⚠️ UNAVAILABLE</span>;
       case 'ENDPOINT_REACHABLE':
-        return <span className="text-[10px] font-mono px-2 py-0.5 rounded-full border bg-sky-950/60 text-sky-400 border-sky-800/60">REACHABLE</span>;
+        return <span className="text-[10px] font-mono px-2 py-0.5 rounded-full border bg-sky-950/60 text-sky-400 border-sky-800/60">⚡ ENDPOINT REACHABLE</span>;
       case 'CONNECTION_FAILED':
         return <span className="text-[10px] font-mono px-2 py-0.5 rounded-full border bg-rose-950/60 text-rose-400 border-rose-800/60">FAILED</span>;
       case 'COUNTRY_MISMATCH':
@@ -156,6 +157,24 @@ export const NetworkView: React.FC<NetworkViewProps> = ({
         return <span className="text-[10px] font-mono px-2 py-0.5 rounded-full border bg-surface-800 text-slate-500 border-surface-700">NOT CONFIGURED</span>;
       default:
         return <span className="text-[10px] font-mono px-2 py-0.5 rounded-full border bg-surface-800 text-slate-500 border-surface-700">{status || 'UNKNOWN'}</span>;
+    }
+  };
+
+  const getDnsWebRtcBadge = (status?: string | null) => {
+    switch (status) {
+      case 'VERIFIED':
+      case 'REMOTE_PROXY_DNS':
+        return <span className="text-[10px] font-mono px-1.5 py-0.5 rounded border bg-emerald-950/60 text-emerald-400 border-emerald-800/60">✓ VERIFIED</span>;
+      case 'FAILED':
+      case 'HOST_DNS_DETECTED':
+        return <span className="text-[10px] font-mono px-1.5 py-0.5 rounded border bg-rose-950/60 text-rose-400 border-rose-800/60">✗ FAILED</span>;
+      case 'UNVERIFIED':
+      case 'POLICY_SET_UNVERIFIED':
+        return <span className="text-[10px] font-mono px-1.5 py-0.5 rounded border bg-amber-950/60 text-amber-400 border-amber-700/60">⚠️ Unverified</span>;
+      case 'NOT_APPLICABLE':
+        return <span className="text-[10px] font-mono px-1.5 py-0.5 rounded border bg-surface-800 text-slate-500 border-surface-700">— N/A</span>;
+      default:
+        return <span className="text-[10px] font-mono px-1.5 py-0.5 rounded border bg-surface-800 text-slate-500 border-surface-700">⚠️ Unverified</span>;
     }
   };
 
@@ -188,7 +207,7 @@ export const NetworkView: React.FC<NetworkViewProps> = ({
         <div>
           <h3 className="text-sm font-semibold text-slate-100">Network Endpoints &amp; Egress Verification</h3>
           <p className="text-xs text-slate-400">
-            Configure authenticated US proxies. Verification states: NOT_CONFIGURED → ENDPOINT_REACHABLE → PROXY_EGRESS_VERIFIED (backend bridge probe). BROWSER_EGRESS_VERIFIED requires future CDP integration.
+            Configure authenticated US proxies. Verification states: NOT_CONFIGURED → ENDPOINT_REACHABLE → PROXY_EGRESS_VERIFIED (backend bridge probe, 🔵 blue). BROWSER_EGRESS_VERIFIED (🟢 green, real Edge-origin via CDP — not yet available). STALE means re-verify required.
           </p>
         </div>
 
@@ -288,7 +307,17 @@ export const NetworkView: React.FC<NetworkViewProps> = ({
                       {env.last_network_status && env.last_network_status !== 'NOT_CONFIGURED' && (
                         <div className="flex items-center justify-between text-[11px]">
                           <span className="text-slate-400">Egress Status:</span>
-                          {getNetworkStatusBadge(env.last_network_status)}
+                          <span title={
+                            env.last_network_status === 'PROXY_EGRESS_VERIFIED'
+                              ? 'PROXY_EGRESS_VERIFIED: Rust backend confirmed proxy bridge is working. Does NOT prove Edge itself is routing through it.'
+                              : env.last_network_status === 'BROWSER_EGRESS_VERIFIED'
+                              ? 'BROWSER_EGRESS_VERIFIED: Real browser-origin traffic confirmed via CDP. (Not yet available — requires CDP integration.)'
+                              : env.last_network_status === 'STALE'
+                              ? 'Result is older than the staleness threshold. Re-verify to confirm current network state.'
+                              : undefined
+                          }>
+                            {getNetworkStatusBadge(env.last_network_status)}
+                          </span>
                         </div>
                       )}
 
@@ -297,6 +326,18 @@ export const NetworkView: React.FC<NetworkViewProps> = ({
                         <div className="flex items-center justify-between text-[11px]">
                           <span className="text-slate-400">Proxy Bridge Port:</span>
                           <span className="font-mono text-purple-300">{env.proxy_bridge_port}</span>
+                        </div>
+                      )}
+
+                      {/* DNS / WebRTC protection badges */}
+                      {(env.last_dns_leak_status || env.last_webrtc_status) && (
+                        <div className="flex items-center justify-between text-[11px]">
+                          <span className="text-slate-400">DNS / WebRTC:</span>
+                          <span className="flex items-center gap-1">
+                            {getDnsWebRtcBadge(env.last_dns_leak_status)}
+                            <span className="text-slate-600">/</span>
+                            {getDnsWebRtcBadge(env.last_webrtc_status)}
+                          </span>
                         </div>
                       )}
 
@@ -340,15 +381,15 @@ export const NetworkView: React.FC<NetworkViewProps> = ({
                     <button
                       onClick={() => handleVerifyBrowserEgress(env.id)}
                       disabled={isVerifyingBrowser || !isRunning}
-                      title={isRunning ? 'Verify actual browser network egress through proxy bridge' : 'Start browser first to verify egress'}
+                      title={isRunning ? 'Run backend proxy-bridge probe to verify PROXY_EGRESS_VERIFIED. Does not prove browser-origin routing — requires CDP (not yet implemented).' : 'Start browser first to verify egress'}
                       className={`w-full py-1.5 px-3 rounded-lg text-xs font-semibold transition-all flex items-center justify-center gap-2 border ${
                         isRunning
-                          ? 'bg-emerald-950/40 hover:bg-emerald-900/60 text-emerald-400 border-emerald-800/60'
+                          ? 'bg-blue-950/40 hover:bg-blue-900/60 text-blue-400 border-blue-800/60'
                           : 'bg-surface-850 text-slate-500 border-surface-700 cursor-not-allowed opacity-60'
                       }`}
                     >
                       <ShieldCheck className={`w-3.5 h-3.5 ${isVerifyingBrowser ? 'animate-spin' : ''}`} />
-                      <span>{isVerifyingBrowser ? 'Verifying Browser Egress...' : '🛡️ Verify Browser Egress'}</span>
+                      <span>{isVerifyingBrowser ? 'Verifying Proxy Egress...' : '🔵 Verify Proxy Egress (Backend Probe)'}</span>
                     </button>
                   )}
 
@@ -364,6 +405,29 @@ export const NetworkView: React.FC<NetworkViewProps> = ({
               );
             })
           )}
+        </div>
+      </div>
+
+      {/* Verification Level Legend */}
+      <div className="bg-surface-900 border border-surface-800 rounded-xl p-4 text-xs space-y-2">
+        <h4 className="text-xs font-semibold text-slate-400 uppercase tracking-wider">Verification Level Reference</h4>
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+          <div className="flex items-start gap-2">
+            <span className="text-[10px] font-mono px-2 py-0.5 rounded-full border bg-blue-950/80 text-blue-300 border-blue-700/80 shrink-0">🔵 PROXY VERIFIED</span>
+            <span className="text-slate-400 leading-relaxed">Rust backend confirmed proxy bridge is reachable and egress IP matches. <strong className="text-slate-300">Does not prove Edge is routing through it.</strong></span>
+          </div>
+          <div className="flex items-start gap-2">
+            <span className="text-[10px] font-mono px-2 py-0.5 rounded-full border bg-emerald-950/80 text-emerald-300 border-emerald-700/80 shrink-0">🟢 BROWSER VERIFIED</span>
+            <span className="text-slate-400 leading-relaxed">Real browser-origin traffic confirmed via CDP. <strong className="text-slate-300">Not yet available — requires CDP Page.navigate integration.</strong></span>
+          </div>
+          <div className="flex items-start gap-2">
+            <span className="text-[10px] font-mono px-2 py-0.5 rounded-full border bg-amber-950/60 text-amber-400 border-amber-700/60 shrink-0">🕐 STALE</span>
+            <span className="text-slate-400">Cached result is outdated. Click Verify to get a fresh reading.</span>
+          </div>
+          <div className="flex items-start gap-2">
+            <span className="text-[10px] font-mono px-2 py-0.5 rounded-full border bg-sky-950/60 text-sky-400 border-sky-800/60 shrink-0">⚡ ENDPOINT REACHABLE</span>
+            <span className="text-slate-400">TCP handshake succeeded but egress IP could not be confirmed (e.g. SOCKS5 without HTTP probe).</span>
+          </div>
         </div>
       </div>
 
