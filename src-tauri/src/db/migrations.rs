@@ -8,14 +8,16 @@ pub fn run_migrations(conn: &mut Connection) -> Result<()> {
          CREATE TABLE IF NOT EXISTS schema_version (
              version INTEGER PRIMARY KEY,
              applied_at TEXT NOT NULL
-         );"
+         );",
     )?;
 
-    let current_version: i64 = conn.query_row(
-        "SELECT COALESCE(MAX(version), 0) FROM schema_version;",
-        [],
-        |row| row.get(0)
-    ).unwrap_or(0);
+    let current_version: i64 = conn
+        .query_row(
+            "SELECT COALESCE(MAX(version), 0) FROM schema_version;",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
 
     if current_version < 1 {
         let tx = conn.transaction()?;

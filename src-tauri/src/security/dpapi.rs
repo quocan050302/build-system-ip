@@ -31,10 +31,13 @@ mod win_dpapi {
                 CRYPTPROTECT_UI_FORBIDDEN,
                 &mut output_blob,
             )
-            .map_err(|e| SecurityError::EncryptionFailed(format!("CryptProtectData failed: {}", e)))?;
+            .map_err(|e| {
+                SecurityError::EncryptionFailed(format!("CryptProtectData failed: {}", e))
+            })?;
 
-            let result = std::slice::from_raw_parts(output_blob.pbData, output_blob.cbData as usize)
-                .to_vec();
+            let result =
+                std::slice::from_raw_parts(output_blob.pbData, output_blob.cbData as usize)
+                    .to_vec();
 
             let _ = LocalFree(windows::Win32::Foundation::HLOCAL(output_blob.pbData as _));
 
@@ -62,10 +65,13 @@ mod win_dpapi {
                 CRYPTPROTECT_UI_FORBIDDEN,
                 &mut output_blob,
             )
-            .map_err(|e| SecurityError::DecryptionFailed(format!("CryptUnprotectData failed: {}", e)))?;
+            .map_err(|e| {
+                SecurityError::DecryptionFailed(format!("CryptUnprotectData failed: {}", e))
+            })?;
 
-            let result = std::slice::from_raw_parts(output_blob.pbData, output_blob.cbData as usize)
-                .to_vec();
+            let result =
+                std::slice::from_raw_parts(output_blob.pbData, output_blob.cbData as usize)
+                    .to_vec();
 
             let _ = LocalFree(windows::Win32::Foundation::HLOCAL(output_blob.pbData as _));
 
@@ -79,6 +85,12 @@ pub struct WindowsDpapiSecretStore;
 impl WindowsDpapiSecretStore {
     pub fn new() -> Self {
         Self
+    }
+}
+
+impl Default for WindowsDpapiSecretStore {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -104,8 +116,7 @@ impl SecretStore for WindowsDpapiSecretStore {
         {
             let decoded = BASE64_STANDARD.decode(reference)?;
             let decrypted = win_dpapi::decrypt_bytes(&decoded)?;
-            String::from_utf8(decrypted)
-                .map_err(|e| SecurityError::DecryptionFailed(e.to_string()))
+            String::from_utf8(decrypted).map_err(|e| SecurityError::DecryptionFailed(e.to_string()))
         }
 
         #[cfg(not(windows))]

@@ -60,3 +60,86 @@ To prevent accidental unauthorized actions on restricted or terminated YouTube c
 ```
 
 - **TERMINATED Accounts:** UI publishing controls and automated workflows are permanently disabled and rendered disabled/read-only with an explicit warning badge.
+
+---
+
+## 6. macOS Native Browser Mode — Proxy Bridge Security (Added: v2 Hardening)
+
+When environments use `execution_mode = NATIVE_BROWSER` on macOS Apple Silicon, Microsoft Edge is launched with a supervised localhost proxy bridge instead of direct proxy credentials.
+
+### Architecture
+
+```
+Edge Process
+    └─ --proxy-server=http://127.0.0.1:<dynamic_port>
+           │
+           ▼
+    Localhost Proxy Bridge (Rust, 127.0.0.1:0)
+           │  Credentials: Apple Keychain only
+           │  No fallback to direct connection
+           ▼
+    Upstream HTTP/SOCKS5 Proxy (J2Proxy US)
+           │
+           ▼
+    Target Websites (TikTok, Instagram, Facebook, Gumroad)
+```
+
+### Threat Mitigations
+
+| Threat | Mitigation |
+|---|---|
+| Credential exposure in CLI args | Bridge pattern: Edge receives only `127.0.0.1:<port>`, never `user:pass@host` |
+| Local bridge accessible by other processes | Dynamic port (`:0`), not advertised; no authentication required (limitation documented) |
+| Direct connection fallback when proxy fails | Bridge returns HTTP 502 Bad Gateway; no silent fallback |
+| Non-loopback connections to bridge | Peer address check: non-loopback connections are dropped immediately |
+| WebRTC IP leak | `--force-webrtc-ip-handling-policy=disable_non_proxied_udp` applied at Edge launch |
+| DNS leak | SOCKS5: domain-mode CONNECT (remote DNS); HTTP: proxy handles DNS |
+| IPv6 leak | Bridge is IPv4-only; IPv6 traffic path **unverified** (documented risk) |
+| Unbounded resource usage | MAX_CONCURRENT_CONNECTIONS=128; IO timeouts 15s; connect timeout 6s |
+
+### Verification Status Hierarchy
+
+The system uses a strict status hierarchy to avoid false PASS:
+
+| Status | Meaning | Evidence Required |
+|---|---|---|
+| `NOT_CONFIGURED` | No proxy endpoint assigned | — |
+| `ENDPOINT_CONFIGURED` | Proxy config saved to DB | — |
+| `ENDPOINT_REACHABLE` | TCP handshake succeeded | TCP connect to proxy host:port |
+| `PROXY_EGRESS_VERIFIED` | Backend Rust probe through bridge returned valid US IP | ipwho.is response via 127.0.0.1:bridge_port |
+| `BROWSER_EGRESS_VERIFIED` | Real Edge-origin request verified | **NOT IMPLEMENTED** — requires CDP/DevTools |
+| `VERIFICATION_UNAVAILABLE` | Cannot verify (browser not running, no bridge) | — |
+| `AUTH_FAILED` | Proxy credentials rejected (HTTP 407) | — |
+| `CONNECTION_FAILED` | Network path failed or country mismatch | — |
+
+### Critical Distinctions
+
+**`PROXY_EGRESS_VERIFIED` ≠ `BROWSER_EGRESS_VERIFIED`**
+
+A backend Rust probe through the proxy bridge proves:
+- ✅ The bridge is running
+- ✅ The upstream proxy accepts connections
+- ✅ The upstream proxy reports a US exit IP
+- ❌ Does NOT prove Edge browser sent the request
+- ❌ Does NOT prove all browser traffic uses the proxy
+
+**`PROXY_EGRESS_VERIFIED` ≠ US Physical Location**
+- ✅ The proxy server has a US exit IP
+- ❌ Does NOT make the user physically located in the US
+- ❌ Does NOT guarantee content is delivered to US audiences
+- ❌ Does NOT change account region settings on TikTok/Instagram/Facebook
+
+### Country Validation (Fixed in v2)
+
+If `expected_country` is configured (e.g., "US"):
+- `UNKNOWN` geolocation result → `CONNECTION_FAILED` (was: false pass in v1)
+- Empty country → `CONNECTION_FAILED`
+- Country mismatch (e.g., VN) → `CONNECTION_FAILED`
+- Matching country (US) + all other checks pass → `PROXY_EGRESS_VERIFIED`
+
+### Known Gaps (Planned)
+
+1. **IPv6 verification**: Not independently verified; recommend disabling IPv6 at system level or verifying via CDP
+2. **WebRTC runtime verification**: Flag applied but not confirmed effective at runtime
+3. **True browser-origin verification**: Requires CDP integration with restricted access (future work)
+4. **Bridge port visibility**: Any local process can connect to the dynamic port if discovered; consider token-based access control

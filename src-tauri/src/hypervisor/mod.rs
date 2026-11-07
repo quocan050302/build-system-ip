@@ -49,9 +49,13 @@ impl VmState {
             VmState::Unknown => "UNKNOWN",
         }
     }
+}
 
-    pub fn from_str(s: &str) -> Self {
-        match s {
+impl std::str::FromStr for VmState {
+    type Err = std::convert::Infallible;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(match s {
             "NOT_CONFIGURED" => VmState::NotConfigured,
             "STOPPED" => VmState::Stopped,
             "STARTING" => VmState::Starting,
@@ -59,7 +63,7 @@ impl VmState {
             "STOPPING" => VmState::Stopping,
             "ERROR" => VmState::Error,
             _ => VmState::Unknown,
-        }
+        })
     }
 }
 
@@ -139,13 +143,19 @@ pub fn create_hypervisor_adapter(
     #[cfg(target_os = "macos")]
     {
         // On macOS Apple Silicon, use native UTM adapter
-        (Arc::new(utm::UTMAdapter::new(data_dir.to_path_buf())), false)
+        (
+            Arc::new(utm::UTMAdapter::new(data_dir.to_path_buf())),
+            false,
+        )
     }
 
     #[cfg(windows)]
     {
         // On Windows 11 Pro, use Microsoft Hyper-V adapter
-        (Arc::new(hyperv::HyperVAdapter::new(data_dir.to_path_buf())), false)
+        (
+            Arc::new(hyperv::HyperVAdapter::new(data_dir.to_path_buf())),
+            false,
+        )
     }
 
     #[cfg(not(any(target_os = "macos", windows)))]

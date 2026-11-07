@@ -138,13 +138,18 @@ export const NetworkView: React.FC<NetworkViewProps> = ({
   const getNetworkStatusBadge = (status?: string | null) => {
     switch (status) {
       case 'BROWSER_EGRESS_VERIFIED':
+        // Requires future CDP integration — kept for forward compatibility
         return <span className="text-[10px] font-mono px-2 py-0.5 rounded-full border bg-emerald-950/80 text-emerald-300 border-emerald-700/80">🛡️ BROWSER VERIFIED</span>;
       case 'PROXY_EGRESS_VERIFIED':
-        return <span className="text-[10px] font-mono px-2 py-0.5 rounded-full border bg-blue-950/80 text-blue-300 border-blue-700/80">✅ PROXY VERIFIED</span>;
+        return <span className="text-[10px] font-mono px-2 py-0.5 rounded-full border bg-blue-950/80 text-blue-300 border-blue-700/80">🔵 PROXY VERIFIED (Bridge)</span>;
+      case 'VERIFICATION_UNAVAILABLE':
+        return <span className="text-[10px] font-mono px-2 py-0.5 rounded-full border bg-yellow-950/60 text-yellow-400 border-yellow-700/60">⚠️ UNAVAILABLE</span>;
       case 'ENDPOINT_REACHABLE':
         return <span className="text-[10px] font-mono px-2 py-0.5 rounded-full border bg-sky-950/60 text-sky-400 border-sky-800/60">REACHABLE</span>;
       case 'CONNECTION_FAILED':
         return <span className="text-[10px] font-mono px-2 py-0.5 rounded-full border bg-rose-950/60 text-rose-400 border-rose-800/60">FAILED</span>;
+      case 'COUNTRY_MISMATCH':
+        return <span className="text-[10px] font-mono px-2 py-0.5 rounded-full border bg-rose-950/60 text-rose-400 border-rose-800/60">COUNTRY MISMATCH</span>;
       case 'AUTH_FAILED':
         return <span className="text-[10px] font-mono px-2 py-0.5 rounded-full border bg-orange-950/60 text-orange-400 border-orange-800/60">AUTH FAILED</span>;
       case 'NOT_CONFIGURED':
@@ -183,7 +188,7 @@ export const NetworkView: React.FC<NetworkViewProps> = ({
         <div>
           <h3 className="text-sm font-semibold text-slate-100">Network Endpoints &amp; Egress Verification</h3>
           <p className="text-xs text-slate-400">
-            Configure authenticated US proxies. Distinct states: Endpoint Configured → Proxy Verified → Browser Verified.
+            Configure authenticated US proxies. Verification states: NOT_CONFIGURED → ENDPOINT_REACHABLE → PROXY_EGRESS_VERIFIED (backend bridge probe). BROWSER_EGRESS_VERIFIED requires future CDP integration.
           </p>
         </div>
 

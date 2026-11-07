@@ -179,15 +179,17 @@ impl VmService {
         let name_exists: bool = self
             .db
             .with_conn(|conn| {
-                let mut stmt =
-                    conn.prepare("SELECT COUNT(1) FROM environments WHERE name = ?1")?;
+                let mut stmt = conn.prepare("SELECT COUNT(1) FROM environments WHERE name = ?1")?;
                 let count: i64 = stmt.query_row(rusqlite::params![clean_name], |r| r.get(0))?;
                 Ok(count > 0)
             })
             .map_err(|e| e.to_string())?;
 
         if name_exists {
-            return Err(format!("An environment named '{}' already exists", clean_name));
+            return Err(format!(
+                "An environment named '{}' already exists",
+                clean_name
+            ));
         }
 
         let is_native_browser =
@@ -257,9 +259,9 @@ impl VmService {
         std::fs::create_dir_all(&env_dir)
             .map_err(|e| format!("Failed to create environment directory: {}", e))?;
 
-        let host_platform = req.host_platform.unwrap_or_else(|| {
-            format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH)
-        });
+        let host_platform = req
+            .host_platform
+            .unwrap_or_else(|| format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH));
         let vm_architecture = req
             .vm_architecture
             .unwrap_or_else(|| std::env::consts::ARCH.to_string());
@@ -269,7 +271,11 @@ impl VmService {
                 .join("browser_profiles")
                 .join(req.browser_type.to_lowercase());
             (
-                format!("native-{}-{}", req.browser_type.to_lowercase(), &env_id[..8]),
+                format!(
+                    "native-{}-{}",
+                    req.browser_type.to_lowercase(),
+                    &env_id[..8]
+                ),
                 profile_root.to_string_lossy().to_string(),
                 "BROWSER_BRIDGE_PROBE".to_string(),
             )
@@ -560,19 +566,17 @@ impl VmService {
             return Ok(());
         }
 
-        self.hypervisor
-            .start_vm(&env.vm_identifier)
-            .map_err(|e| {
-                self.audit_service
-                    .log(
-                        Some(id),
-                        "START_VM_FAILED",
-                        "ERROR",
-                        &format!("Failed to start VM: {}", e),
-                    )
-                    .ok();
-                format!("Failed to start VM in hypervisor: {}", e)
-            })?;
+        self.hypervisor.start_vm(&env.vm_identifier).map_err(|e| {
+            self.audit_service
+                .log(
+                    Some(id),
+                    "START_VM_FAILED",
+                    "ERROR",
+                    &format!("Failed to start VM: {}", e),
+                )
+                .ok();
+            format!("Failed to start VM in hypervisor: {}", e)
+        })?;
 
         let now = Utc::now().to_rfc3339();
         self.db

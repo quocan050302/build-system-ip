@@ -55,7 +55,10 @@ impl PlatformService {
         #[cfg(not(any(target_os = "macos", windows)))]
         {
             if let Ok(home) = std::env::var("HOME") {
-                PathBuf::from(home).join(".local").join("share").join("YouTubeIsolationManager")
+                PathBuf::from(home)
+                    .join(".local")
+                    .join("share")
+                    .join("YouTubeIsolationManager")
             } else {
                 PathBuf::from("./app_data")
             }
@@ -97,9 +100,9 @@ impl PlatformService {
         #[cfg(windows)]
         {
             use std::mem::zeroed;
-            use windows::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
-            use windows::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
             use windows::core::HSTRING;
+            use windows::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
+            use windows::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
 
             unsafe {
                 let mut mem: MEMORYSTATUSEX = zeroed();
@@ -158,8 +161,8 @@ impl PlatformService {
             unsafe {
                 let mut count = libc::HOST_VM_INFO64_COUNT;
                 let mut vm_stat: libc::vm_statistics64 = std::mem::zeroed();
-            #[allow(deprecated)]
-            let host_port = libc::mach_host_self();
+                #[allow(deprecated)]
+                let host_port = libc::mach_host_self();
                 let ret = libc::host_statistics64(
                     host_port,
                     libc::HOST_VM_INFO64,
@@ -169,7 +172,8 @@ impl PlatformService {
                 if ret == libc::KERN_SUCCESS {
                     let page_size = libc::sysconf(libc::_SC_PAGESIZE) as u64;
                     let page_size = if page_size == 0 { 4096 } else { page_size };
-                    let avail_bytes = (vm_stat.free_count as u64 + vm_stat.inactive_count as u64) * page_size;
+                    let avail_bytes =
+                        (vm_stat.free_count as u64 + vm_stat.inactive_count as u64) * page_size;
                     available_mem_mb = avail_bytes / (1024 * 1024);
                 }
             }
@@ -193,7 +197,12 @@ impl PlatformService {
                 }
             }
 
-            (total_mem_mb, available_mem_mb, total_disk_mb, available_disk_mb)
+            (
+                total_mem_mb,
+                available_mem_mb,
+                total_disk_mb,
+                available_disk_mb,
+            )
         }
 
         #[cfg(not(any(windows, target_os = "macos")))]
@@ -204,11 +213,19 @@ impl PlatformService {
             if let Ok(meminfo) = std::fs::read_to_string("/proc/meminfo") {
                 for line in meminfo.lines() {
                     if line.starts_with("MemTotal:") {
-                        if let Some(val) = line.split_whitespace().nth(1).and_then(|v| v.parse::<u64>().ok()) {
+                        if let Some(val) = line
+                            .split_whitespace()
+                            .nth(1)
+                            .and_then(|v| v.parse::<u64>().ok())
+                        {
                             total_mem_mb = val / 1024;
                         }
                     } else if line.starts_with("MemAvailable:") {
-                        if let Some(val) = line.split_whitespace().nth(1).and_then(|v| v.parse::<u64>().ok()) {
+                        if let Some(val) = line
+                            .split_whitespace()
+                            .nth(1)
+                            .and_then(|v| v.parse::<u64>().ok())
+                        {
                             avail_mem_mb = val / 1024;
                         }
                     }
@@ -235,15 +252,23 @@ impl PlatformService {
 
         #[cfg(target_os = "macos")]
         {
-            if Path::new("/Applications/UTM.app").exists() || Path::new("/Applications/UTM.app/Contents/MacOS/utmctl").exists() {
+            if Path::new("/Applications/UTM.app").exists()
+                || Path::new("/Applications/UTM.app/Contents/MacOS/utmctl").exists()
+            {
                 list.push("UTM".to_string());
             }
-            if std::process::Command::new("which").arg("utmctl").output().map(|o| o.status.success()).unwrap_or(false) {
-                if !list.contains(&"UTM".to_string()) {
-                    list.push("UTM".to_string());
-                }
+            if std::process::Command::new("which")
+                .arg("utmctl")
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false)
+                && !list.contains(&"UTM".to_string())
+            {
+                list.push("UTM".to_string());
             }
-            if Path::new("/Applications/VirtualBox.app").exists() || Path::new("/usr/local/bin/VBoxManage").exists() {
+            if Path::new("/Applications/VirtualBox.app").exists()
+                || Path::new("/usr/local/bin/VBoxManage").exists()
+            {
                 list.push("VirtualBox".to_string());
             }
         }
@@ -261,7 +286,8 @@ impl PlatformService {
                 list.push("Hyper-V".to_string());
             }
 
-            let default_win_path = PathBuf::from("C:\\Program Files\\Oracle\\VirtualBox\\VBoxManage.exe");
+            let default_win_path =
+                PathBuf::from("C:\\Program Files\\Oracle\\VirtualBox\\VBoxManage.exe");
             if default_win_path.exists() {
                 list.push("VirtualBox".to_string());
             }

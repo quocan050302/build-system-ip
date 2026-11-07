@@ -197,7 +197,10 @@ impl ProxyBridgeManager {
         });
 
         {
-            let mut map = self.bridges.lock().map_err(|_| "Bridge lock poisoned".to_string())?;
+            let mut map = self
+                .bridges
+                .lock()
+                .map_err(|_| "Bridge lock poisoned".to_string())?;
             map.insert(config.environment_id.clone(), instance.clone());
         }
 
@@ -239,6 +242,12 @@ impl Drop for ProxyBridgeManager {
     }
 }
 
+impl Default for ProxyBridgeManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 fn run_bridge_accept_loop(listener: TcpListener, instance: Arc<ProxyBridgeInstance>) {
     for stream_res in listener.incoming() {
         if !instance.running.load(Ordering::SeqCst) {
@@ -274,7 +283,9 @@ fn run_bridge_accept_loop(listener: TcpListener, instance: Arc<ProxyBridgeInstan
         let conn_instance = instance.clone();
         thread::spawn(move || {
             let _ = handle_client_connection(client_stream, &conn_instance);
-            conn_instance.active_connections.fetch_sub(1, Ordering::SeqCst);
+            conn_instance
+                .active_connections
+                .fetch_sub(1, Ordering::SeqCst);
         });
     }
 }
@@ -361,10 +372,7 @@ fn handle_client_connection(
     client.set_read_timeout(io_timeout).ok();
     client.set_write_timeout(io_timeout).ok();
 
-    let (header_str, leftover) = match read_http_request_head(&mut client) {
-        Ok(res) => res,
-        Err(e) => return Err(e),
-    };
+    let (header_str, leftover) = read_http_request_head(&mut client)?;
 
     let first_line = header_str.lines().next().unwrap_or("");
     let parts: Vec<&str> = first_line.split_whitespace().collect();
@@ -377,7 +385,14 @@ fn handle_client_connection(
     let target = parts[1];
 
     if instance.config.protocol.eq_ignore_ascii_case("SOCKS5") {
-        return handle_socks5_upstream(&mut client, instance, &method, target, &header_str, &leftover);
+        return handle_socks5_upstream(
+            &mut client,
+            instance,
+            &method,
+            target,
+            &header_str,
+            &leftover,
+        );
     }
 
     // HTTP / HTTPS Upstream Proxy
@@ -419,7 +434,9 @@ fn handle_client_connection(
 
         let status_line = resp_head.lines().next().unwrap_or("");
         if status_line.contains(" 407 ") || status_line.ends_with(" 407") {
-            let msg = "Upstream proxy authentication failed (HTTP 407 Proxy Authentication Required)".to_string();
+            let msg =
+                "Upstream proxy authentication failed (HTTP 407 Proxy Authentication Required)"
+                    .to_string();
             record_bridge_error(instance, true, msg.clone());
             send_bad_gateway(&mut client, &msg);
             return Err(msg);
@@ -461,7 +478,9 @@ fn handle_client_connection(
                 if !auth_hdr.is_empty() {
                     rebuilt.push_str(&auth_hdr);
                 }
-            } else if !line.to_ascii_lowercase().starts_with("proxy-authorization:")
+            } else if !line
+                .to_ascii_lowercase()
+                .starts_with("proxy-authorization:")
                 && !line.to_ascii_lowercase().starts_with("proxy-connection:")
             {
                 rebuilt.push_str(line);
@@ -501,7 +520,9 @@ fn handle_client_connection(
         let first_str = String::from_utf8_lossy(&first_chunk[..n]);
         let status_line = first_str.lines().next().unwrap_or("");
         if status_line.contains(" 407 ") || status_line.ends_with(" 407") {
-            let msg = "Upstream proxy authentication failed (HTTP 407 Proxy Authentication Required)".to_string();
+            let msg =
+                "Upstream proxy authentication failed (HTTP 407 Proxy Authentication Required)"
+                    .to_string();
             record_bridge_error(instance, true, msg.clone());
             send_bad_gateway(&mut client, &msg);
             return Err(msg);
@@ -522,7 +543,9 @@ fn handle_client_connection(
 fn parse_target_host_port(method: &str, target: &str) -> Result<(String, u16, String), String> {
     if method == "CONNECT" {
         if let Some((h, p_str)) = target.rsplit_once(':') {
-            let port = p_str.parse::<u16>().map_err(|_| "Invalid CONNECT port".to_string())?;
+            let port = p_str
+                .parse::<u16>()
+                .map_err(|_| "Invalid CONNECT port".to_string())?;
             return Ok((h.to_string(), port, "/".to_string()));
         }
         return Ok((target.to_string(), 443, "/".to_string()));
@@ -566,9 +589,13 @@ fn handle_socks5_upstream(
     // SOCKS5 greeting
     let creds = instance.config.formatted_credentials();
     if creds.is_some() {
-        upstream.write_all(&[0x05, 0x02, 0x00, 0x02]).map_err(|e| e.to_string())?;
+        upstream
+            .write_all(&[0x05, 0x02, 0x00, 0x02])
+            .map_err(|e| e.to_string())?;
     } else {
-        upstream.write_all(&[0x05, 0x01, 0x00]).map_err(|e| e.to_string())?;
+        upstream
+            .write_all(&[0x05, 0x01, 0x00])
+            .map_err(|e| e.to_string())?;
     }
 
     let mut method_resp = [0u8; 2];
@@ -608,9 +635,12 @@ fn handle_socks5_upstream(
         upstream.write_all(&auth_pkt).map_err(|e| e.to_string())?;
 
         let mut auth_resp = [0u8; 2];
-        upstream.read_exact(&mut auth_resp).map_err(|e| e.to_string())?;
+        upstream
+            .read_exact(&mut auth_resp)
+            .map_err(|e| e.to_string())?;
         if auth_resp[1] != 0x00 {
-            let msg = "SOCKS5 proxy authentication failed (invalid username or password)".to_string();
+            let msg =
+                "SOCKS5 proxy authentication failed (invalid username or password)".to_string();
             record_bridge_error(instance, true, msg.clone());
             send_bad_gateway(client, &msg);
             return Err(msg);
@@ -636,7 +666,10 @@ fn handle_socks5_upstream(
         return Err(msg);
     }
     if reply_hdr[1] != 0x00 {
-        let msg = format!("SOCKS5 connect to {}:{} failed (code {})", dest_host, dest_port, reply_hdr[1]);
+        let msg = format!(
+            "SOCKS5 connect to {}:{} failed (code {})",
+            dest_host, dest_port, reply_hdr[1]
+        );
         record_bridge_error(instance, false, msg.clone());
         send_bad_gateway(client, &msg);
         return Err(msg);
@@ -690,7 +723,9 @@ fn handle_socks5_upstream(
             }
         }
         rebuilt.push_str("Connection: close\r\n\r\n");
-        upstream.write_all(rebuilt.as_bytes()).map_err(|e| e.to_string())?;
+        upstream
+            .write_all(rebuilt.as_bytes())
+            .map_err(|e| e.to_string())?;
         if !leftover.is_empty() {
             let _ = upstream.write_all(leftover);
         }
@@ -730,11 +765,18 @@ pub struct BridgeProbeResult {
     pub dns_summary: String,
 }
 
-pub fn probe_via_local_bridge(local_port: u16, timeout: Duration) -> Result<BridgeProbeResult, String> {
+pub fn probe_via_local_bridge(
+    local_port: u16,
+    timeout: Duration,
+) -> Result<BridgeProbeResult, String> {
     let start = Instant::now();
     let addr = SocketAddr::from(([127, 0, 0, 1], local_port));
-    let mut stream = TcpStream::connect_timeout(&addr, timeout)
-        .map_err(|e| format!("Local proxy bridge (127.0.0.1:{}) unreachable: {}", local_port, e))?;
+    let mut stream = TcpStream::connect_timeout(&addr, timeout).map_err(|e| {
+        format!(
+            "Local proxy bridge (127.0.0.1:{}) unreachable: {}",
+            local_port, e
+        )
+    })?;
     stream.set_read_timeout(Some(timeout)).ok();
     stream.set_write_timeout(Some(timeout)).ok();
 
@@ -777,7 +819,9 @@ pub fn probe_via_local_bridge(local_port: u16, timeout: Duration) -> Result<Brid
                     observed_ipv6: None,
                     observed_country: country,
                     latency_ms,
-                    dns_summary: "Remote DNS resolution via authenticated proxy bridge (no local DNS leak)".to_string(),
+                    dns_summary:
+                        "Remote DNS resolution via authenticated proxy bridge (no local DNS leak)"
+                            .to_string(),
                 });
             }
         }
@@ -799,7 +843,9 @@ pub fn probe_via_local_bridge(local_port: u16, timeout: Duration) -> Result<Brid
     stream2.set_read_timeout(Some(timeout)).ok();
     stream2.set_write_timeout(Some(timeout)).ok();
     let req2 = "GET http://api.ipify.org/ HTTP/1.1\r\nHost: api.ipify.org\r\nUser-Agent: Mozilla/5.0\r\nConnection: close\r\n\r\n";
-    stream2.write_all(req2.as_bytes()).map_err(|e| e.to_string())?;
+    stream2
+        .write_all(req2.as_bytes())
+        .map_err(|e| e.to_string())?;
     let mut resp2 = Vec::new();
     stream2.read_to_end(&mut resp2).map_err(|e| e.to_string())?;
     let latency2 = start.elapsed().as_millis() as u32;
@@ -819,4 +865,3 @@ pub fn probe_via_local_bridge(local_port: u16, timeout: Duration) -> Result<Brid
 
     Err("Proxy bridge did not return a valid public IP response".to_string())
 }
-
