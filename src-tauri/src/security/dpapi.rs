@@ -23,7 +23,7 @@ mod win_dpapi {
             };
 
             CryptProtectData(
-                &mut input_blob,
+                &input_blob,
                 None,
                 None,
                 None,
@@ -57,7 +57,7 @@ mod win_dpapi {
             };
 
             CryptUnprotectData(
-                &mut input_blob,
+                &input_blob,
                 None,
                 None,
                 None,

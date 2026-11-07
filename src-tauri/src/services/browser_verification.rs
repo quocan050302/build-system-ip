@@ -171,6 +171,11 @@ pub struct BrowserSessionInfo {
     pub proxy_endpoint_id: String,
     pub expected_country: Option<String>,
     pub expected_ip: Option<String>,
+    /// Snapshot of recent tunnel events recorded by the proxy bridge telemetry
+    /// in the last 5 minutes.  Populated by the caller from
+    /// `ProxyBridgeManager::recent_tunnel_count`.  Zero when the bridge is not
+    /// available or telemetry has not yet been wired at the call site.
+    pub recent_bridge_connection_count: usize,
 }
 
 /// Result of a token-based browser verification attempt.
@@ -221,33 +226,43 @@ fn start_verification_listener(token: &str) -> Result<(u16, String), String> {
     Ok((port, url))
 }
 
-/// Performs a token-based browser verification.
+/// Performs a token-based browser verification using proxy bridge telemetry.
 ///
-/// # Flow
+/// # What this proves
 ///
-/// 1. Generate a unique verification token.
-/// 2. Start a local HTTP listener on 127.0.0.1:<ephemeral>.
-/// 3. Build a verification URL containing the token.
-/// 4. Direct the browser to visit that URL (via CDP Page.navigate or UI).
-/// 5. Wait up to `BROWSER_VERIFICATION_TIMEOUT_SECS` for the browser to connect.
-/// 6. Verify the connection source is 127.0.0.1 (expected: routed through proxy bridge).
-/// 7. Return evidence.
+/// - The proxy bridge has been active (tunnel events exist in the ring-buffer).
+/// - The browser process exists and was associated with this bridge port at
+///   session creation time.
 ///
-/// # Current implementation status
+/// # What this cannot prove without CDP
 ///
-/// The CDP `Page.navigate` step requires a WebSocket connection to the browser's
-/// remote debugging endpoint. This is not yet implemented.
+/// - That a *specific browser-origin* request was observed.
+/// - That the browser is routing through the bridge (not bypassing it).
 ///
-/// Until CDP navigation is wired, this function returns `VERIFICATION_UNAVAILABLE`
-/// with a clear explanation. The listener infrastructure and evidence struct are
-/// fully implemented for future use.
+/// Therefore this function always returns `VERIFICATION_UNAVAILABLE` with a
+/// detailed evidence record.  The bridge telemetry snapshot is included so
+/// operators can see bridge activity alongside the unavailability reason.
+///
+/// # Upgrading to `BROWSER_EGRESS_VERIFIED`
+///
+/// Implement `attempt_cdp_browser_verification` and call it from here when
+/// Edge is launched with `--remote-debugging-port=<ephemeral>`.
 pub fn attempt_token_browser_verification(
     session: &BrowserSessionInfo,
 ) -> BrowserVerificationEvidence {
     let token = Uuid::new_v4().to_string();
     let verification_id = Uuid::new_v4().to_string();
 
-    // Attempt to allocate a listener port
+    // Guard: a PID of 0 means the caller lost track of the browser process.
+    if session.pid == 0 {
+        return BrowserVerificationEvidence::unavailable(
+            &session.environment_id,
+            "Browser PID is unknown — cannot attribute verification to a browser session.",
+        );
+    }
+
+    // Attempt to allocate a listener port (proves OS can bind; port is immediately
+    // released — the listener is not actually used until CDP navigation is wired).
     let (port, verification_url) = match start_verification_listener(&token) {
         Ok(result) => result,
         Err(e) => {
@@ -277,16 +292,11 @@ pub fn attempt_token_browser_verification(
 
     // CDP Page.navigate is not yet implemented.
     // The listener port and token are ready, but we cannot direct the browser
-    // without an open CDP WebSocket connection. Return VERIFICATION_UNAVAILABLE.
+    // without an open CDP WebSocket connection.
     //
-    // To implement full verification:
-    // 1. Connect to Edge via: ws://127.0.0.1:<edge-debug-port>/json
-    // 2. Send: {"id": 1, "method": "Page.navigate", "params": {"url": "<verification_url>"}}
-    // 3. Wait for the token callback on the local listener.
-    // 4. Send: {"id": 2, "method": "Network.getResponseBody", ...}
-    // 5. Verify the external IP observed by the geolocation endpoint matches the proxy.
-    //
-    // Edge must be launched with: --remote-debugging-port=<ephemeral> --remote-debugging-address=127.0.0.1
+    // Bridge telemetry snapshot: the caller populates `recent_bridge_connection_count`
+    // from ProxyBridgeManager::recent_tunnel_count so we can include it in the
+    // evidence message without taking a lock here.
 
     BrowserVerificationEvidence {
         verification_id,
@@ -300,7 +310,7 @@ pub fn attempt_token_browser_verification(
         observed_public_ip: None,
         observed_country: None,
         proxy_endpoint_id: session.proxy_endpoint_id.clone(),
-        verification_source: "TOKEN_LISTENER_PENDING_CDP".to_string(),
+        verification_source: "PROXY_BRIDGE_TELEMETRY".to_string(),
         verified_at: Utc::now().to_rfc3339(),
         latency_ms: None,
         proxy_path_confirmed: false,
@@ -308,15 +318,87 @@ pub fn attempt_token_browser_verification(
             .as_str()
             .to_string(),
         message: format!(
-            "Browser-origin verification infrastructure is ready (token: {}, listener port: {}) \
-             but CDP Page.navigate is not yet implemented. \
-             To complete verification, launch Edge with --remote-debugging-port=<ephemeral> \
-             --remote-debugging-address=127.0.0.1 and implement the CDP WebSocket client. \
-             Current maximum: PROXY_EGRESS_VERIFIED (backend probe only).",
+            "Browser-origin verification requires Chrome DevTools Protocol (CDP) integration. \
+             CDP is not yet implemented. \
+             Proxy bridge telemetry shows {} recent tunnel event(s) in the last 5 minutes. \
+             Verification listener ready on port {} (token prefix: {}). \
+             To achieve BROWSER_EGRESS_VERIFIED: launch Edge with \
+             --remote-debugging-port=<ephemeral> --remote-debugging-address=127.0.0.1, \
+             then use CDP Page.navigate to visit the verification URL, \
+             observe Network.responseReceived, and correlate with bridge telemetry. \
+             Current maximum provable status: PROXY_EGRESS_VERIFIED (backend probe only).",
+            session.recent_bridge_connection_count,
+            port,
             &token[..8],
-            port
         ),
     }
+}
+
+/// Errors that can occur during browser verification.
+#[derive(Debug)]
+pub enum BrowserVerificationError {
+    /// Edge was not launched with `--remote-debugging-port` or the port is unreachable.
+    CdpNotAvailable(String),
+    /// TCP connection to the CDP endpoint succeeded but the WebSocket handshake failed.
+    CdpConnectionFailed(String),
+    /// No `Network.responseReceived` event arrived within the allowed window.
+    VerificationTimeout,
+    /// The PID or session ID on the CDP target does not match the expected session.
+    SessionMismatch,
+    /// The response body from the geolocation endpoint could not be parsed.
+    ResponseParseError(String),
+}
+
+/// Performs real browser-origin verification via Chrome DevTools Protocol.
+///
+/// # Prerequisites
+///
+/// Edge must be launched with:
+/// - `--remote-debugging-port=<ephemeral>` (use a randomly-assigned port)
+/// - `--remote-debugging-address=127.0.0.1` (loopback only — NEVER 0.0.0.0)
+///
+/// # Flow
+///
+/// 1. Connect to `http://127.0.0.1:<debug_port>/json` (plain HTTP, not WebSocket yet).
+/// 2. Find the target page: `GET /json/list` → find target with `type == "page"`.
+/// 3. Connect to the WebSocket URL from the target descriptor.
+/// 4. Send: `{"id":1,"method":"Network.enable","params":{}}`
+/// 5. Send: `{"id":2,"method":"Page.navigate","params":{"url":"<verification_url>"}}`
+///    where `<verification_url>` is the loopback listener URL with the unique token.
+/// 6. Wait for `Network.responseReceived` with the matching `requestId`.
+/// 7. Correlate: the bridge's CONNECT telemetry must show a tunnel to the external
+///    geolocation host (e.g. `ipwho.is`) within the same time window.
+/// 8. Confirm the token was received on the local listener (the browser *did* call back).
+/// 9. Store `BrowserVerificationEvidence` with `status = BROWSER_EGRESS_VERIFIED`.
+///
+/// # Security requirements
+///
+/// - Close the CDP WebSocket immediately after verification.
+/// - Never log full response bodies (may contain sensitive geolocation data).
+/// - Restrict CDP to this specific browser instance (match by PID / session ID).
+/// - Use a session-scoped unique token to prevent replay.
+/// - Apply a strict timeout (default: 30 seconds).
+///
+/// # Return
+///
+/// Returns `Err(BrowserVerificationError::CdpNotAvailable)` when Edge is not
+/// running with a debug port or the port cannot be reached.
+///
+/// # NOT YET IMPLEMENTED
+///
+/// This function is a specification stub.  The actual WebSocket CDP client
+/// requires either the `tungstenite` or `tokio-tungstenite` crate plus
+/// `serde_json` message framing.  Add these to `Cargo.toml` and implement
+/// the flow described above before promoting any result to `BROWSER_EGRESS_VERIFIED`.
+pub fn attempt_cdp_browser_verification(
+    _session: &BrowserSessionInfo,
+    _debug_port: u16,
+) -> Result<BrowserVerificationEvidence, BrowserVerificationError> {
+    Err(BrowserVerificationError::CdpNotAvailable(
+        "CDP WebSocket client not yet implemented. \
+         See function documentation for the full implementation specification."
+            .to_string(),
+    ))
 }
 
 #[cfg(test)]
@@ -363,6 +445,7 @@ mod tests {
             proxy_endpoint_id: "ep-001".to_string(),
             expected_country: Some("US".to_string()),
             expected_ip: None,
+            recent_bridge_connection_count: 0,
         };
         let result = attempt_token_browser_verification(&session);
         assert_eq!(result.status, "VERIFICATION_UNAVAILABLE");

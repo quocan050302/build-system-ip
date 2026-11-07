@@ -2,7 +2,7 @@ use crate::security::redaction::redact_sensitive_str;
 use base64::Engine;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -11,6 +11,91 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 const MAX_CONCURRENT_CONNECTIONS: usize = 128;
+
+// ---------------------------------------------------------------------------
+// Bridge connection telemetry
+// ---------------------------------------------------------------------------
+
+/// A single observed connection event tunnelled through the proxy bridge.
+///
+/// These records are used by `browser_verification` to build composite
+/// evidence showing that the bridge has been active during a session.
+/// They do NOT prove browser-origin egress by themselves — that requires CDP.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BridgeConnectionEvent {
+    /// RFC3339 timestamp when the connection was established.
+    pub timestamp: String,
+    /// Target host extracted from the CONNECT request or plain-HTTP Host header.
+    pub target_host: String,
+    /// Whether the tunnel completed without an upstream error.
+    pub completed: bool,
+    /// Round-trip latency in milliseconds, if measured at tunnel close.
+    pub latency_ms: Option<u32>,
+}
+
+/// Thread-safe, bounded ring-buffer of recent bridge connection events.
+///
+/// Bounded to `max_events` entries so memory usage is O(1) regardless of
+/// how long the bridge runs.
+pub struct BridgeTelemetry {
+    events: Mutex<VecDeque<BridgeConnectionEvent>>,
+    max_events: usize,
+}
+
+impl BridgeTelemetry {
+    pub fn new(max_events: usize) -> Self {
+        Self {
+            events: Mutex::new(VecDeque::new()),
+            max_events,
+        }
+    }
+
+    /// Push a new event, dropping the oldest if the ring is full.
+    pub fn record_event(&self, event: BridgeConnectionEvent) {
+        if let Ok(mut events) = self.events.lock() {
+            if events.len() >= self.max_events {
+                events.pop_front();
+            }
+            events.push_back(event);
+        }
+    }
+
+    /// Return all events recorded within the last `since_secs` seconds.
+    pub fn recent_events(&self, since_secs: u64) -> Vec<BridgeConnectionEvent> {
+        if let Ok(events) = self.events.lock() {
+            let cutoff = Utc::now() - chrono::Duration::seconds(since_secs as i64);
+            events
+                .iter()
+                .filter(|e| {
+                    e.timestamp
+                        .parse::<chrono::DateTime<Utc>>()
+                        .map(|t| t > cutoff)
+                        .unwrap_or(false)
+                })
+                .cloned()
+                .collect()
+        } else {
+            vec![]
+        }
+    }
+
+    /// Return `true` when at least one completed tunnel to `target_host` was
+    /// recorded within the last `since_secs` seconds.
+    pub fn has_recent_connection_to(&self, target_host: &str, since_secs: u64) -> bool {
+        self.recent_events(since_secs)
+            .iter()
+            .any(|e| e.target_host.contains(target_host) && e.completed)
+    }
+
+    /// Total number of events currently held in the ring-buffer.
+    pub fn len(&self) -> usize {
+        self.events.lock().map(|g| g.len()).unwrap_or(0)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
 const UPSTREAM_CONNECT_TIMEOUT_MS: u64 = 6000;
 const STREAM_IO_TIMEOUT_MS: u64 = 15000;
 
@@ -88,6 +173,9 @@ pub struct ProxyBridgeInstance {
     pub last_error: Arc<Mutex<Option<String>>>,
     pub last_activity_at: Arc<Mutex<Option<String>>>,
     pub started_at: String,
+    /// Ring-buffer of recent tunnel events for browser-verification correlation.
+    /// Bounded to 500 entries; each entry is O(100 bytes) ≈ 50 KB worst-case.
+    pub telemetry: Arc<BridgeTelemetry>,
 }
 
 impl ProxyBridgeInstance {
@@ -181,6 +269,7 @@ impl ProxyBridgeManager {
         let last_error = Arc::new(Mutex::new(None));
         let last_activity_at = Arc::new(Mutex::new(None));
         let started_at = Utc::now().to_rfc3339();
+        let telemetry = Arc::new(BridgeTelemetry::new(500));
 
         let instance = Arc::new(ProxyBridgeInstance {
             config: config.clone(),
@@ -194,6 +283,7 @@ impl ProxyBridgeManager {
             last_error: last_error.clone(),
             last_activity_at: last_activity_at.clone(),
             started_at,
+            telemetry,
         });
 
         {
@@ -215,6 +305,17 @@ impl ProxyBridgeManager {
     pub fn get_bridge_status(&self, environment_id: &str) -> Option<ProxyBridgeStatus> {
         let map = self.bridges.lock().ok()?;
         map.get(environment_id).map(|b| b.status())
+    }
+
+    /// Return the number of recent tunnel events for the given environment.
+    /// Used by browser verification to populate `recent_bridge_connection_count`.
+    pub fn recent_tunnel_count(&self, environment_id: &str, since_secs: u64) -> usize {
+        if let Ok(map) = self.bridges.lock() {
+            if let Some(instance) = map.get(environment_id) {
+                return instance.telemetry.recent_events(since_secs).len();
+            }
+        }
+        0
     }
 
     pub fn stop_bridge(&self, environment_id: &str) -> bool {
@@ -465,6 +566,17 @@ fn handle_client_connection(
             *err = None;
         }
 
+        // Record telemetry for this CONNECT tunnel before bidirectional relay.
+        // `completed = true` because the upstream accepted the tunnel.
+        // Latency is not measured here (relay is synchronous and long-lived);
+        // the event timestamp is sufficient for correlation windows.
+        instance.telemetry.record_event(BridgeConnectionEvent {
+            timestamp: Utc::now().to_rfc3339(),
+            target_host: target.to_string(),
+            completed: true,
+            latency_ms: None,
+        });
+
         relay_bidirectional(client, upstream);
         Ok(())
     } else {
@@ -532,6 +644,25 @@ fn handle_client_connection(
         if let Ok(mut err) = instance.last_error.lock() {
             *err = None;
         }
+
+        // Record telemetry for plain-HTTP requests forwarded through the bridge.
+        // For HTTP (non-CONNECT), `target` is a full URL; extract host portion.
+        let http_host = {
+            let without_scheme = target
+                .strip_prefix("http://")
+                .or_else(|| target.strip_prefix("https://"))
+                .unwrap_or(target);
+            match without_scheme.find('/') {
+                Some(idx) => without_scheme[..idx].to_string(),
+                None => without_scheme.to_string(),
+            }
+        };
+        instance.telemetry.record_event(BridgeConnectionEvent {
+            timestamp: Utc::now().to_rfc3339(),
+            target_host: http_host,
+            completed: true,
+            latency_ms: None,
+        });
 
         let _ = client.write_all(&first_chunk[..n]);
         let _ = std::io::copy(&mut upstream, &mut client);
@@ -698,6 +829,14 @@ fn handle_socks5_upstream(
     if let Ok(mut err) = instance.last_error.lock() {
         *err = None;
     }
+
+    // Record telemetry for the SOCKS5 tunnel.
+    instance.telemetry.record_event(BridgeConnectionEvent {
+        timestamp: Utc::now().to_rfc3339(),
+        target_host: format!("{}:{}", dest_host, dest_port),
+        completed: true,
+        latency_ms: None,
+    });
 
     if method == "CONNECT" {
         client

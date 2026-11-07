@@ -147,12 +147,12 @@ impl SystemBrowserLauncher {
         }
 
         let mut paths = Vec::new();
-        let home_apps = std::env::var("HOME")
-            .ok()
-            .map(|h| PathBuf::from(h).join("Applications"));
 
         #[cfg(target_os = "macos")]
         {
+            let home_apps = std::env::var("HOME")
+                .ok()
+                .map(|h| PathBuf::from(h).join("Applications"));
             match key.as_str() {
                 "edge" | "msedge" | "microsoft-edge" | "microsoft edge" => {
                     paths.push(PathBuf::from(
@@ -247,7 +247,6 @@ impl SystemBrowserLauncher {
 
         #[cfg(not(any(target_os = "macos", windows)))]
         {
-            let _ = home_apps;
             match key.as_str() {
                 "edge" | "msedge" => {
                     paths.push(PathBuf::from("/usr/bin/microsoft-edge"));
@@ -301,6 +300,11 @@ impl SystemBrowserLauncher {
     }
 
     pub fn detect_version(exe_path: &Path) -> Option<String> {
+        #[cfg(windows)]
+        {
+            let _ = exe_path;
+        }
+
         // On macOS, check Info.plist inside the .app bundle first (instant and doesn't spawn browser window)
         #[cfg(target_os = "macos")]
         {

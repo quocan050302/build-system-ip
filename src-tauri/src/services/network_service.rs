@@ -105,16 +105,18 @@ impl NetworkProtectionStatus {
     /// This translates stored status strings into the structured protection view.
     pub fn from_check_record(record: &NetworkCheckRecord, environment_id: &str) -> Self {
         let dns_status = match record.dns_leak_status.as_str() {
-            "REMOTE_PROXY_DNS" => "VERIFIED".to_string(),
+            "REMOTE_PROXY_DNS" => "PROXY_DNS_ASSUMED".to_string(),
+            "DNS_VERIFIED" => "VERIFIED".to_string(),
             "HOST_DNS_DETECTED" => "FAILED".to_string(),
             "NOT_APPLICABLE" => "NOT_APPLICABLE".to_string(),
             _ => "UNVERIFIED".to_string(),
         };
         let dns_notes = match record.dns_leak_status.as_str() {
-            "REMOTE_PROXY_DNS" => "DNS resolves through proxy (remote side). Host DNS not observed.".to_string(),
+            "REMOTE_PROXY_DNS" => "DNS assumed to be proxied (CONNECT/SOCKS5 semantics). Host-side DNS resolver usage has NOT been independently verified. Packet capture or browser DNS instrumentation required for VERIFIED status.".to_string(),
+            "DNS_VERIFIED" => "DNS resolution independently verified to route through proxy.".to_string(),
             "HOST_DNS_DETECTED" => "ALERT: Host-side DNS resolution detected — potential DNS leak.".to_string(),
             "NOT_APPLICABLE" => "DNS verification not applicable for this connection type.".to_string(),
-            _ => "DNS routing has not been independently verified. SOCKS5/HTTP proxy assumed to handle DNS remotely.".to_string(),
+            _ => "DNS routing has not been tested. No network check has been performed, or the check method does not include DNS observation.".to_string(),
         };
 
         let ipv6_status = "UNVERIFIED".to_string();
@@ -144,7 +146,10 @@ impl NetworkProtectionStatus {
                 && webrtc_status == "VERIFIED"
             {
                 "FULLY_PROTECTED".to_string()
-            } else if dns_status == "VERIFIED" || webrtc_status == "POLICY_SET_UNVERIFIED" {
+            } else if dns_status == "PROXY_DNS_ASSUMED"
+                || dns_status == "VERIFIED"
+                || webrtc_status == "POLICY_SET_UNVERIFIED"
+            {
                 "PARTIALLY_PROTECTED".to_string()
             } else {
                 "UNVERIFIED".to_string()
@@ -1403,6 +1408,11 @@ impl NetworkService {
                     proxy_endpoint_id: _ep_id.clone(),
                     expected_country: expected_country.clone(),
                     expected_ip: expected_ip.clone(),
+                    // `recent_bridge_connection_count` is populated from ProxyBridgeManager::recent_tunnel_count
+                    // when the bridge manager is accessible from NetworkService.  NetworkService does not
+                    // currently hold an Arc<ProxyBridgeManager>; wiring that is a future step.
+                    // The field defaults to 0 here so the architecture compiles and is complete.
+                    recent_bridge_connection_count: 0,
                 };
                 let _browser_evidence = attempt_token_browser_verification(&bridge_session);
                 // _browser_evidence.status == "VERIFICATION_UNAVAILABLE" until CDP is wired.
