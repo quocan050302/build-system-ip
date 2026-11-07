@@ -3,7 +3,9 @@ use crate::hypervisor::HypervisorAdapter;
 use crate::security::redaction::redact_sensitive_str;
 use crate::security::{get_secret_store, SecretStore};
 use crate::services::audit_service::AuditService;
-use crate::services::browser_verification::{attempt_cdp_browser_verification, BrowserSessionInfo};
+use crate::services::browser_verification::{
+    attempt_cdp_browser_verification, evaluate_verification_decision, BrowserSessionInfo,
+};
 use crate::services::profile_service::{BrowserStatus, ProfileService};
 use crate::services::proxy_bridge::probe_via_local_bridge;
 use crate::services::vm_service::VmService;
@@ -1392,31 +1394,36 @@ impl NetworkService {
                     }
                 }
 
-                // Backend bridge probe succeeded — this is PROXY_EGRESS_VERIFIED, not BROWSER_EGRESS_VERIFIED.
-                // True BROWSER_EGRESS_VERIFIED requires CDP/DevTools Protocol verification (not yet implemented).
+                let bridge_instance_id = profile_service
+                    .proxy_bridge_manager()
+                    .get_instance_id(environment_id);
 
-                // Attempt token-based browser verification (CDP not yet wired).
-                // This returns VERIFICATION_UNAVAILABLE until CDP Page.navigate is implemented.
-                // The evidence is logged for auditability even when unavailable.
                 let bridge_session = BrowserSessionInfo {
                     environment_id: environment_id.to_string(),
                     session_id: session_tag.clone(),
                     pid,
-                    profile_path: String::new(), // Profile path available from BrowserStatus if extended
+                    profile_path: String::new(),
                     proxy_bridge_port: Some(bridge_port),
                     proxy_endpoint_id: _ep_id.clone(),
+                    bridge_instance_id,
                     expected_country: expected_country.clone(),
                     expected_ip: expected_ip.clone(),
-                    // Real telemetry from the active shared ProxyBridgeManager instance
                     recent_bridge_connection_count: profile_service
                         .proxy_bridge_manager()
                         .recent_tunnel_count(environment_id, 300),
                     cdp_port: cdp_port_opt,
+                    is_simulation: false,
                 };
 
                 // Attempt real CDP browser-origin verification if Edge has an active loopback debug port
                 let cdp_evidence = if let Some(cdp_port) = cdp_port_opt {
-                    attempt_cdp_browser_verification(&bridge_session, cdp_port).ok()
+                    attempt_cdp_browser_verification(
+                        &bridge_session,
+                        cdp_port,
+                        Some(profile_service.proxy_bridge_manager()),
+                    )
+                    .ok()
+                    .filter(|ev| evaluate_verification_decision(ev).is_ok())
                 } else {
                     None
                 };
@@ -1428,7 +1435,8 @@ impl NetworkService {
                         "BROWSER_EGRESS_VERIFIED".to_string(),
                         "BROWSER_SESSION".to_string(),
                         format!(
-                            "Edge browser-origin egress verified via CDP for session ({}): external IP {}, country {}.",
+                            "Edge browser-origin egress verified via CDP and correlated with proxy bridge instance ({}) for session ({}): external IP {}, country {}.",
+                            evidence.bridge_instance_id.as_deref().unwrap_or("unknown"),
                             session_tag,
                             evidence.observed_public_ip.as_deref().unwrap_or(""),
                             evidence.observed_country.as_deref().unwrap_or("")
@@ -1439,7 +1447,7 @@ impl NetworkService {
                         "PROXY_EGRESS_VERIFIED".to_string(),
                         "PROXY_BRIDGE_PROBE".to_string(),
                         format!(
-                            "Proxy bridge probe for session ({}) confirmed egress IP: {} (country: {}, latency: {}ms). Note: browser-origin verification requires active CDP session.",
+                            "Proxy bridge probe for session ({}) confirmed egress IP: {} (country: {}, latency: {}ms). Note: browser-origin verification requires active CDP session and correlated proxy tunnel.",
                             session_tag, probe_res.observed_ipv4, country_code, probe_res.latency_ms
                         ),
                     )

@@ -21,16 +21,37 @@ const MAX_CONCURRENT_CONNECTIONS: usize = 128;
 /// These records are used by `browser_verification` to build composite
 /// evidence showing that the bridge has been active during a session.
 /// They do NOT prove browser-origin egress by themselves — that requires CDP.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum BridgeTunnelOutcome {
+    Success,
+    UpstreamConnectFailed,
+    AuthFailed,
+    ClientClosed,
+    ProtocolError,
+}
+
+/// A single observed connection event tunnelled through the proxy bridge.
+///
+/// Extended in V6 to support exact request-level correlation:
+/// - Explicit bridge instance UUID (detects bridge restarts)
+/// - Exact destination host & port (no substring matches)
+/// - Connection start and finish timestamps
+/// - Typed tunnel outcome
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BridgeConnectionEvent {
-    /// RFC3339 timestamp when the connection was established.
-    pub timestamp: String,
-    /// Target host extracted from the CONNECT request or plain-HTTP Host header.
-    pub target_host: String,
-    /// Whether the tunnel completed without an upstream error.
-    pub completed: bool,
-    /// Round-trip latency in milliseconds, if measured at tunnel close.
+    pub event_id: String,
+    pub bridge_instance_id: String,
+    pub environment_id: String,
+    pub proxy_endpoint_id: String,
+    pub local_bridge_port: u16,
+    pub destination_host: String,
+    pub destination_port: u16,
+    pub protocol: String,
+    pub connection_started_at: String,
+    pub connection_finished_at: Option<String>,
+    pub outcome: BridgeTunnelOutcome,
     pub latency_ms: Option<u32>,
+    pub bytes_transferred: u64,
 }
 
 /// Thread-safe, bounded ring-buffer of recent bridge connection events.
@@ -67,7 +88,7 @@ impl BridgeTelemetry {
             events
                 .iter()
                 .filter(|e| {
-                    e.timestamp
+                    e.connection_started_at
                         .parse::<chrono::DateTime<Utc>>()
                         .map(|t| t > cutoff)
                         .unwrap_or(false)
@@ -79,12 +100,54 @@ impl BridgeTelemetry {
         }
     }
 
+    /// Find an exact matching tunnel event for request-level browser verification correlation.
+    ///
+    /// Requires exact match on:
+    /// - `bridge_instance_id`: proves event belongs to the current bridge generation.
+    /// - `environment_id`: proves event belongs to the current environment.
+    /// - `proxy_endpoint_id`: proves event used the assigned proxy endpoint.
+    /// - `destination_host`: exact normalized hostname (no substring matches).
+    /// - `destination_port`: exact destination port (e.g. 443).
+    /// - `outcome`: must be `BridgeTunnelOutcome::Success`.
+    /// - `connection_started_at`: must have started AT OR AFTER `started_after` (rejects stale events).
+    pub fn find_matching_tunnel(
+        &self,
+        bridge_instance_id: &str,
+        environment_id: &str,
+        proxy_endpoint_id: &str,
+        target_host: &str,
+        target_port: u16,
+        started_after: chrono::DateTime<Utc>,
+    ) -> Option<BridgeConnectionEvent> {
+        let norm_target = target_host.trim_end_matches('.').to_ascii_lowercase();
+        if let Ok(events) = self.events.lock() {
+            events
+                .iter()
+                .find(|e| {
+                    e.bridge_instance_id == bridge_instance_id
+                        && e.environment_id == environment_id
+                        && e.proxy_endpoint_id == proxy_endpoint_id
+                        && e.destination_host == norm_target
+                        && (target_port == 0 || e.destination_port == target_port)
+                        && e.outcome == BridgeTunnelOutcome::Success
+                        && e.connection_started_at
+                            .parse::<chrono::DateTime<Utc>>()
+                            .map(|t| t >= started_after)
+                            .unwrap_or(false)
+                })
+                .cloned()
+        } else {
+            None
+        }
+    }
+
     /// Return `true` when at least one completed tunnel to `target_host` was
-    /// recorded within the last `since_secs` seconds.
+    /// recorded within the last `since_secs` seconds with exact host match.
     pub fn has_recent_connection_to(&self, target_host: &str, since_secs: u64) -> bool {
+        let norm = target_host.trim_end_matches('.').to_ascii_lowercase();
         self.recent_events(since_secs)
             .iter()
-            .any(|e| e.target_host.contains(target_host) && e.completed)
+            .any(|e| e.destination_host == norm && e.outcome == BridgeTunnelOutcome::Success)
     }
 
     /// Total number of events currently held in the ring-buffer.
@@ -101,6 +164,7 @@ const STREAM_IO_TIMEOUT_MS: u64 = 15000;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProxyBridgeStatus {
+    pub instance_id: String,
     pub environment_id: String,
     pub endpoint_id: String,
     pub local_port: u16,
@@ -162,6 +226,7 @@ impl UpstreamProxyConfig {
 }
 
 pub struct ProxyBridgeInstance {
+    pub instance_id: String,
     pub config: UpstreamProxyConfig,
     pub local_port: u16,
     pub running: Arc<AtomicBool>,
@@ -181,6 +246,7 @@ pub struct ProxyBridgeInstance {
 impl ProxyBridgeInstance {
     pub fn status(&self) -> ProxyBridgeStatus {
         ProxyBridgeStatus {
+            instance_id: self.instance_id.clone(),
             environment_id: self.config.environment_id.clone(),
             endpoint_id: self.config.endpoint_id.clone(),
             local_port: self.local_port,
@@ -260,6 +326,7 @@ impl ProxyBridgeManager {
             .map_err(|e| format!("Failed to read local bridge address: {}", e))?
             .port();
 
+        let instance_id = uuid::Uuid::new_v4().to_string();
         let running = Arc::new(AtomicBool::new(true));
         let active_connections = Arc::new(AtomicUsize::new(0));
         let total_connections = Arc::new(AtomicU64::new(0));
@@ -272,6 +339,7 @@ impl ProxyBridgeManager {
         let telemetry = Arc::new(BridgeTelemetry::new(500));
 
         let instance = Arc::new(ProxyBridgeInstance {
+            instance_id,
             config: config.clone(),
             local_port,
             running: running.clone(),
@@ -307,6 +375,12 @@ impl ProxyBridgeManager {
         map.get(environment_id).map(|b| b.status())
     }
 
+    /// Retrieve the unique instance generation UUID of the currently running bridge.
+    pub fn get_instance_id(&self, environment_id: &str) -> Option<String> {
+        let map = self.bridges.lock().ok()?;
+        map.get(environment_id).map(|b| b.instance_id.clone())
+    }
+
     /// Return the number of recent tunnel events for the given environment.
     /// Used by browser verification to populate `recent_bridge_connection_count`.
     pub fn recent_tunnel_count(&self, environment_id: &str, since_secs: u64) -> usize {
@@ -316,6 +390,32 @@ impl ProxyBridgeManager {
             }
         }
         0
+    }
+
+    /// Find an exact matching tunnel event belonging to the current bridge generation,
+    /// environment, assigned proxy endpoint, exact host/port, and started after the baseline.
+    pub fn find_matching_tunnel(
+        &self,
+        bridge_instance_id: &str,
+        environment_id: &str,
+        proxy_endpoint_id: &str,
+        target_host: &str,
+        target_port: u16,
+        started_after: chrono::DateTime<Utc>,
+    ) -> Option<BridgeConnectionEvent> {
+        if let Ok(map) = self.bridges.lock() {
+            if let Some(instance) = map.get(environment_id) {
+                return instance.telemetry.find_matching_tunnel(
+                    bridge_instance_id,
+                    environment_id,
+                    proxy_endpoint_id,
+                    target_host,
+                    target_port,
+                    started_after,
+                );
+            }
+        }
+        None
     }
 
     /// Check whether a tunnel to target_host was completed within the last since_secs seconds.
@@ -483,6 +583,35 @@ fn connect_to_upstream(config: &UpstreamProxyConfig) -> Result<TcpStream, String
     Ok(stream)
 }
 
+#[allow(clippy::too_many_arguments)]
+fn record_telemetry_event(
+    instance: &ProxyBridgeInstance,
+    dest_host: &str,
+    dest_port: u16,
+    protocol: &str,
+    conn_start: chrono::DateTime<Utc>,
+    outcome: BridgeTunnelOutcome,
+    latency_ms: Option<u32>,
+    bytes_transferred: u64,
+) {
+    let norm_host = dest_host.trim_end_matches('.').to_ascii_lowercase();
+    instance.telemetry.record_event(BridgeConnectionEvent {
+        event_id: uuid::Uuid::new_v4().to_string(),
+        bridge_instance_id: instance.instance_id.clone(),
+        environment_id: instance.config.environment_id.clone(),
+        proxy_endpoint_id: instance.config.endpoint_id.clone(),
+        local_bridge_port: instance.local_port,
+        destination_host: norm_host,
+        destination_port: dest_port,
+        protocol: protocol.to_string(),
+        connection_started_at: conn_start.to_rfc3339(),
+        connection_finished_at: Some(Utc::now().to_rfc3339()),
+        outcome,
+        latency_ms,
+        bytes_transferred,
+    });
+}
+
 fn handle_client_connection(
     mut client: TcpStream,
     instance: &ProxyBridgeInstance,
@@ -502,6 +631,16 @@ fn handle_client_connection(
 
     let method = parts[0].to_uppercase();
     let target = parts[1];
+    let (dest_host, dest_port, _rel_path) = match parse_target_host_port(&method, target) {
+        Ok(res) => res,
+        Err(e) => {
+            send_bad_gateway(&mut client, &e);
+            return Err(e);
+        }
+    };
+
+    let conn_start = Utc::now();
+    let start_inst = Instant::now();
 
     if instance.config.protocol.eq_ignore_ascii_case("SOCKS5") {
         return handle_socks5_upstream(
@@ -509,6 +648,10 @@ fn handle_client_connection(
             instance,
             &method,
             target,
+            &dest_host,
+            dest_port,
+            conn_start,
+            start_inst,
             &header_str,
             &leftover,
         );
@@ -519,6 +662,16 @@ fn handle_client_connection(
         Ok(s) => s,
         Err(e) => {
             record_bridge_error(instance, false, e.clone());
+            record_telemetry_event(
+                instance,
+                &dest_host,
+                dest_port,
+                &method,
+                conn_start,
+                BridgeTunnelOutcome::UpstreamConnectFailed,
+                Some(start_inst.elapsed().as_millis() as u32),
+                0,
+            );
             send_bad_gateway(
                 &mut client,
                 &format!("Proxy connection failed (direct fallback blocked): {}", e),
@@ -537,6 +690,16 @@ fn handle_client_connection(
         if let Err(e) = upstream.write_all(connect_req.as_bytes()) {
             let msg = format!("Failed writing CONNECT to upstream proxy: {}", e);
             record_bridge_error(instance, false, msg.clone());
+            record_telemetry_event(
+                instance,
+                &dest_host,
+                dest_port,
+                "HTTP_CONNECT",
+                conn_start,
+                BridgeTunnelOutcome::UpstreamConnectFailed,
+                Some(start_inst.elapsed().as_millis() as u32),
+                0,
+            );
             send_bad_gateway(&mut client, &msg);
             return Err(msg);
         }
@@ -546,6 +709,16 @@ fn handle_client_connection(
             Err(e) => {
                 let msg = format!("Upstream proxy closed during CONNECT handshake: {}", e);
                 record_bridge_error(instance, false, msg.clone());
+                record_telemetry_event(
+                    instance,
+                    &dest_host,
+                    dest_port,
+                    "HTTP_CONNECT",
+                    conn_start,
+                    BridgeTunnelOutcome::UpstreamConnectFailed,
+                    Some(start_inst.elapsed().as_millis() as u32),
+                    0,
+                );
                 send_bad_gateway(&mut client, &msg);
                 return Err(msg);
             }
@@ -557,6 +730,16 @@ fn handle_client_connection(
                 "Upstream proxy authentication failed (HTTP 407 Proxy Authentication Required)"
                     .to_string();
             record_bridge_error(instance, true, msg.clone());
+            record_telemetry_event(
+                instance,
+                &dest_host,
+                dest_port,
+                "HTTP_CONNECT",
+                conn_start,
+                BridgeTunnelOutcome::AuthFailed,
+                Some(start_inst.elapsed().as_millis() as u32),
+                0,
+            );
             send_bad_gateway(&mut client, &msg);
             return Err(msg);
         }
@@ -564,6 +747,16 @@ fn handle_client_connection(
         if !status_line.contains(" 200") {
             let msg = format!("Upstream proxy rejected CONNECT tunnel: {}", status_line);
             record_bridge_error(instance, false, msg.clone());
+            record_telemetry_event(
+                instance,
+                &dest_host,
+                dest_port,
+                "HTTP_CONNECT",
+                conn_start,
+                BridgeTunnelOutcome::ProtocolError,
+                Some(start_inst.elapsed().as_millis() as u32),
+                0,
+            );
             send_bad_gateway(&mut client, &msg);
             return Err(msg);
         }
@@ -584,16 +777,16 @@ fn handle_client_connection(
             *err = None;
         }
 
-        // Record telemetry for this CONNECT tunnel before bidirectional relay.
-        // `completed = true` because the upstream accepted the tunnel.
-        // Latency is not measured here (relay is synchronous and long-lived);
-        // the event timestamp is sufficient for correlation windows.
-        instance.telemetry.record_event(BridgeConnectionEvent {
-            timestamp: Utc::now().to_rfc3339(),
-            target_host: target.to_string(),
-            completed: true,
-            latency_ms: None,
-        });
+        record_telemetry_event(
+            instance,
+            &dest_host,
+            dest_port,
+            "HTTP_CONNECT",
+            conn_start,
+            BridgeTunnelOutcome::Success,
+            Some(start_inst.elapsed().as_millis() as u32),
+            0,
+        );
 
         relay_bidirectional(client, upstream);
         Ok(())
@@ -622,6 +815,16 @@ fn handle_client_connection(
         if let Err(e) = upstream.write_all(rebuilt.as_bytes()) {
             let msg = format!("Failed sending HTTP request to upstream proxy: {}", e);
             record_bridge_error(instance, false, msg.clone());
+            record_telemetry_event(
+                instance,
+                &dest_host,
+                dest_port,
+                "PLAIN_HTTP",
+                conn_start,
+                BridgeTunnelOutcome::UpstreamConnectFailed,
+                Some(start_inst.elapsed().as_millis() as u32),
+                0,
+            );
             send_bad_gateway(&mut client, &msg);
             return Err(msg);
         }
@@ -635,6 +838,16 @@ fn handle_client_connection(
             Ok(0) => {
                 let msg = "Upstream proxy returned empty response".to_string();
                 record_bridge_error(instance, false, msg.clone());
+                record_telemetry_event(
+                    instance,
+                    &dest_host,
+                    dest_port,
+                    "PLAIN_HTTP",
+                    conn_start,
+                    BridgeTunnelOutcome::UpstreamConnectFailed,
+                    Some(start_inst.elapsed().as_millis() as u32),
+                    0,
+                );
                 send_bad_gateway(&mut client, &msg);
                 return Err(msg);
             }
@@ -642,6 +855,16 @@ fn handle_client_connection(
             Err(e) => {
                 let msg = format!("Failed reading upstream proxy response: {}", e);
                 record_bridge_error(instance, false, msg.clone());
+                record_telemetry_event(
+                    instance,
+                    &dest_host,
+                    dest_port,
+                    "PLAIN_HTTP",
+                    conn_start,
+                    BridgeTunnelOutcome::UpstreamConnectFailed,
+                    Some(start_inst.elapsed().as_millis() as u32),
+                    0,
+                );
                 send_bad_gateway(&mut client, &msg);
                 return Err(msg);
             }
@@ -654,6 +877,16 @@ fn handle_client_connection(
                 "Upstream proxy authentication failed (HTTP 407 Proxy Authentication Required)"
                     .to_string();
             record_bridge_error(instance, true, msg.clone());
+            record_telemetry_event(
+                instance,
+                &dest_host,
+                dest_port,
+                "PLAIN_HTTP",
+                conn_start,
+                BridgeTunnelOutcome::AuthFailed,
+                Some(start_inst.elapsed().as_millis() as u32),
+                0,
+            );
             send_bad_gateway(&mut client, &msg);
             return Err(msg);
         }
@@ -663,24 +896,16 @@ fn handle_client_connection(
             *err = None;
         }
 
-        // Record telemetry for plain-HTTP requests forwarded through the bridge.
-        // For HTTP (non-CONNECT), `target` is a full URL; extract host portion.
-        let http_host = {
-            let without_scheme = target
-                .strip_prefix("http://")
-                .or_else(|| target.strip_prefix("https://"))
-                .unwrap_or(target);
-            match without_scheme.find('/') {
-                Some(idx) => without_scheme[..idx].to_string(),
-                None => without_scheme.to_string(),
-            }
-        };
-        instance.telemetry.record_event(BridgeConnectionEvent {
-            timestamp: Utc::now().to_rfc3339(),
-            target_host: http_host,
-            completed: true,
-            latency_ms: None,
-        });
+        record_telemetry_event(
+            instance,
+            &dest_host,
+            dest_port,
+            "PLAIN_HTTP",
+            conn_start,
+            BridgeTunnelOutcome::Success,
+            Some(start_inst.elapsed().as_millis() as u32),
+            n as u64,
+        );
 
         let _ = client.write_all(&first_chunk[..n]);
         let _ = std::io::copy(&mut upstream, &mut client);
@@ -717,19 +942,34 @@ fn parse_target_host_port(method: &str, target: &str) -> Result<(String, u16, St
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle_socks5_upstream(
     client: &mut TcpStream,
     instance: &ProxyBridgeInstance,
     method: &str,
     target: &str,
+    dest_host: &str,
+    dest_port: u16,
+    conn_start: chrono::DateTime<Utc>,
+    start_inst: Instant,
     header_str: &str,
     leftover: &[u8],
 ) -> Result<(), String> {
-    let (dest_host, dest_port, rel_path) = parse_target_host_port(method, target)?;
+    let (_h, _p, rel_path) = parse_target_host_port(method, target)?;
     let mut upstream = match connect_to_upstream(&instance.config) {
         Ok(s) => s,
         Err(e) => {
             record_bridge_error(instance, false, e.clone());
+            record_telemetry_event(
+                instance,
+                dest_host,
+                dest_port,
+                method,
+                conn_start,
+                BridgeTunnelOutcome::UpstreamConnectFailed,
+                Some(start_inst.elapsed().as_millis() as u32),
+                0,
+            );
             send_bad_gateway(client, &e);
             return Err(e);
         }
@@ -751,6 +991,16 @@ fn handle_socks5_upstream(
     if let Err(e) = upstream.read_exact(&mut method_resp) {
         let msg = format!("SOCKS5 greeting failed: {}", e);
         record_bridge_error(instance, false, msg.clone());
+        record_telemetry_event(
+            instance,
+            dest_host,
+            dest_port,
+            method,
+            conn_start,
+            BridgeTunnelOutcome::UpstreamConnectFailed,
+            Some(start_inst.elapsed().as_millis() as u32),
+            0,
+        );
         send_bad_gateway(client, &msg);
         return Err(msg);
     }
@@ -758,6 +1008,16 @@ fn handle_socks5_upstream(
     if method_resp[0] != 0x05 || method_resp[1] == 0xFF {
         let msg = "SOCKS5 proxy rejected authentication methods".to_string();
         record_bridge_error(instance, true, msg.clone());
+        record_telemetry_event(
+            instance,
+            dest_host,
+            dest_port,
+            method,
+            conn_start,
+            BridgeTunnelOutcome::AuthFailed,
+            Some(start_inst.elapsed().as_millis() as u32),
+            0,
+        );
         send_bad_gateway(client, &msg);
         return Err(msg);
     }
@@ -766,6 +1026,16 @@ fn handle_socks5_upstream(
         let c = creds.ok_or_else(|| {
             let msg = "SOCKS5 proxy requires credentials, but none were provided".to_string();
             record_bridge_error(instance, true, msg.clone());
+            record_telemetry_event(
+                instance,
+                dest_host,
+                dest_port,
+                method,
+                conn_start,
+                BridgeTunnelOutcome::AuthFailed,
+                Some(start_inst.elapsed().as_millis() as u32),
+                0,
+            );
             send_bad_gateway(client, &msg);
             msg
         })?;
@@ -791,6 +1061,16 @@ fn handle_socks5_upstream(
             let msg =
                 "SOCKS5 proxy authentication failed (invalid username or password)".to_string();
             record_bridge_error(instance, true, msg.clone());
+            record_telemetry_event(
+                instance,
+                dest_host,
+                dest_port,
+                method,
+                conn_start,
+                BridgeTunnelOutcome::AuthFailed,
+                Some(start_inst.elapsed().as_millis() as u32),
+                0,
+            );
             send_bad_gateway(client, &msg);
             return Err(msg);
         }
@@ -811,6 +1091,16 @@ fn handle_socks5_upstream(
     if let Err(e) = upstream.read_exact(&mut reply_hdr) {
         let msg = format!("SOCKS5 connect reply failed: {}", e);
         record_bridge_error(instance, false, msg.clone());
+        record_telemetry_event(
+            instance,
+            dest_host,
+            dest_port,
+            method,
+            conn_start,
+            BridgeTunnelOutcome::UpstreamConnectFailed,
+            Some(start_inst.elapsed().as_millis() as u32),
+            0,
+        );
         send_bad_gateway(client, &msg);
         return Err(msg);
     }
@@ -820,6 +1110,16 @@ fn handle_socks5_upstream(
             dest_host, dest_port, reply_hdr[1]
         );
         record_bridge_error(instance, false, msg.clone());
+        record_telemetry_event(
+            instance,
+            dest_host,
+            dest_port,
+            method,
+            conn_start,
+            BridgeTunnelOutcome::ProtocolError,
+            Some(start_inst.elapsed().as_millis() as u32),
+            0,
+        );
         send_bad_gateway(client, &msg);
         return Err(msg);
     }
@@ -849,12 +1149,20 @@ fn handle_socks5_upstream(
     }
 
     // Record telemetry for the SOCKS5 tunnel.
-    instance.telemetry.record_event(BridgeConnectionEvent {
-        timestamp: Utc::now().to_rfc3339(),
-        target_host: format!("{}:{}", dest_host, dest_port),
-        completed: true,
-        latency_ms: None,
-    });
+    record_telemetry_event(
+        instance,
+        dest_host,
+        dest_port,
+        if method == "CONNECT" {
+            "SOCKS5_CONNECT"
+        } else {
+            "SOCKS5_HTTP"
+        },
+        conn_start,
+        BridgeTunnelOutcome::Success,
+        Some(start_inst.elapsed().as_millis() as u32),
+        0,
+    );
 
     if method == "CONNECT" {
         client
@@ -1133,22 +1441,56 @@ mod tests {
     #[test]
     fn test_proxy_bridge_telemetry_tunnel_tracking() {
         let telemetry = BridgeTelemetry::new(50);
+        let baseline = Utc::now() - chrono::Duration::seconds(1);
+
         telemetry.record_event(BridgeConnectionEvent {
-            timestamp: Utc::now().to_rfc3339(),
-            target_host: "api.ipwho.is:443".to_string(),
-            completed: true,
+            event_id: uuid::Uuid::new_v4().to_string(),
+            bridge_instance_id: "inst-1".to_string(),
+            environment_id: "env-1".to_string(),
+            proxy_endpoint_id: "ep-1".to_string(),
+            local_bridge_port: 49200,
+            destination_host: "ipwho.is".to_string(),
+            destination_port: 443,
+            protocol: "HTTP_CONNECT".to_string(),
+            connection_started_at: Utc::now().to_rfc3339(),
+            connection_finished_at: Some(Utc::now().to_rfc3339()),
+            outcome: BridgeTunnelOutcome::Success,
             latency_ms: Some(45),
-        });
-        telemetry.record_event(BridgeConnectionEvent {
-            timestamp: Utc::now().to_rfc3339(),
-            target_host: "api.ipify.org:443".to_string(),
-            completed: true,
-            latency_ms: Some(52),
+            bytes_transferred: 1024,
         });
 
-        assert!(telemetry.has_recent_connection_to("api.ipwho.is", 60));
-        assert!(telemetry.has_recent_connection_to("api.ipify.org", 60));
+        // Exact match succeeds
+        assert!(telemetry
+            .find_matching_tunnel("inst-1", "env-1", "ep-1", "ipwho.is", 443, baseline)
+            .is_some());
+        // Wrong instance ID fails
+        assert!(telemetry
+            .find_matching_tunnel("inst-2", "env-1", "ep-1", "ipwho.is", 443, baseline)
+            .is_none());
+        // Wrong environment ID fails
+        assert!(telemetry
+            .find_matching_tunnel("inst-1", "env-2", "ep-1", "ipwho.is", 443, baseline)
+            .is_none());
+        // Wrong proxy endpoint ID fails
+        assert!(telemetry
+            .find_matching_tunnel("inst-1", "env-1", "ep-999", "ipwho.is", 443, baseline)
+            .is_none());
+        // Wrong destination host fails
+        assert!(telemetry
+            .find_matching_tunnel("inst-1", "env-1", "ep-1", "example.com", 443, baseline)
+            .is_none());
+        // Wrong destination port fails
+        assert!(telemetry
+            .find_matching_tunnel("inst-1", "env-1", "ep-1", "ipwho.is", 80, baseline)
+            .is_none());
+        // Stale timestamp (baseline after event) fails
+        let future = Utc::now() + chrono::Duration::seconds(10);
+        assert!(telemetry
+            .find_matching_tunnel("inst-1", "env-1", "ep-1", "ipwho.is", 443, future)
+            .is_none());
+
+        assert!(telemetry.has_recent_connection_to("ipwho.is", 60));
         assert!(!telemetry.has_recent_connection_to("unknown.domain.org", 60));
-        assert_eq!(telemetry.recent_events(60).len(), 2);
+        assert_eq!(telemetry.recent_events(60).len(), 1);
     }
 }

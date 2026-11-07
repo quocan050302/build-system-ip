@@ -207,7 +207,7 @@ export const NetworkView: React.FC<NetworkViewProps> = ({
         <div>
           <h3 className="text-sm font-semibold text-slate-100">Network Endpoints &amp; Egress Verification</h3>
           <p className="text-xs text-slate-400">
-            Configure authenticated US proxies. Verification states: NOT_CONFIGURED → ENDPOINT_REACHABLE → PROXY_EGRESS_VERIFIED (backend bridge probe, 🔵 blue). BROWSER_EGRESS_VERIFIED (🟢 green, real Edge-origin via CDP — not yet available). STALE means re-verify required.
+            Configure authenticated US proxies. Verification states: NOT_CONFIGURED → ENDPOINT_REACHABLE → PROXY_EGRESS_VERIFIED (backend bridge probe, 🔵 blue) → BROWSER_EGRESS_VERIFIED (🟢 green, real Edge-origin via CDP + correlated proxy tunnel). STALE means re-verify required.
           </p>
         </div>
 
@@ -311,7 +311,7 @@ export const NetworkView: React.FC<NetworkViewProps> = ({
                             env.last_network_status === 'PROXY_EGRESS_VERIFIED'
                               ? 'PROXY_EGRESS_VERIFIED: Rust backend confirmed proxy bridge is working. Does NOT prove Edge itself is routing through it.'
                               : env.last_network_status === 'BROWSER_EGRESS_VERIFIED'
-                              ? 'BROWSER_EGRESS_VERIFIED: Real browser-origin traffic confirmed via CDP. (Not yet available — requires CDP integration.)'
+                              ? 'BROWSER_EGRESS_VERIFIED: Real Edge browser-origin traffic confirmed via CDP and correlated with proxy bridge tunnel.'
                               : env.last_network_status === 'STALE'
                               ? 'Result is older than the staleness threshold. Re-verify to confirm current network state.'
                               : undefined
@@ -381,15 +381,15 @@ export const NetworkView: React.FC<NetworkViewProps> = ({
                     <button
                       onClick={() => handleVerifyBrowserEgress(env.id)}
                       disabled={isVerifyingBrowser || !isRunning}
-                      title={isRunning ? 'Run backend proxy-bridge probe to verify PROXY_EGRESS_VERIFIED. Does not prove browser-origin routing — requires CDP (not yet implemented).' : 'Start browser first to verify egress'}
+                      title={isRunning ? 'Verify Edge browser-origin egress via CDP and correlate with local proxy bridge tunnel.' : 'Start browser first to verify egress'}
                       className={`w-full py-1.5 px-3 rounded-lg text-xs font-semibold transition-all flex items-center justify-center gap-2 border ${
                         isRunning
-                          ? 'bg-blue-950/40 hover:bg-blue-900/60 text-blue-400 border-blue-800/60'
+                          ? 'bg-emerald-950/40 hover:bg-emerald-900/60 text-emerald-400 border-emerald-800/60'
                           : 'bg-surface-850 text-slate-500 border-surface-700 cursor-not-allowed opacity-60'
                       }`}
                     >
                       <ShieldCheck className={`w-3.5 h-3.5 ${isVerifyingBrowser ? 'animate-spin' : ''}`} />
-                      <span>{isVerifyingBrowser ? 'Verifying Proxy Egress...' : '🔵 Verify Proxy Egress (Backend Probe)'}</span>
+                      <span>{isVerifyingBrowser ? 'Verifying Browser Egress...' : '🟢 Verify Browser Egress (CDP + Proxy Route)'}</span>
                     </button>
                   )}
 
@@ -418,7 +418,7 @@ export const NetworkView: React.FC<NetworkViewProps> = ({
           </div>
           <div className="flex items-start gap-2">
             <span className="text-[10px] font-mono px-2 py-0.5 rounded-full border bg-emerald-950/80 text-emerald-300 border-emerald-700/80 shrink-0">🟢 BROWSER VERIFIED</span>
-            <span className="text-slate-400 leading-relaxed">Real browser-origin traffic confirmed via CDP. <strong className="text-slate-300">Not yet available — requires CDP Page.navigate integration.</strong></span>
+            <span className="text-slate-400 leading-relaxed">Real Edge browser-origin traffic confirmed via CDP and correlated with the local proxy bridge tunnel. <strong className="text-slate-300">Proves Edge routed the HTTPS request through the assigned proxy.</strong></span>
           </div>
           <div className="flex items-start gap-2">
             <span className="text-[10px] font-mono px-2 py-0.5 rounded-full border bg-amber-950/60 text-amber-400 border-amber-700/60 shrink-0">🕐 STALE</span>

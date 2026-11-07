@@ -121,6 +121,8 @@ pub struct BrowserVerificationEvidence {
     pub observed_country: Option<String>,
     /// The proxy endpoint ID assigned to this environment.
     pub proxy_endpoint_id: String,
+    /// Unique instance generation UUID of the proxy bridge used.
+    pub bridge_instance_id: Option<String>,
     /// Source of the verification.
     pub verification_source: String,
     /// RFC3339 timestamp.
@@ -150,6 +152,7 @@ impl BrowserVerificationEvidence {
             observed_public_ip: None,
             observed_country: None,
             proxy_endpoint_id: String::new(),
+            bridge_instance_id: None,
             verification_source: "NONE".to_string(),
             verified_at: Utc::now().to_rfc3339(),
             latency_ms: None,
@@ -171,15 +174,152 @@ pub struct BrowserSessionInfo {
     pub profile_path: String,
     pub proxy_bridge_port: Option<u16>,
     pub proxy_endpoint_id: String,
+    /// Unique instance generation UUID of the running proxy bridge.
+    pub bridge_instance_id: Option<String>,
     pub expected_country: Option<String>,
     pub expected_ip: Option<String>,
-    /// Snapshot of recent tunnel events recorded by the proxy bridge telemetry
-    /// in the last 5 minutes.  Populated by the caller from
-    /// `ProxyBridgeManager::recent_tunnel_count`.  Zero when the bridge is not
-    /// available or telemetry has not yet been wired at the call site.
+    /// Snapshot of recent tunnel events recorded by the proxy bridge telemetry.
     pub recent_bridge_connection_count: usize,
     /// Loopback CDP debugging port assigned to this managed Edge instance.
     pub cdp_port: Option<u16>,
+    /// Whether this check is running in simulated/mock test mode.
+    /// In production live verification, `is_simulation` MUST be false,
+    /// requiring globally routable non-documentation public IP addresses.
+    pub is_simulation: bool,
+}
+
+/// Helper to verify whether an OS process ID is currently alive.
+#[cfg(unix)]
+pub fn is_process_alive(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    unsafe { libc::kill(pid as i32, 0) == 0 }
+}
+
+#[cfg(windows)]
+pub fn is_process_alive(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    use windows::Win32::System::Threading::{
+        CloseHandle, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    unsafe {
+        match OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) {
+            Ok(handle) if !handle.is_invalid() => {
+                let _ = CloseHandle(handle);
+                true
+            }
+            _ => false,
+        }
+    }
+}
+
+/// Validates whether an IP address is a globally routable public address.
+///
+/// Rejects private, loopback, link-local, broadcast, multicast, CGNAT,
+/// and RFC documentation test ranges (TEST-NET-1, TEST-NET-2, TEST-NET-3).
+pub fn is_globally_routable_ip(ip_str: &str) -> bool {
+    use std::net::IpAddr;
+    let ip = match ip_str.parse::<IpAddr>() {
+        Ok(ip) => ip,
+        Err(_) => return false,
+    };
+    match ip {
+        IpAddr::V4(ipv4) => {
+            if ipv4.is_unspecified()
+                || ipv4.is_loopback()
+                || ipv4.is_link_local()
+                || ipv4.is_broadcast()
+                || ipv4.is_multicast()
+            {
+                return false;
+            }
+            if ipv4.is_private() {
+                return false;
+            }
+            let oct = ipv4.octets();
+            // 0.0.0.0/8
+            if oct[0] == 0 {
+                return false;
+            }
+            // Documentation TEST-NET-1 (192.0.2.0/24), TEST-NET-2 (198.51.100.0/24), TEST-NET-3 (203.0.113.0/24)
+            if (oct[0] == 192 && oct[1] == 0 && oct[2] == 2)
+                || (oct[0] == 198 && oct[1] == 51 && oct[2] == 100)
+                || (oct[0] == 203 && oct[1] == 0 && oct[2] == 113)
+            {
+                return false;
+            }
+            // Carrier Grade NAT 100.64.0.0/10 (100.64.0.0 - 100.127.255.255)
+            if oct[0] == 100 && (oct[1] >= 64 && oct[1] <= 127) {
+                return false;
+            }
+            // Benchmarking 198.18.0.0/15 (198.18.0.0 - 198.19.255.255)
+            if oct[0] == 198 && (oct[1] == 18 || oct[1] == 19) {
+                return false;
+            }
+            // Reserved 240.0.0.0/4
+            if oct[0] >= 240 {
+                return false;
+            }
+            true
+        }
+        IpAddr::V6(ipv6) => {
+            if ipv6.is_unspecified() || ipv6.is_loopback() || ipv6.is_multicast() {
+                return false;
+            }
+            let segs = ipv6.segments();
+            // Unique local fc00::/7
+            if (segs[0] & 0xfe00) == 0xfc00 {
+                return false;
+            }
+            // Link-local fe80::/10
+            if (segs[0] & 0xffc0) == 0xfe80 {
+                return false;
+            }
+            // Documentation 2001:db8::/32
+            if segs[0] == 0x2001 && segs[1] == 0x0db8 {
+                return false;
+            }
+            true
+        }
+    }
+}
+
+/// Centralized strict verification decision gate.
+///
+/// Invariant: `BROWSER_EGRESS_VERIFIED` must NEVER be returned if any
+/// required verification dimension fails or is unconfirmed.
+pub fn evaluate_verification_decision(
+    evidence: &BrowserVerificationEvidence,
+) -> Result<(), &'static str> {
+    if !evidence.proxy_path_confirmed {
+        return Err("Proxy path not confirmed: request-level correlation to proxy bridge failed");
+    }
+    if let Some(ref ip) = evidence.observed_public_ip {
+        if !is_globally_routable_ip(ip) {
+            return Err("Observed public IP is not a globally routable address");
+        }
+    } else {
+        return Err("Missing observed public IP");
+    }
+    if evidence.observed_country.is_none() {
+        return Err("Missing observed country");
+    }
+    if evidence.browser_pid == 0 {
+        return Err("Invalid browser process ID");
+    }
+    if evidence.verification_source.is_empty()
+        || evidence.verification_source == "NONE"
+        || evidence.verification_source == "SIMULATED_MOCK_CDP"
+    {
+        return Err("Missing, invalid, or simulated verification source");
+    }
+    if evidence.status != VerificationStatus::BrowserEgressVerified.as_str() {
+        return Err("Evidence status is not BROWSER_EGRESS_VERIFIED");
+    }
+    Ok(())
 }
 
 /// Result of a token-based browser verification attempt.
@@ -282,6 +422,7 @@ pub fn attempt_token_browser_verification(
                 observed_public_ip: None,
                 observed_country: None,
                 proxy_endpoint_id: session.proxy_endpoint_id.clone(),
+                bridge_instance_id: session.bridge_instance_id.clone(),
                 verification_source: "TOKEN_LISTENER".to_string(),
                 verified_at: Utc::now().to_rfc3339(),
                 latency_ms: None,
@@ -314,6 +455,7 @@ pub fn attempt_token_browser_verification(
         observed_public_ip: None,
         observed_country: None,
         proxy_endpoint_id: session.proxy_endpoint_id.clone(),
+        bridge_instance_id: session.bridge_instance_id.clone(),
         verification_source: "PROXY_BRIDGE_TELEMETRY".to_string(),
         verified_at: Utc::now().to_rfc3339(),
         latency_ms: None,
@@ -510,6 +652,8 @@ fn fetch_cdp_version(
 pub enum BrowserVerificationError {
     /// Edge was not launched with `--remote-debugging-port` or the port is unreachable.
     CdpNotAvailable(String),
+    /// CDP endpoint violation (e.g. non-loopback address or invalid scheme).
+    CdpSecurityViolation(String),
     /// TCP connection to the CDP endpoint succeeded but the WebSocket handshake failed.
     CdpConnectionFailed(String),
     /// No response arrived within the allowed timeout window.
@@ -526,12 +670,15 @@ pub enum BrowserVerificationError {
     CountryMismatch(String),
     /// IP mismatch or invalid format.
     IpMismatch(String),
+    /// Observed IP is private, documentation, or otherwise not globally routable.
+    IpNotGloballyRoutable(String),
 }
 
 impl std::fmt::Display for BrowserVerificationError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::CdpNotAvailable(s) => write!(f, "CDP not available: {}", s),
+            Self::CdpSecurityViolation(s) => write!(f, "CDP security violation: {}", s),
             Self::CdpConnectionFailed(s) => write!(f, "CDP connection failed: {}", s),
             Self::VerificationTimeout => write!(f, "Browser verification timed out"),
             Self::SessionMismatch => write!(f, "Browser session mismatch"),
@@ -540,6 +687,7 @@ impl std::fmt::Display for BrowserVerificationError {
             Self::ProxyBridgeMismatch(s) => write!(f, "Proxy bridge correlation mismatch: {}", s),
             Self::CountryMismatch(s) => write!(f, "Country mismatch: {}", s),
             Self::IpMismatch(s) => write!(f, "IP mismatch: {}", s),
+            Self::IpNotGloballyRoutable(s) => write!(f, "IP not globally routable: {}", s),
         }
     }
 }
@@ -558,35 +706,70 @@ impl std::error::Error for BrowserVerificationError {}
 pub fn attempt_cdp_browser_verification(
     session: &BrowserSessionInfo,
     debug_port: u16,
+    bridge_mgr: Option<&crate::services::proxy_bridge::ProxyBridgeManager>,
 ) -> Result<BrowserVerificationEvidence, BrowserVerificationError> {
-    if session.pid == 0 {
+    if session.pid == 0 || !is_process_alive(session.pid) {
         return Err(BrowserVerificationError::SessionMismatch);
+    }
+    if debug_port == 0 {
+        return Err(BrowserVerificationError::CdpNotAvailable(
+            "CDP port cannot be 0".to_string(),
+        ));
     }
 
     let connect_timeout = Duration::from_millis(3000);
     let op_timeout = Duration::from_millis(8000);
+    let verification_start = Utc::now();
 
     // 1. Resolve WebSocket debugger URL from CDP HTTP endpoint
-    let ws_url = if let Ok(targets) = fetch_cdp_targets(debug_port, connect_timeout) {
-        targets
-            .iter()
-            .find(|t| t.target_type == "page" && t.websocket_debugger_url.is_some())
-            .or_else(|| targets.iter().find(|t| t.websocket_debugger_url.is_some()))
-            .and_then(|t| t.websocket_debugger_url.clone())
-    } else {
-        None
-    };
+    let targets = fetch_cdp_targets(debug_port, connect_timeout)?;
 
-    let ws_url = match ws_url {
-        Some(u) => u,
-        None => {
-            let ver = fetch_cdp_version(debug_port, connect_timeout)?;
-            ver.websocket_debugger_url.ok_or_else(|| {
-                BrowserVerificationError::CdpNotAvailable(
-                    "No webSocketDebuggerUrl returned by CDP endpoint".to_string(),
-                )
-            })?
+    // Endpoint security check: every target websocketDebuggerUrl must be loopback only
+    for t in &targets {
+        if let Some(ref u) = t.websocket_debugger_url {
+            let parsed_url: url::Url = u.parse().map_err(|e| {
+                BrowserVerificationError::CdpSecurityViolation(format!("Malformed WS URL: {}", e))
+            })?;
+            if parsed_url.scheme() != "ws" {
+                return Err(BrowserVerificationError::CdpSecurityViolation(
+                    "CDP endpoint must use ws:// scheme".to_string(),
+                ));
+            }
+            let host = parsed_url.host_str().unwrap_or("");
+            if host != "127.0.0.1" && host != "localhost" && host != "::1" {
+                return Err(BrowserVerificationError::CdpSecurityViolation(format!(
+                    "CDP endpoint rejected non-loopback host '{}'",
+                    host
+                )));
+            }
         }
+    }
+
+    // Target Selection: Avoid executing in user tabs (TikTok, Instagram, YouTube, Gumroad)
+    let ws_url = if let Some(t) = targets.iter().find(|t| {
+        t.target_type == "page"
+            && t.url.as_deref().unwrap_or("").starts_with("about:blank")
+            && t.websocket_debugger_url.is_some()
+    }) {
+        t.websocket_debugger_url.clone().unwrap()
+    } else if let Some(t) = targets.iter().find(|t| {
+        t.target_type == "page" && t.websocket_debugger_url.is_some() && {
+            let u = t.url.as_deref().unwrap_or("").to_ascii_lowercase();
+            !u.contains("tiktok")
+                && !u.contains("instagram")
+                && !u.contains("youtube")
+                && !u.contains("facebook")
+                && !u.contains("gumroad")
+        }
+    }) {
+        t.websocket_debugger_url.clone().unwrap()
+    } else {
+        let ver = fetch_cdp_version(debug_port, connect_timeout)?;
+        ver.websocket_debugger_url.ok_or_else(|| {
+            BrowserVerificationError::CdpNotAvailable(
+                "No webSocketDebuggerUrl returned by CDP endpoint".to_string(),
+            )
+        })?
     };
 
     // 2. Establish bounded loopback WebSocket connection
@@ -737,7 +920,15 @@ pub fn attempt_cdp_browser_verification(
     // 5. Strict IP validation
     if !crate::services::network_service::NetworkService::is_valid_ip_address(&observed_ip) {
         return Err(BrowserVerificationError::IpMismatch(format!(
-            "Browser returned malformed IP: '{}'",
+            "Browser returned syntactically invalid IP: '{}'",
+            observed_ip
+        )));
+    }
+
+    // DEFECT HIGH-04: Non-routable / documentation IPs must be rejected in live verification
+    if !session.is_simulation && !is_globally_routable_ip(&observed_ip) {
+        return Err(BrowserVerificationError::IpNotGloballyRoutable(format!(
+            "Observed IP '{}' is not globally routable (private, documentation, or local range)",
             observed_ip
         )));
     }
@@ -761,11 +952,38 @@ pub fn attempt_cdp_browser_verification(
         }
     }
 
-    // 7. Verify correlation with proxy bridge telemetry
-    let proxy_path_confirmed = session.recent_bridge_connection_count > 0;
+    // 7. Request-level correlation with proxy bridge telemetry
+    let proxy_path_confirmed =
+        if let (Some(mgr), Some(ref inst_id)) = (bridge_mgr, &session.bridge_instance_id) {
+            mgr.find_matching_tunnel(
+                inst_id,
+                &session.environment_id,
+                &session.proxy_endpoint_id,
+                "ipwho.is",
+                443,
+                verification_start,
+            )
+            .is_some()
+        } else if session.is_simulation {
+            session.recent_bridge_connection_count > 0
+        } else {
+            false
+        };
+
+    // DEFECT HIGH-01: BROWSER_EGRESS_VERIFIED is prohibited unless proxy_path_confirmed is true!
+    if !proxy_path_confirmed {
+        return Err(BrowserVerificationError::ProxyBridgeMismatch(
+            "Proxy tunnel correlation failed: no matching upstream bridge event recorded for this request".to_string(),
+        ));
+    }
 
     let token = Uuid::new_v4().to_string();
     let verification_id = Uuid::new_v4().to_string();
+    let verification_source = if session.is_simulation {
+        "SIMULATED_MOCK_CDP".to_string()
+    } else {
+        "CDP_BROWSER_FETCH".to_string()
+    };
 
     Ok(BrowserVerificationEvidence {
         verification_id,
@@ -779,10 +997,11 @@ pub fn attempt_cdp_browser_verification(
         observed_public_ip: Some(observed_ip.clone()),
         observed_country: Some(observed_country.clone()),
         proxy_endpoint_id: session.proxy_endpoint_id.clone(),
-        verification_source: "CDP_BROWSER_FETCH".to_string(),
+        bridge_instance_id: session.bridge_instance_id.clone(),
+        verification_source,
         verified_at: Utc::now().to_rfc3339(),
         latency_ms: Some(latency_ms),
-        proxy_path_confirmed,
+        proxy_path_confirmed: true,
         status: VerificationStatus::BrowserEgressVerified.as_str().to_string(),
         message: format!(
             "Microsoft Edge session (PID {}) verified via CDP: observed external egress IP {} ({}) matching assigned proxy route.",
@@ -829,19 +1048,21 @@ mod tests {
         let session = BrowserSessionInfo {
             environment_id: "env-test".to_string(),
             session_id: "sess-001".to_string(),
-            pid: 12345,
+            pid: std::process::id(),
             profile_path: "/tmp/test-profile".to_string(),
             proxy_bridge_port: Some(49200),
             proxy_endpoint_id: "ep-001".to_string(),
+            bridge_instance_id: None,
             expected_country: Some("US".to_string()),
             expected_ip: None,
             recent_bridge_connection_count: 0,
             cdp_port: None,
+            is_simulation: true,
         };
         let result = attempt_token_browser_verification(&session);
         assert_eq!(result.status, "VERIFICATION_UNAVAILABLE");
         assert_eq!(result.environment_id, "env-test");
-        assert_eq!(result.browser_pid, 12345);
+        assert_eq!(result.browser_pid, std::process::id());
         assert!(!result.token_received);
         assert!(!result.proxy_path_confirmed);
         assert!(result.message.contains("CDP"));
@@ -849,7 +1070,6 @@ mod tests {
 
     #[test]
     fn test_cdp_unavailable_when_port_closed() {
-        // Ephemeral port that is not listening
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         drop(listener);
@@ -857,17 +1077,19 @@ mod tests {
         let session = BrowserSessionInfo {
             environment_id: "env-test".to_string(),
             session_id: "sess-001".to_string(),
-            pid: 12345,
+            pid: std::process::id(),
             profile_path: "/tmp/test-profile".to_string(),
             proxy_bridge_port: Some(49200),
             proxy_endpoint_id: "ep-001".to_string(),
+            bridge_instance_id: None,
             expected_country: Some("US".to_string()),
             expected_ip: None,
             recent_bridge_connection_count: 1,
             cdp_port: Some(port),
+            is_simulation: true,
         };
 
-        let result = attempt_cdp_browser_verification(&session, port);
+        let result = attempt_cdp_browser_verification(&session, port, None);
         assert!(matches!(
             result,
             Err(BrowserVerificationError::CdpNotAvailable(_))
@@ -883,14 +1105,91 @@ mod tests {
             profile_path: "/tmp/test-profile".to_string(),
             proxy_bridge_port: Some(49200),
             proxy_endpoint_id: "ep-001".to_string(),
+            bridge_instance_id: None,
             expected_country: Some("US".to_string()),
             expected_ip: None,
             recent_bridge_connection_count: 1,
             cdp_port: Some(9222),
+            is_simulation: true,
         };
 
-        let result = attempt_cdp_browser_verification(&session, 9222);
+        let result = attempt_cdp_browser_verification(&session, 9222, None);
         assert_eq!(result, Err(BrowserVerificationError::SessionMismatch));
+    }
+
+    #[test]
+    fn test_cdp_session_mismatch_when_pid_not_alive() {
+        let session = BrowserSessionInfo {
+            environment_id: "env-test".to_string(),
+            session_id: "sess-001".to_string(),
+            pid: 999_999_999,
+            profile_path: "/tmp/test-profile".to_string(),
+            proxy_bridge_port: Some(49200),
+            proxy_endpoint_id: "ep-001".to_string(),
+            bridge_instance_id: None,
+            expected_country: Some("US".to_string()),
+            expected_ip: None,
+            recent_bridge_connection_count: 1,
+            cdp_port: Some(9222),
+            is_simulation: true,
+        };
+
+        let result = attempt_cdp_browser_verification(&session, 9222, None);
+        assert_eq!(result, Err(BrowserVerificationError::SessionMismatch));
+    }
+
+    #[test]
+    fn test_cdp_security_violation_when_non_loopback_ws() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 1024];
+            let n = stream.read(&mut buf).unwrap();
+            let req = String::from_utf8_lossy(&buf[..n]);
+
+            if req.contains("GET /json/list") {
+                let targets = serde_json::json!([{
+                    "id": "target-1",
+                    "type": "page",
+                    "title": "Mock Target",
+                    "url": "about:blank",
+                    "webSocketDebuggerUrl": format!("ws://192.168.1.100:{}/devtools/page/target-1", port)
+                }]);
+                let body = targets.to_string();
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                stream.write_all(resp.as_bytes()).unwrap();
+                stream.flush().unwrap();
+            }
+        });
+
+        std::thread::sleep(Duration::from_millis(50));
+
+        let session = BrowserSessionInfo {
+            environment_id: "env-test".to_string(),
+            session_id: "sess-001".to_string(),
+            pid: std::process::id(),
+            profile_path: "/tmp/test-profile".to_string(),
+            proxy_bridge_port: Some(49200),
+            proxy_endpoint_id: "ep-001".to_string(),
+            bridge_instance_id: None,
+            expected_country: Some("US".to_string()),
+            expected_ip: None,
+            recent_bridge_connection_count: 1,
+            cdp_port: Some(port),
+            is_simulation: true,
+        };
+
+        let err = attempt_cdp_browser_verification(&session, port, None).unwrap_err();
+        assert!(matches!(
+            err,
+            BrowserVerificationError::CdpSecurityViolation(_)
+        ));
     }
 
     #[test]
@@ -898,7 +1197,6 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
 
-        // Spawn mock CDP server
         std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
             let mut buf = [0u8; 1024];
@@ -924,7 +1222,6 @@ mod tests {
                 drop(stream);
             }
 
-            // Accept WebSocket connection
             let (ws_stream, _) = listener.accept().unwrap();
             let mut ws = tungstenite::accept(ws_stream).unwrap();
             let msg = ws.read().unwrap();
@@ -950,30 +1247,31 @@ mod tests {
             }
         });
 
-        // Small pause to ensure thread is listening
         std::thread::sleep(Duration::from_millis(50));
 
         let session = BrowserSessionInfo {
             environment_id: "env-test".to_string(),
             session_id: "sess-001".to_string(),
-            pid: 54321,
+            pid: std::process::id(),
             profile_path: "/tmp/test-profile".to_string(),
             proxy_bridge_port: Some(49200),
             proxy_endpoint_id: "ep-001".to_string(),
+            bridge_instance_id: None,
             expected_country: Some("US".to_string()),
             expected_ip: Some("198.51.100.25".to_string()),
             recent_bridge_connection_count: 3,
             cdp_port: Some(port),
+            is_simulation: true,
         };
 
-        let evidence = attempt_cdp_browser_verification(&session, port).unwrap();
+        let evidence = attempt_cdp_browser_verification(&session, port, None).unwrap();
         assert_eq!(evidence.status, "BROWSER_EGRESS_VERIFIED");
         assert_eq!(
             evidence.observed_public_ip,
             Some("198.51.100.25".to_string())
         );
         assert_eq!(evidence.observed_country, Some("US".to_string()));
-        assert_eq!(evidence.verification_source, "CDP_BROWSER_FETCH");
+        assert_eq!(evidence.verification_source, "SIMULATED_MOCK_CDP");
         assert!(evidence.proxy_path_confirmed);
     }
 
@@ -1037,24 +1335,322 @@ mod tests {
         let session = BrowserSessionInfo {
             environment_id: "env-test".to_string(),
             session_id: "sess-001".to_string(),
-            pid: 54321,
+            pid: std::process::id(),
             profile_path: "/tmp/test-profile".to_string(),
             proxy_bridge_port: Some(49200),
             proxy_endpoint_id: "ep-001".to_string(),
+            bridge_instance_id: None,
             expected_country: Some("US".to_string()),
             expected_ip: None,
             recent_bridge_connection_count: 1,
             cdp_port: Some(port),
+            is_simulation: true,
         };
 
-        let err = attempt_cdp_browser_verification(&session, port).unwrap_err();
+        let err = attempt_cdp_browser_verification(&session, port, None).unwrap_err();
         assert!(matches!(err, BrowserVerificationError::CountryMismatch(_)));
+    }
+
+    #[test]
+    fn test_cdp_fails_when_no_bridge_tunnel_event() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 1024];
+            let n = stream.read(&mut buf).unwrap();
+            let req = String::from_utf8_lossy(&buf[..n]);
+
+            if req.contains("GET /json/list") {
+                let targets = serde_json::json!([{
+                    "id": "target-1",
+                    "type": "page",
+                    "title": "Mock Target",
+                    "url": "about:blank",
+                    "webSocketDebuggerUrl": format!("ws://127.0.0.1:{}/devtools/page/target-1", port)
+                }]);
+                let body = targets.to_string();
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                stream.write_all(resp.as_bytes()).unwrap();
+                stream.flush().unwrap();
+                drop(stream);
+            }
+
+            let (ws_stream, _) = listener.accept().unwrap();
+            let mut ws = tungstenite::accept(ws_stream).unwrap();
+            let msg = ws.read().unwrap();
+            if let tungstenite::Message::Text(txt) = msg {
+                let v: serde_json::Value = serde_json::from_str(&txt).unwrap();
+                let id = v.get("id").unwrap().as_i64().unwrap();
+                let resp_payload = serde_json::json!({
+                    "id": id,
+                    "result": {
+                        "result": {
+                            "type": "string",
+                            "value": serde_json::json!({
+                                "ip": "64.233.160.1",
+                                "country_code": "US",
+                                "country": "United States",
+                                "success": true
+                            }).to_string()
+                        }
+                    }
+                });
+                ws.send(tungstenite::Message::Text(resp_payload.to_string().into()))
+                    .unwrap();
+            }
+        });
+
+        std::thread::sleep(Duration::from_millis(50));
+
+        // recent_bridge_connection_count == 0 -> must NEVER pass as BROWSER_EGRESS_VERIFIED
+        let session = BrowserSessionInfo {
+            environment_id: "env-test".to_string(),
+            session_id: "sess-001".to_string(),
+            pid: std::process::id(),
+            profile_path: "/tmp/test-profile".to_string(),
+            proxy_bridge_port: Some(49200),
+            proxy_endpoint_id: "ep-001".to_string(),
+            bridge_instance_id: None,
+            expected_country: Some("US".to_string()),
+            expected_ip: Some("64.233.160.1".to_string()),
+            recent_bridge_connection_count: 0,
+            cdp_port: Some(port),
+            is_simulation: true,
+        };
+
+        let err = attempt_cdp_browser_verification(&session, port, None).unwrap_err();
+        assert!(matches!(
+            err,
+            BrowserVerificationError::ProxyBridgeMismatch(_)
+        ));
+    }
+
+    #[test]
+    fn test_cdp_fails_when_country_unknown_and_expected_set() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 1024];
+            let n = stream.read(&mut buf).unwrap();
+            let req = String::from_utf8_lossy(&buf[..n]);
+
+            if req.contains("GET /json/list") {
+                let targets = serde_json::json!([{
+                    "id": "target-1",
+                    "type": "page",
+                    "title": "Mock Target",
+                    "url": "about:blank",
+                    "webSocketDebuggerUrl": format!("ws://127.0.0.1:{}/devtools/page/target-1", port)
+                }]);
+                let body = targets.to_string();
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                stream.write_all(resp.as_bytes()).unwrap();
+                stream.flush().unwrap();
+                drop(stream);
+            }
+
+            let (ws_stream, _) = listener.accept().unwrap();
+            let mut ws = tungstenite::accept(ws_stream).unwrap();
+            let msg = ws.read().unwrap();
+            if let tungstenite::Message::Text(txt) = msg {
+                let v: serde_json::Value = serde_json::from_str(&txt).unwrap();
+                let id = v.get("id").unwrap().as_i64().unwrap();
+                let resp_payload = serde_json::json!({
+                    "id": id,
+                    "result": {
+                        "result": {
+                            "type": "string",
+                            "value": serde_json::json!({
+                                "ip": "64.233.160.1",
+                                "country_code": "UNKNOWN",
+                                "country": "Unknown",
+                                "success": true
+                            }).to_string()
+                        }
+                    }
+                });
+                ws.send(tungstenite::Message::Text(resp_payload.to_string().into()))
+                    .unwrap();
+            }
+        });
+
+        std::thread::sleep(Duration::from_millis(50));
+
+        let session = BrowserSessionInfo {
+            environment_id: "env-test".to_string(),
+            session_id: "sess-001".to_string(),
+            pid: std::process::id(),
+            profile_path: "/tmp/test-profile".to_string(),
+            proxy_bridge_port: Some(49200),
+            proxy_endpoint_id: "ep-001".to_string(),
+            bridge_instance_id: None,
+            expected_country: Some("US".to_string()),
+            expected_ip: None,
+            recent_bridge_connection_count: 1,
+            cdp_port: Some(port),
+            is_simulation: true,
+        };
+
+        let err = attempt_cdp_browser_verification(&session, port, None).unwrap_err();
+        assert!(matches!(err, BrowserVerificationError::CountryMismatch(_)));
+    }
+
+    #[test]
+    fn test_live_verification_rejects_documentation_ip() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 1024];
+            let n = stream.read(&mut buf).unwrap();
+            let req = String::from_utf8_lossy(&buf[..n]);
+
+            if req.contains("GET /json/list") {
+                let targets = serde_json::json!([{
+                    "id": "target-1",
+                    "type": "page",
+                    "title": "Mock Target",
+                    "url": "about:blank",
+                    "webSocketDebuggerUrl": format!("ws://127.0.0.1:{}/devtools/page/target-1", port)
+                }]);
+                let body = targets.to_string();
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                stream.write_all(resp.as_bytes()).unwrap();
+                stream.flush().unwrap();
+                drop(stream);
+            }
+
+            let (ws_stream, _) = listener.accept().unwrap();
+            let mut ws = tungstenite::accept(ws_stream).unwrap();
+            let msg = ws.read().unwrap();
+            if let tungstenite::Message::Text(txt) = msg {
+                let v: serde_json::Value = serde_json::from_str(&txt).unwrap();
+                let id = v.get("id").unwrap().as_i64().unwrap();
+                let resp_payload = serde_json::json!({
+                    "id": id,
+                    "result": {
+                        "result": {
+                            "type": "string",
+                            "value": serde_json::json!({
+                                "ip": "198.51.100.25",
+                                "country_code": "US",
+                                "country": "United States",
+                                "success": true
+                            }).to_string()
+                        }
+                    }
+                });
+                ws.send(tungstenite::Message::Text(resp_payload.to_string().into()))
+                    .unwrap();
+            }
+        });
+
+        std::thread::sleep(Duration::from_millis(50));
+
+        // is_simulation == false -> live mode MUST reject RFC 5737 documentation IP 198.51.100.25
+        let session = BrowserSessionInfo {
+            environment_id: "env-test".to_string(),
+            session_id: "sess-001".to_string(),
+            pid: std::process::id(),
+            profile_path: "/tmp/test-profile".to_string(),
+            proxy_bridge_port: Some(49200),
+            proxy_endpoint_id: "ep-001".to_string(),
+            bridge_instance_id: None,
+            expected_country: Some("US".to_string()),
+            expected_ip: None,
+            recent_bridge_connection_count: 1,
+            cdp_port: Some(port),
+            is_simulation: false,
+        };
+
+        let err = attempt_cdp_browser_verification(&session, port, None).unwrap_err();
+        assert!(matches!(
+            err,
+            BrowserVerificationError::IpNotGloballyRoutable(_)
+        ));
+    }
+
+    #[test]
+    fn test_globally_routable_ip_classification() {
+        assert!(!is_globally_routable_ip("127.0.0.1"));
+        assert!(!is_globally_routable_ip("10.0.0.1"));
+        assert!(!is_globally_routable_ip("172.16.0.1"));
+        assert!(!is_globally_routable_ip("192.168.1.1"));
+        assert!(!is_globally_routable_ip("169.254.1.1"));
+        assert!(!is_globally_routable_ip("192.0.2.1"));
+        assert!(!is_globally_routable_ip("198.51.100.25"));
+        assert!(!is_globally_routable_ip("203.0.113.10"));
+        assert!(!is_globally_routable_ip("100.64.0.1"));
+        assert!(!is_globally_routable_ip("::1"));
+        assert!(!is_globally_routable_ip("2001:db8::1"));
+        assert!(!is_globally_routable_ip("fe80::1"));
+
+        // Real globally routable public IPs
+        assert!(is_globally_routable_ip("8.8.8.8"));
+        assert!(is_globally_routable_ip("1.1.1.1"));
+        assert!(is_globally_routable_ip("64.233.160.1"));
+        assert!(is_globally_routable_ip("2606:4700:4700::1111"));
+    }
+
+    #[test]
+    fn test_evaluate_verification_decision_enforces_invariants() {
+        let mut ev = BrowserVerificationEvidence {
+            verification_id: "v-1".to_string(),
+            environment_id: "env-1".to_string(),
+            browser_session_id: "s-1".to_string(),
+            browser_pid: std::process::id(),
+            profile_path: "/tmp/p".to_string(),
+            verification_token: "tok".to_string(),
+            verification_url: "https://ipwho.is/".to_string(),
+            token_received: true,
+            observed_public_ip: Some("64.233.160.1".to_string()),
+            observed_country: Some("US".to_string()),
+            proxy_endpoint_id: "ep-1".to_string(),
+            bridge_instance_id: Some("br-1".to_string()),
+            verification_source: "CDP_BROWSER_FETCH".to_string(),
+            verified_at: Utc::now().to_rfc3339(),
+            latency_ms: Some(120),
+            proxy_path_confirmed: true,
+            status: "BROWSER_EGRESS_VERIFIED".to_string(),
+            message: "ok".to_string(),
+        };
+        assert!(evaluate_verification_decision(&ev).is_ok());
+
+        // proxy_path_confirmed == false must NEVER pass
+        ev.proxy_path_confirmed = false;
+        assert!(evaluate_verification_decision(&ev).is_err());
+
+        // SIMULATED_MOCK_CDP must NEVER pass live evaluate_verification_decision
+        ev.proxy_path_confirmed = true;
+        ev.verification_source = "SIMULATED_MOCK_CDP".to_string();
+        assert!(evaluate_verification_decision(&ev).is_err());
+
+        // Documentation IP must NEVER pass live evaluate_verification_decision
+        ev.verification_source = "CDP_BROWSER_FETCH".to_string();
+        ev.observed_public_ip = Some("198.51.100.25".to_string());
+        assert!(evaluate_verification_decision(&ev).is_err());
     }
 
     #[test]
     fn test_browser_verification_evidence_unavailable_clears_sensitive_fields() {
         let ev = BrowserVerificationEvidence::unavailable("env-999", "No browser");
-        // No real credentials or IP data should be present
         assert!(ev.observed_public_ip.is_none());
         assert!(ev.observed_country.is_none());
         assert!(!ev.proxy_path_confirmed);
