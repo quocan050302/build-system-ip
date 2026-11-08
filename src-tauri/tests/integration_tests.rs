@@ -927,18 +927,77 @@ fn test_v8_real_edge_headless_cdp_target_lifecycle_ownership_and_fail_closed_bri
         let temp_dir = tempfile::tempdir().expect("create temp profile dir");
         let profile_path = temp_dir.path().to_path_buf();
 
-        // 1. Start a real local proxy bridge pointing to an unreachable upstream (127.0.0.1:1)
+        // Bind a controllable mock upstream proxy listener on 127.0.0.1:0:
+        // - For `CONNECT api.ipify.org:443` (Step 8 fail-closed check), it immediately closes without replying,
+        //   forcing the local proxy bridge to fail closed with HTTP 502 Bad Gateway.
+        // - For `CONNECT ipwho.is:443` (Step 10 correlation check), it verifies `Proxy-Authorization: Basic `,
+        //   replies `HTTP/1.1 200 Connection Established`, and reads Edge's TLS ClientHello bytes (> 0).
+        let upstream_listener =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("bind mock upstream proxy");
+        let upstream_port = upstream_listener.local_addr().unwrap().port();
+        let upstream_handle = std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            upstream_listener.set_nonblocking(true).ok();
+            let accept_deadline = Instant::now() + Duration::from_secs(25);
+            let mut last_connect_req = String::new();
+            while Instant::now() < accept_deadline {
+                match upstream_listener.accept() {
+                    Ok((mut stream, _)) => {
+                        stream.set_nonblocking(false).ok();
+                        stream
+                            .set_read_timeout(Some(Duration::from_millis(2500)))
+                            .ok();
+                        let mut buf = [0u8; 4096];
+                        let n = stream.read(&mut buf).unwrap_or(0);
+                        let req_str = String::from_utf8_lossy(&buf[..n]).to_string();
+                        if req_str.starts_with("CONNECT ipwho.is:443")
+                            && req_str.contains("Proxy-Authorization: Basic ")
+                        {
+                            last_connect_req = req_str.clone();
+                            let _ =
+                                stream.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n");
+                            let _ = stream.flush();
+                            // Read Edge's TLS ClientHello bytes so relay_bidirectional tracks bytes_transferred > 0
+                            let mut tls_buf = [0u8; 1024];
+                            if let Ok(tls_n) = stream.read(&mut tls_buf) {
+                                if tls_n > 0 {
+                                    // Give relay_bidirectional 80ms to record telemetry.add_bytes before closing upstream
+                                    std::thread::sleep(Duration::from_millis(80));
+                                    let _ = stream.shutdown(std::net::Shutdown::Both);
+                                    return (req_str, tls_n);
+                                }
+                            }
+                        } else if req_str.starts_with("CONNECT api.ipify.org:443") {
+                            // Step 8 fail-closed check: drop upstream immediately without HTTP response
+                            let _ = stream.shutdown(std::net::Shutdown::Both);
+                        } else {
+                            // Background Edge telemetry request (e.g. edge.microsoft.com); close and keep waiting
+                            let _ = stream.write_all(
+                                b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                            );
+                        }
+                    }
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(20));
+                    }
+                    Err(_) => break,
+                }
+            }
+            (last_connect_req, 0)
+        });
+
+        // 1. Start a real local proxy bridge pointing to our controllable upstream proxy
         let bridge_mgr = ProxyBridgeManager::new();
         let bridge_status = bridge_mgr
             .start_or_replace_bridge(UpstreamProxyConfig {
                 environment_id: "env-real-edge-v8".to_string(),
                 endpoint_id: "ep-us-test".to_string(),
                 host: "127.0.0.1".to_string(),
-                port: 1,
+                port: upstream_port,
                 protocol: "HTTP".to_string(),
-                username: Some("test_user".to_string()),
-                password: Some("test_secret_not_logged".to_string()),
-                connect_timeout: Duration::from_millis(500),
+                username: Some("j2_user".to_string()),
+                password: Some("j2_pass_secret".to_string()),
+                connect_timeout: Duration::from_millis(1500),
             })
             .expect("start local proxy bridge");
         let bridge_port = bridge_status.local_port;
@@ -951,6 +1010,7 @@ fn test_v8_real_edge_headless_cdp_target_lifecycle_ownership_and_fail_closed_bri
             .arg(format!("--user-data-dir={}", profile_path.display()))
             .arg("--no-first-run")
             .arg("--no-default-browser-check")
+            .arg("--disable-background-networking")
             .arg("--remote-debugging-port=0")
             .arg("--remote-debugging-address=127.0.0.1")
             .arg(format!("--proxy-server=http://127.0.0.1:{}", bridge_port))
@@ -973,19 +1033,23 @@ fn test_v8_real_edge_headless_cdp_target_lifecycle_ownership_and_fail_closed_bri
         let guard = EdgeGuard { child };
         let edge_pid = guard.child.id();
 
-        // 3. Wait for DevToolsActivePort to be written by real Edge
-        let deadline = Instant::now() + Duration::from_secs(8);
+        // 3. Wait for DevToolsActivePort to be written AND CDP /json/version to respond
+        let deadline = Instant::now() + Duration::from_secs(20);
         let mut cdp_port_opt = None;
         while Instant::now() < deadline {
             if let Some((port, _ws_path)) =
                 SystemBrowserLauncher::parse_devtools_active_port(&profile_path)
             {
-                cdp_port_opt = Some(port);
-                break;
+                if cdp_http_request(port, "GET", "/json/version", Duration::from_millis(800))
+                    .is_ok()
+                {
+                    cdp_port_opt = Some(port);
+                    break;
+                }
             }
             std::thread::sleep(Duration::from_millis(50));
         }
-        let cdp_port = cdp_port_opt.expect("real Edge must write DevToolsActivePort");
+        let cdp_port = cdp_port_opt.expect("real Edge must write DevToolsActivePort and listen");
 
         // 4. Verify real Edge CDP ownership check passes with matching session + profile + bridge
         let session = BrowserSessionInfo {
@@ -1053,14 +1117,14 @@ fn test_v8_real_edge_headless_cdp_target_lifecycle_ownership_and_fail_closed_bri
             .expect("target must include webSocketDebuggerUrl");
         assert!(target_ws_url.starts_with(&format!("ws://127.0.0.1:{}/devtools/page/", cdp_port)));
 
-        // 8. Verify fail-closed proxy behavior: navigating the real Edge target when upstream proxy is dead
-        //    must hit the local proxy bridge (recording an HTTP_CONNECT event that fails closed) and fail navigation.
+        // 8. Verify fail-closed proxy behavior: navigating to api.ipify.org when upstream closes
+        //    must fail closed through the proxy bridge and never leak direct.
         let nav_res = navigate_cdp_target_and_read_body(
             &target_ws_url,
             cdp_port,
             &FALLBACK_VERIFICATION_PROVIDER,
-            Duration::from_millis(1500),
-            Duration::from_millis(3500),
+            Duration::from_millis(2000),
+            Duration::from_millis(4000),
             false,
         );
         assert!(
@@ -1070,7 +1134,7 @@ fn test_v8_real_edge_headless_cdp_target_lifecycle_ownership_and_fail_closed_bri
 
         // 9. Verify target cleanup via GET /json/close/{id} removes the target from /json/list
         close_cdp_target(cdp_port, &target.id, Duration::from_millis(2000));
-        let close_deadline = Instant::now() + Duration::from_millis(1500);
+        let close_deadline = Instant::now() + Duration::from_millis(2000);
         let mut target_removed = false;
         while Instant::now() < close_deadline {
             let list_resp =
@@ -1088,133 +1152,26 @@ fn test_v8_real_edge_headless_cdp_target_lifecycle_ownership_and_fail_closed_bri
             target.id
         );
 
-        bridge_mgr.stop_bridge("env-real-edge-v8");
-
-        // 10. Also verify real Edge HTTP_CONNECT tunnel correlation with bytes_transferred > 0
-        //     against an authenticated mock upstream proxy!
-        let upstream_listener =
-            std::net::TcpListener::bind("127.0.0.1:0").expect("bind mock upstream proxy");
-        let upstream_port = upstream_listener.local_addr().unwrap().port();
-        let upstream_handle = std::thread::spawn(move || {
-            use std::io::{Read, Write};
-            upstream_listener.set_nonblocking(true).ok();
-            let accept_deadline = Instant::now() + Duration::from_secs(7);
-            let mut last_connect_req = String::new();
-            while Instant::now() < accept_deadline {
-                match upstream_listener.accept() {
-                    Ok((mut stream, _)) => {
-                        stream.set_nonblocking(false).ok();
-                        stream
-                            .set_read_timeout(Some(Duration::from_millis(2000)))
-                            .ok();
-                        let mut buf = [0u8; 4096];
-                        let n = stream.read(&mut buf).unwrap_or(0);
-                        let req_str = String::from_utf8_lossy(&buf[..n]).to_string();
-                        if req_str.starts_with("CONNECT ipwho.is:443")
-                            && req_str.contains("Proxy-Authorization: Basic ")
-                        {
-                            last_connect_req = req_str.clone();
-                            let _ =
-                                stream.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n");
-                            let _ = stream.flush();
-                            // Read Edge's TLS ClientHello bytes so relay_bidirectional tracks bytes_transferred > 0
-                            let mut tls_buf = [0u8; 1024];
-                            match stream.read(&mut tls_buf) {
-                                Ok(tls_n) if tls_n > 0 => {
-                                    // Give relay_bidirectional 50ms to record telemetry.add_bytes before closing upstream
-                                    std::thread::sleep(Duration::from_millis(50));
-                                    let _ = stream.shutdown(std::net::Shutdown::Both);
-                                    return (req_str, tls_n);
-                                }
-                                other => {
-                                    eprintln!(
-                                        " CONNECT ipwho.is:443 tls read returned: {:?}",
-                                        other
-                                    );
-                                }
-                            }
-                        } else {
-                            // Background Edge telemetry request (e.g. edge.microsoft.com); close and keep waiting for ipwho.is
-                            let _ = stream.write_all(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
-                        }
-                    }
-                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                        std::thread::sleep(Duration::from_millis(20));
-                    }
-                    Err(_) => break,
-                }
-            }
-            (last_connect_req, 0)
-        });
-
-        let bridge_status_ok = bridge_mgr
-            .start_or_replace_bridge(UpstreamProxyConfig {
-                environment_id: "env-real-edge-v8".to_string(),
-                endpoint_id: "ep-us-auth".to_string(),
-                host: "127.0.0.1".to_string(),
-                port: upstream_port,
-                protocol: "HTTP".to_string(),
-                username: Some("j2_user".to_string()),
-                password: Some("j2_pass_secret".to_string()),
-                connect_timeout: Duration::from_millis(1500),
-            })
-            .expect("start local bridge for authenticated upstream");
-
-        // Rebind Edge or spawn a short-lived headless Edge bound to bridge_status_ok.local_port
-        drop(guard);
-        let temp_dir2 = tempfile::tempdir().expect("create temp profile dir 2");
-        let profile_path2 = temp_dir2.path().to_path_buf();
-        let child2 = Command::new(edge_bin)
-            .arg("--headless=new")
-            .arg("--disable-gpu")
-            .arg(format!("--user-data-dir={}", profile_path2.display()))
-            .arg("--no-first-run")
-            .arg("--no-default-browser-check")
-            .arg("--remote-debugging-port=0")
-            .arg("--remote-debugging-address=127.0.0.1")
-            .arg(format!(
-                "--proxy-server=http://127.0.0.1:{}",
-                bridge_status_ok.local_port
-            ))
-            .arg("--proxy-bypass-list=<-loopback>")
-            .arg("about:blank")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn headless Edge 2");
-        let _guard2 = EdgeGuard { child: child2 };
-
-        let deadline2 = Instant::now() + Duration::from_secs(8);
-        let mut cdp_port2_opt = None;
-        while Instant::now() < deadline2 {
-            if let Some((port, _)) =
-                SystemBrowserLauncher::parse_devtools_active_port(&profile_path2)
-            {
-                cdp_port2_opt = Some(port);
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        }
-        let cdp_port2 = cdp_port2_opt.expect("Edge 2 DevToolsActivePort");
-
-        let target2 = create_cdp_blank_target_full(cdp_port2, Duration::from_millis(2000))
-            .expect("PUT /json/new on Edge 2");
+        // 10. Verify real Edge HTTP_CONNECT tunnel correlation with bytes_transferred > 0
+        //     using a fresh dedicated target on the same running Edge session!
+        let target2 = create_cdp_blank_target_full(cdp_port, Duration::from_millis(2000))
+            .expect("PUT /json/new for CONNECT correlation test");
         let ws2 = target2.websocket_debugger_url.unwrap();
 
-        let window_start = chrono::Utc::now() - chrono::Duration::milliseconds(250);
+        let window_start = chrono::Utc::now() - chrono::Duration::seconds(1);
         // Navigate to https://ipwho.is/ — Edge sends CONNECT ipwho.is:443 + TLS ClientHello through bridge
         let _ = navigate_cdp_target_and_read_body(
             &ws2,
-            cdp_port2,
+            cdp_port,
             &youtube_isolation_manager_lib::services::browser_verification::PRIMARY_VERIFICATION_PROVIDER,
-            Duration::from_millis(1500),
-            Duration::from_millis(2500),
+            Duration::from_millis(2000),
+            Duration::from_millis(3000),
             false,
         );
-        let window_end = chrono::Utc::now() + chrono::Duration::milliseconds(250);
-        close_cdp_target(cdp_port2, &target2.id, Duration::from_millis(2000));
+        close_cdp_target(cdp_port, &target2.id, Duration::from_millis(2000));
 
         let (upstream_req, tls_bytes) = upstream_handle.join().unwrap();
+        let window_end = chrono::Utc::now() + chrono::Duration::seconds(1);
         assert!(
             upstream_req.starts_with("CONNECT ipwho.is:443"),
             "Upstream proxy must receive CONNECT ipwho.is:443 from local bridge, got: {}",
@@ -1235,7 +1192,7 @@ fn test_v8_real_edge_headless_cdp_target_lifecycle_ownership_and_fail_closed_bri
                 .as_deref()
                 .unwrap(),
             "env-real-edge-v8",
-            "ep-us-auth",
+            "ep-us-test",
             "ipwho.is",
             443,
             window_start,
