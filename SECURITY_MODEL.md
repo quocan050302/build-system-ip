@@ -107,7 +107,7 @@ The system uses a strict status hierarchy to avoid false PASS:
 | `ENDPOINT_CONFIGURED` | Proxy config saved to DB | — |
 | `ENDPOINT_REACHABLE` | TCP handshake succeeded | TCP connect to proxy host:port |
 | `PROXY_EGRESS_VERIFIED` | Backend Rust probe through bridge returned valid US IP | ipwho.is response via 127.0.0.1:bridge_port |
-| `BROWSER_EGRESS_VERIFIED` | Real Edge-origin request verified | **NOT IMPLEMENTED** — requires CDP/DevTools |
+| `BROWSER_EGRESS_VERIFIED` | Real Edge-origin request via CDP confirmed US exit IP, proxy route confirmed | CDP `Runtime.evaluate(fetch("https://ipwho.is/"))` → IP/country + `find_matching_tunnel` correlation |
 | `VERIFICATION_UNAVAILABLE` | Cannot verify (browser not running, no bridge) | — |
 | `AUTH_FAILED` | Proxy credentials rejected (HTTP 407) | — |
 | `CONNECTION_FAILED` | Network path failed or country mismatch | — |
@@ -137,12 +137,12 @@ If `expected_country` is configured (e.g., "US"):
 - Country mismatch (e.g., VN) → `CONNECTION_FAILED`
 - Matching country (US) + all other checks pass → `PROXY_EGRESS_VERIFIED`
 
-### Known Gaps (Planned)
+### Known Gaps (Remaining)
 
-1. **IPv6 verification**: Not independently verified; recommend disabling IPv6 at system level or verifying via CDP
-2. **WebRTC runtime verification**: Flag applied but not confirmed effective at runtime
-3. **True browser-origin verification**: Requires CDP integration with restricted access (future work)
-4. **Bridge port visibility**: Any local process can connect to the dynamic port if discovered; consider token-based access control
+1. **IPv6 bypass risk**: Edge may use IPv6 if the system has it; traffic would bypass the IPv4-only proxy bridge. Recommend disabling IPv6 at UTM VM network level, or adding `--disable-ipv6` to Edge launch args.
+2. **WebRTC runtime verification**: `--force-webrtc-ip-handling-policy=disable_non_proxied_udp` is applied at launch but not confirmed effective at runtime. Full verification requires injecting JavaScript via CDP to test `RTCPeerConnection`.
+3. **HTTPS CONNECT tunnel opacity**: HTTP CONNECT establishes an encrypted tunnel; the bridge can confirm the tunnel's upstream host and timestamp but cannot inspect individual encrypted requests inside it. Correlation in `find_matching_tunnel` relies on IP/timestamp heuristics.
+4. **Bridge port visibility**: Any local process can connect to the dynamic port if discovered. Consider token-based access control for the bridge in a future hardening pass.
 
 ---
 
@@ -192,7 +192,7 @@ If `expected_country` is configured (e.g., "US"):
 | DNS routing through proxy | ⚠️ ASSUMED | CONNECT/SOCKS5 semantics; not packet-verified |
 | IPv6 bypass prevention | ❌ NOT MITIGATED | No IPv6 disable; bridge is IPv4-only |
 | WebRTC non-proxied UDP disable | ⚠️ POLICY SET | Flag applied at launch; runtime not verified |
-| Browser-origin verification | ❌ NOT IMPLEMENTED | CDP integration pending |
+| Browser-origin verification | ✅ IMPLEMENTED (live test pending) | CDP `Runtime.evaluate` fetch → IP/country; `find_matching_tunnel` timestamp correlation |
 
 ## 8. Legitimate Use Boundaries
 

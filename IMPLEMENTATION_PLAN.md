@@ -88,37 +88,51 @@ On Windows x64 (`x86_64-pc-windows-msvc`):
 
 ## Phase 6 — Proxy Verification Hardening (fix/macos-edge-us-proxy-verification-v2)
 
-### Status: IN PROGRESS
+### Status: ENGINEERING_READY_LIVE_VERIFICATION_PENDING (V7)
 
-### Changes delivered
+### Changes delivered (cumulative V1–V7)
 
 #### Defect fixes
-1. **FALSE BROWSER_EGRESS_VERIFIED** — `verify_browser_egress()` now returns `PROXY_EGRESS_VERIFIED` for backend bridge probes. `BROWSER_EGRESS_VERIFIED` is reserved for CDP-verified browser-origin evidence.
+1. **FALSE BROWSER_EGRESS_VERIFIED** — `verify_browser_egress()` now returns `PROXY_EGRESS_VERIFIED` for backend bridge probes. `BROWSER_EGRESS_VERIFIED` requires all four: managed Edge PID alive, CDP succeeded, globally-routable public IP observed, and proxy route confirmed.
 2. **UNKNOWN country false pass** — `UNKNOWN` and empty geolocation results now fail when `expected_country` is set.
-3. **IP address validation** — `expected_ip` and observed IP are now validated with proper `std::net` parsers.
+3. **IP address validation** — `expected_ip` and observed IP validated with `std::net` parsers; RFC5737, private, loopback, link-local, CGNAT ranges all rejected.
+4. **Windows E0432** — `Win32_System_Threading` Cargo feature added; `CloseHandle` import corrected to `Win32::Foundation`.
+5. **Mock CDP false pass** — `evaluate_verification_decision()` rejects any result with `verification_source == "SIMULATED_MOCK_CDP"`.
 
-#### New architecture
-- `src-tauri/src/services/browser_verification.rs` — CDP browser verification skeleton with `BrowserVerificationEvidence`, `VerificationStatus` enum, and token-based verification infrastructure.
-- `NetworkProtectionStatus` — structured DNS/IPv6/WebRTC status reporting.
-- `is_verification_stale()` — detects and marks cached verification results older than a configured threshold.
+#### CDP browser-origin verification (implemented in V5–V7)
+- `attempt_cdp_browser_verification` — connects to Edge's CDP debug port, creates a **dedicated blank target** (`/json/new?about:blank`), injects a `fetch("https://ipwho.is/")` via `Runtime.evaluate`, parses the JSON response for `ip` and `country`, cleans up the target on all exit paths.
+- Dedicated blank target prevents CDP commands from contaminating social-media tab state.
+- `create_cdp_blank_target` / `close_cdp_target` — explicit lifecycle management with best-effort cleanup.
+- `BrowserSessionInfo` carries `bridge_instance_id` and `is_simulation` flags; `is_simulation: true` permanently blocks `BROWSER_EGRESS_VERIFIED`.
+- `find_matching_tunnel` — correlates the CDP-observed egress IP against active proxy-bridge tunnel records within a ±60-second time window; confirms the browser request transited the managed proxy.
+
+#### Proxy bridge telemetry (V4–V6)
+- `BridgeTunnelOutcome` / `BridgeConnectionEvent` — full telemetry: upstream host, port, timestamp, bytes, latency, outcome.
+- `get_instance_id()` — UUID per bridge process lifetime; stale verification invalidated on restart.
+- Fail-closed: proxy failure returns error; no silent direct-network fallback.
+
+#### Network protection status
+- `NetworkProtectionStatus` — structured DNS/IPv6/WebRTC status reporting to UI.
+- `is_verification_stale()` — cached results older than the configured threshold are automatically marked stale.
 
 #### CI improvements
-- `macos-14` → `macos-15` for more reliable ARM64 runner availability.
+- `macos-14` → `macos-15` for reliable ARM64 runner.
 - Feature branch triggers added (`fix/**`, `feature/**`).
-- Architecture verification step added to macOS jobs.
+- Architecture verification step in macOS jobs.
 - Bounded timeouts on all jobs.
+- 50 Rust tests (21 unit + 29 integration), 5 npm tests — all pass.
 
 ### Known remaining gaps
 
 | Gap | Severity | Recommended action |
 |---|---|---|
-| CDP browser-origin verification | HIGH | Implement WebSocket client for Chrome DevTools Protocol |
-| IPv6 bypass possible | HIGH | Add `--disable-ipv6` to Edge args or disable at VM network level |
-| WebRTC runtime not verified | MEDIUM | Use CDP to inject WebRTC test and verify behavior |
-| DNS routing not packet-verified | MEDIUM | Add network packet inspection or DNS query logging |
-| macOS ARM64 live Edge+Proxy test | HIGH | Manual test with real credentials required |
+| HTTPS CONNECT tunnel opacity | MEDIUM | HTTP CONNECT bridge cannot correlate individual encrypted requests inside the tunnel; correlation relies on IP/timestamp heuristics |
+| IPv6 bypass possible | HIGH | Add `--disable-ipv6` to Edge launch args or disable at VM network level |
+| WebRTC runtime not verified | MEDIUM | Use CDP `Page.addScriptToEvaluateOnNewDocument` to inject WebRTC peer test |
+| DNS routing not packet-verified | MEDIUM | Add network packet inspection or DNS query logging at proxy bridge |
+| macOS ARM64 live Edge+Proxy test | HIGH | Manual test with real Edge + real J2Proxy credentials required |
 
 ### Production readiness
 `ENGINEERING_READY_LIVE_VERIFICATION_PENDING`
 
-Real Microsoft Edge + real J2Proxy credentials + macOS ARM64 hardware test required before `READY_FOR_PRODUCTION`.
+All CI jobs must be GREEN on the final commit SHA. Real Microsoft Edge + real J2Proxy credentials + macOS ARM64 hardware acceptance test required before `READY_FOR_PRODUCTION`.
