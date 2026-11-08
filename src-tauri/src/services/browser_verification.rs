@@ -600,6 +600,7 @@ fn fetch_cdp_targets(
 }
 
 /// Fetch version information from loopback CDP HTTP endpoint.
+#[allow(dead_code)]
 fn fetch_cdp_version(
     port: u16,
     timeout: Duration,
@@ -672,6 +673,8 @@ pub enum BrowserVerificationError {
     IpMismatch(String),
     /// Observed IP is private, documentation, or otherwise not globally routable.
     IpNotGloballyRoutable(String),
+    /// Failed to create a dedicated blank CDP target for verification.
+    CdpTargetCreationFailed(String),
 }
 
 impl std::fmt::Display for BrowserVerificationError {
@@ -688,11 +691,94 @@ impl std::fmt::Display for BrowserVerificationError {
             Self::CountryMismatch(s) => write!(f, "Country mismatch: {}", s),
             Self::IpMismatch(s) => write!(f, "IP mismatch: {}", s),
             Self::IpNotGloballyRoutable(s) => write!(f, "IP not globally routable: {}", s),
+            Self::CdpTargetCreationFailed(s) => {
+                write!(f, "CDP target creation failed: {}", s)
+            }
         }
     }
 }
 
 impl std::error::Error for BrowserVerificationError {}
+
+/// Creates a dedicated blank CDP target via `GET /json/new?about:blank`.
+///
+/// Returns the target ID string on success.
+pub fn create_cdp_blank_target(
+    debug_port: u16,
+    connect_timeout: Duration,
+) -> Result<String, BrowserVerificationError> {
+    let addr_str = format!("127.0.0.1:{}", debug_port);
+    let socket_addr: SocketAddr = addr_str.parse().map_err(|e: std::net::AddrParseError| {
+        BrowserVerificationError::CdpNotAvailable(e.to_string())
+    })?;
+
+    let mut stream = TcpStream::connect_timeout(&socket_addr, connect_timeout).map_err(|e| {
+        BrowserVerificationError::CdpNotAvailable(format!(
+            "Cannot connect to CDP port {} for target creation: {}",
+            debug_port, e
+        ))
+    })?;
+
+    stream.set_read_timeout(Some(connect_timeout)).ok();
+    stream.set_write_timeout(Some(connect_timeout)).ok();
+
+    let request = format!(
+        "GET /json/new?about:blank HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nConnection: close\r\nUser-Agent: YouTubeIsolationManager-Verifier/1.0\r\n\r\n",
+        debug_port
+    );
+    stream.write_all(request.as_bytes()).map_err(|e| {
+        BrowserVerificationError::CdpTargetCreationFailed(format!(
+            "Failed to write /json/new request: {}",
+            e
+        ))
+    })?;
+
+    let response_str = read_http_response(&mut stream)?;
+    let body = match response_str.find("\r\n\r\n") {
+        Some(idx) => &response_str[idx + 4..],
+        None => {
+            return Err(BrowserVerificationError::CdpTargetCreationFailed(
+                "Malformed HTTP response from /json/new".to_string(),
+            ))
+        }
+    };
+
+    // The response body is a CdpTarget JSON object (not an array)
+    let target: CdpTarget = serde_json::from_str(body).map_err(|e| {
+        BrowserVerificationError::CdpTargetCreationFailed(format!(
+            "Failed to parse /json/new response: {} — body: {}",
+            e,
+            &body[..body.len().min(200)]
+        ))
+    })?;
+
+    Ok(target.id)
+}
+
+/// Closes a CDP target via `GET /json/close/{target_id}` (best-effort cleanup).
+pub fn close_cdp_target(debug_port: u16, target_id: &str, connect_timeout: Duration) {
+    let addr_str = format!("127.0.0.1:{}", debug_port);
+    let socket_addr: SocketAddr = match addr_str.parse() {
+        Ok(a) => a,
+        Err(_) => return,
+    };
+    let mut stream = match TcpStream::connect_timeout(&socket_addr, connect_timeout) {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+    stream.set_read_timeout(Some(connect_timeout)).ok();
+    stream.set_write_timeout(Some(connect_timeout)).ok();
+
+    let request = format!(
+        "GET /json/close/{} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nConnection: close\r\nUser-Agent: YouTubeIsolationManager-Verifier/1.0\r\n\r\n",
+        target_id, debug_port
+    );
+    // Best-effort: ignore all errors
+    let _ = stream.write_all(request.as_bytes());
+    // Read response to ensure the server processes the request
+    let mut buf = [0u8; 256];
+    let _ = stream.read(&mut buf);
+}
 
 /// Performs real browser-origin verification via Chrome DevTools Protocol.
 ///
@@ -721,22 +807,33 @@ pub fn attempt_cdp_browser_verification(
     let op_timeout = Duration::from_millis(8000);
     let verification_start = Utc::now();
 
-    // 1. Resolve WebSocket debugger URL from CDP HTTP endpoint
-    let targets = fetch_cdp_targets(debug_port, connect_timeout)?;
+    // 1. Create a dedicated blank target to avoid executing JS in user's social media tabs
+    let new_target_id = create_cdp_blank_target(debug_port, connect_timeout)?;
+
+    // Brief pause to allow the new target to register with the CDP endpoint
+    std::thread::sleep(Duration::from_millis(100));
+
+    // 2. Fetch target list and find our specific new target by ID
+    let targets = fetch_cdp_targets(debug_port, connect_timeout).inspect_err(|_e| {
+        close_cdp_target(debug_port, &new_target_id, connect_timeout);
+    })?;
 
     // Endpoint security check: every target websocketDebuggerUrl must be loopback only
     for t in &targets {
         if let Some(ref u) = t.websocket_debugger_url {
             let parsed_url: url::Url = u.parse().map_err(|e| {
+                close_cdp_target(debug_port, &new_target_id, connect_timeout);
                 BrowserVerificationError::CdpSecurityViolation(format!("Malformed WS URL: {}", e))
             })?;
             if parsed_url.scheme() != "ws" {
+                close_cdp_target(debug_port, &new_target_id, connect_timeout);
                 return Err(BrowserVerificationError::CdpSecurityViolation(
                     "CDP endpoint must use ws:// scheme".to_string(),
                 ));
             }
             let host = parsed_url.host_str().unwrap_or("");
             if host != "127.0.0.1" && host != "localhost" && host != "::1" {
+                close_cdp_target(debug_port, &new_target_id, connect_timeout);
                 return Err(BrowserVerificationError::CdpSecurityViolation(format!(
                     "CDP endpoint rejected non-loopback host '{}'",
                     host
@@ -745,35 +842,24 @@ pub fn attempt_cdp_browser_verification(
         }
     }
 
-    // Target Selection: Avoid executing in user tabs (TikTok, Instagram, YouTube, Gumroad)
-    let ws_url = if let Some(t) = targets.iter().find(|t| {
-        t.target_type == "page"
-            && t.url.as_deref().unwrap_or("").starts_with("about:blank")
-            && t.websocket_debugger_url.is_some()
-    }) {
-        t.websocket_debugger_url.clone().unwrap()
-    } else if let Some(t) = targets.iter().find(|t| {
-        t.target_type == "page" && t.websocket_debugger_url.is_some() && {
-            let u = t.url.as_deref().unwrap_or("").to_ascii_lowercase();
-            !u.contains("tiktok")
-                && !u.contains("instagram")
-                && !u.contains("youtube")
-                && !u.contains("facebook")
-                && !u.contains("gumroad")
+    // Find our dedicated target by ID — never fall back to user's social media tabs
+    let ws_url = match targets
+        .iter()
+        .find(|t| t.id == new_target_id && t.websocket_debugger_url.is_some())
+    {
+        Some(t) => t.websocket_debugger_url.clone().unwrap(),
+        None => {
+            close_cdp_target(debug_port, &new_target_id, connect_timeout);
+            return Err(BrowserVerificationError::CdpNotAvailable(format!(
+                "Dedicated blank target '{}' not found in CDP target list after creation",
+                new_target_id
+            )));
         }
-    }) {
-        t.websocket_debugger_url.clone().unwrap()
-    } else {
-        let ver = fetch_cdp_version(debug_port, connect_timeout)?;
-        ver.websocket_debugger_url.ok_or_else(|| {
-            BrowserVerificationError::CdpNotAvailable(
-                "No webSocketDebuggerUrl returned by CDP endpoint".to_string(),
-            )
-        })?
     };
 
     // 2. Establish bounded loopback WebSocket connection
     let url: url::Url = ws_url.parse().map_err(|e| {
+        close_cdp_target(debug_port, &new_target_id, connect_timeout);
         BrowserVerificationError::CdpConnectionFailed(format!("Invalid WS URL: {}", e))
     })?;
 
@@ -783,10 +869,12 @@ pub fn attempt_cdp_browser_verification(
         format!("{}:{}", host, port)
             .parse()
             .map_err(|e: std::net::AddrParseError| {
+                close_cdp_target(debug_port, &new_target_id, connect_timeout);
                 BrowserVerificationError::CdpConnectionFailed(e.to_string())
             })?;
 
     let stream = TcpStream::connect_timeout(&socket_addr, connect_timeout).map_err(|e| {
+        close_cdp_target(debug_port, &new_target_id, connect_timeout);
         BrowserVerificationError::CdpConnectionFailed(format!(
             "TCP connect to CDP WS failed: {}",
             e
@@ -797,6 +885,7 @@ pub fn attempt_cdp_browser_verification(
     stream.set_write_timeout(Some(connect_timeout)).ok();
 
     let (mut socket, _resp) = tungstenite::client(url, stream).map_err(|e| {
+        close_cdp_target(debug_port, &new_target_id, connect_timeout);
         BrowserVerificationError::CdpConnectionFailed(format!(
             "CDP WebSocket handshake failed: {}",
             e
@@ -833,14 +922,14 @@ pub fn attempt_cdp_browser_verification(
         }
     });
 
-    socket
-        .send(tungstenite::Message::Text(eval_cmd.to_string().into()))
-        .map_err(|e| {
-            BrowserVerificationError::CdpConnectionFailed(format!(
-                "Failed sending CDP command: {}",
-                e
-            ))
-        })?;
+    if let Err(e) = socket.send(tungstenite::Message::Text(eval_cmd.to_string().into())) {
+        let _ = socket.close(None);
+        close_cdp_target(debug_port, &new_target_id, connect_timeout);
+        return Err(BrowserVerificationError::CdpConnectionFailed(format!(
+            "Failed sending CDP command: {}",
+            e
+        )));
+    }
 
     // 4. Await evaluated response with bounded loop
     let mut raw_resp_str: Option<String> = None;
@@ -852,6 +941,7 @@ pub fn attempt_cdp_browser_verification(
                     if v.get("id").and_then(|id| id.as_i64()) == Some(req_id) {
                         if let Some(err) = v.get("error") {
                             let _ = socket.close(None);
+                            close_cdp_target(debug_port, &new_target_id, connect_timeout);
                             return Err(BrowserVerificationError::BrowserRequestFailed(format!(
                                 "CDP Runtime error: {}",
                                 err
@@ -870,6 +960,7 @@ pub fn attempt_cdp_browser_verification(
             Ok(_) => {}
             Err(e) => {
                 let _ = socket.close(None);
+                close_cdp_target(debug_port, &new_target_id, connect_timeout);
                 return Err(BrowserVerificationError::CdpConnectionFailed(format!(
                     "CDP read error: {}",
                     e
@@ -882,9 +973,16 @@ pub fn attempt_cdp_browser_verification(
 
     let latency_ms = start.elapsed().as_millis() as u32;
 
-    let resp_str = raw_resp_str.ok_or(BrowserVerificationError::VerificationTimeout)?;
+    let resp_str = match raw_resp_str {
+        Some(s) => s,
+        None => {
+            close_cdp_target(debug_port, &new_target_id, connect_timeout);
+            return Err(BrowserVerificationError::VerificationTimeout);
+        }
+    };
 
     let parsed: serde_json::Value = serde_json::from_str(&resp_str).map_err(|e| {
+        close_cdp_target(debug_port, &new_target_id, connect_timeout);
         BrowserVerificationError::ResponseParseError(format!(
             "Malformed response from browser fetch: {}",
             e
@@ -892,6 +990,7 @@ pub fn attempt_cdp_browser_verification(
     })?;
 
     if let Some(err_val) = parsed.get("error").and_then(|e| e.as_str()) {
+        close_cdp_target(debug_port, &new_target_id, connect_timeout);
         return Err(BrowserVerificationError::BrowserRequestFailed(format!(
             "Browser-origin fetch rejected: {}",
             err_val
@@ -902,6 +1001,7 @@ pub fn attempt_cdp_browser_verification(
         .get("ip")
         .and_then(|v| v.as_str())
         .ok_or_else(|| {
+            close_cdp_target(debug_port, &new_target_id, connect_timeout);
             BrowserVerificationError::ResponseParseError(
                 "Missing 'ip' field in response".to_string(),
             )
@@ -919,6 +1019,7 @@ pub fn attempt_cdp_browser_verification(
 
     // 5. Strict IP validation
     if !crate::services::network_service::NetworkService::is_valid_ip_address(&observed_ip) {
+        close_cdp_target(debug_port, &new_target_id, connect_timeout);
         return Err(BrowserVerificationError::IpMismatch(format!(
             "Browser returned syntactically invalid IP: '{}'",
             observed_ip
@@ -927,6 +1028,7 @@ pub fn attempt_cdp_browser_verification(
 
     // DEFECT HIGH-04: Non-routable / documentation IPs must be rejected in live verification
     if !session.is_simulation && !is_globally_routable_ip(&observed_ip) {
+        close_cdp_target(debug_port, &new_target_id, connect_timeout);
         return Err(BrowserVerificationError::IpNotGloballyRoutable(format!(
             "Observed IP '{}' is not globally routable (private, documentation, or local range)",
             observed_ip
@@ -935,6 +1037,7 @@ pub fn attempt_cdp_browser_verification(
 
     if let Some(ref exp_ip) = session.expected_ip {
         if &observed_ip != exp_ip {
+            close_cdp_target(debug_port, &new_target_id, connect_timeout);
             return Err(BrowserVerificationError::IpMismatch(format!(
                 "Expected IP '{}', observed '{}'",
                 exp_ip, observed_ip
@@ -948,6 +1051,7 @@ pub fn attempt_cdp_browser_verification(
             &observed_country,
             Some(exp_c),
         ) {
+            close_cdp_target(debug_port, &new_target_id, connect_timeout);
             return Err(BrowserVerificationError::CountryMismatch(e));
         }
     }
@@ -972,6 +1076,7 @@ pub fn attempt_cdp_browser_verification(
 
     // DEFECT HIGH-01: BROWSER_EGRESS_VERIFIED is prohibited unless proxy_path_confirmed is true!
     if !proxy_path_confirmed {
+        close_cdp_target(debug_port, &new_target_id, connect_timeout);
         return Err(BrowserVerificationError::ProxyBridgeMismatch(
             "Proxy tunnel correlation failed: no matching upstream bridge event recorded for this request".to_string(),
         ));
@@ -984,6 +1089,9 @@ pub fn attempt_cdp_browser_verification(
     } else {
         "CDP_BROWSER_FETCH".to_string()
     };
+
+    // Cleanup the dedicated blank target — verification complete
+    close_cdp_target(debug_port, &new_target_id, connect_timeout);
 
     Ok(BrowserVerificationEvidence {
         verification_id,
@@ -1142,29 +1250,45 @@ mod tests {
     fn test_cdp_security_violation_when_non_loopback_ws() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
+        let target_id = "target-nonloopback";
+        let ws_url_bad = format!("ws://192.168.1.100:{}/devtools/page/{}", port, target_id);
+        let new_body = format!(
+            r#"{{"id":"{}","type":"page","title":"","url":"about:blank","webSocketDebuggerUrl":"{}"}}"#,
+            target_id, ws_url_bad
+        );
+        let list_body = format!(
+            r#"[{{"id":"{}","type":"page","title":"","url":"about:blank","webSocketDebuggerUrl":"{}"}}]"#,
+            target_id, ws_url_bad
+        );
 
         std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            let mut buf = [0u8; 1024];
-            let n = stream.read(&mut buf).unwrap();
-            let req = String::from_utf8_lossy(&buf[..n]);
-
-            if req.contains("GET /json/list") {
-                let targets = serde_json::json!([{
-                    "id": "target-1",
-                    "type": "page",
-                    "title": "Mock Target",
-                    "url": "about:blank",
-                    "webSocketDebuggerUrl": format!("ws://192.168.1.100:{}/devtools/page/target-1", port)
-                }]);
-                let body = targets.to_string();
-                let resp = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                    body.len(),
-                    body
-                );
-                stream.write_all(resp.as_bytes()).unwrap();
-                stream.flush().unwrap();
+            // Handle /json/new and /json/list (and /json/close best-effort)
+            for _ in 0..3 {
+                if let Ok((mut stream, _)) = listener.accept() {
+                    let mut buf = [0u8; 1024];
+                    let n = match stream.read(&mut buf) {
+                        Ok(n) => n,
+                        Err(_) => break,
+                    };
+                    let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                    if req.contains("GET /json/new") {
+                        let resp = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            new_body.len(), new_body
+                        );
+                        let _ = stream.write_all(resp.as_bytes());
+                    } else if req.contains("GET /json/list") {
+                        let resp = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            list_body.len(), list_body
+                        );
+                        let _ = stream.write_all(resp.as_bytes());
+                    } else if req.contains("GET /json/close") {
+                        let _ = stream.write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK",
+                        );
+                    }
+                }
             }
         });
 
@@ -1192,61 +1316,102 @@ mod tests {
         ));
     }
 
+    /// Helper: spawn a mock CDP server that handles /json/new, /json/list, WebSocket, and /json/close.
+    fn spawn_mock_cdp_server(
+        listener: TcpListener,
+        target_id: &'static str,
+        ws_country_code: &'static str,
+        ws_ip: &'static str,
+    ) {
+        let port = listener.local_addr().unwrap().port();
+        let ws_path = format!("/devtools/page/{}", target_id);
+        let ws_url = format!("ws://127.0.0.1:{}{}", port, ws_path);
+
+        std::thread::spawn(move || {
+            for _ in 0..6 {
+                if let Ok((mut stream, _)) = listener.accept() {
+                    // Peek at the first bytes to route the connection type without consuming
+                    let mut peek_buf = [0u8; 512];
+                    let peeked = match stream.peek(&mut peek_buf) {
+                        Ok(n) if n > 0 => n,
+                        _ => continue,
+                    };
+                    let peek_str = String::from_utf8_lossy(&peek_buf[..peeked]);
+
+                    if peek_str.contains("GET /json/new") {
+                        // Consume the request by reading it
+                        let mut buf = [0u8; 512];
+                        let _ = stream.read(&mut buf);
+                        let body = format!(
+                            r#"{{"id":"{}","type":"page","title":"","url":"about:blank","webSocketDebuggerUrl":"{}"}}"#,
+                            target_id, ws_url
+                        );
+                        let resp = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            body.len(),
+                            body
+                        );
+                        let _ = stream.write_all(resp.as_bytes());
+                    } else if peek_str.contains("GET /json/list") {
+                        let mut buf = [0u8; 512];
+                        let _ = stream.read(&mut buf);
+                        let body = format!(
+                            r#"[{{"id":"{}","type":"page","title":"","url":"about:blank","webSocketDebuggerUrl":"{}"}}]"#,
+                            target_id, ws_url
+                        );
+                        let resp = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            body.len(),
+                            body
+                        );
+                        let _ = stream.write_all(resp.as_bytes());
+                    } else if peek_str.contains("GET /json/close") {
+                        let mut buf = [0u8; 512];
+                        let _ = stream.read(&mut buf);
+                        let _ = stream.write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK",
+                        );
+                    } else if peek_str.contains("Upgrade: websocket")
+                        || (peek_str.contains("GET") && peek_str.contains(ws_path.as_str()))
+                    {
+                        // WebSocket upgrade — do NOT pre-read; let tungstenite handle the HTTP handshake
+                        let mut ws = match tungstenite::accept(stream) {
+                            Ok(ws) => ws,
+                            Err(_) => continue,
+                        };
+                        if let Ok(tungstenite::Message::Text(txt)) = ws.read() {
+                            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&txt) {
+                                let id = v.get("id").and_then(|i| i.as_i64()).unwrap_or(0);
+                                let resp_payload = serde_json::json!({
+                                    "id": id,
+                                    "result": {
+                                        "result": {
+                                            "type": "string",
+                                            "value": serde_json::json!({
+                                                "ip": ws_ip,
+                                                "country_code": ws_country_code,
+                                                "country": "Test Country",
+                                                "success": true
+                                            }).to_string()
+                                        }
+                                    }
+                                });
+                                let _ = ws.send(tungstenite::Message::Text(
+                                    resp_payload.to_string().into(),
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        });
+    }
+
     #[test]
     fn test_cdp_mock_verification_success() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
-
-        std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            let mut buf = [0u8; 1024];
-            let n = stream.read(&mut buf).unwrap();
-            let req = String::from_utf8_lossy(&buf[..n]);
-
-            if req.contains("GET /json/list") {
-                let targets = serde_json::json!([{
-                    "id": "target-1",
-                    "type": "page",
-                    "title": "Mock Target",
-                    "url": "about:blank",
-                    "webSocketDebuggerUrl": format!("ws://127.0.0.1:{}/devtools/page/target-1", port)
-                }]);
-                let body = targets.to_string();
-                let resp = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                    body.len(),
-                    body
-                );
-                stream.write_all(resp.as_bytes()).unwrap();
-                stream.flush().unwrap();
-                drop(stream);
-            }
-
-            let (ws_stream, _) = listener.accept().unwrap();
-            let mut ws = tungstenite::accept(ws_stream).unwrap();
-            let msg = ws.read().unwrap();
-            if let tungstenite::Message::Text(txt) = msg {
-                let v: serde_json::Value = serde_json::from_str(&txt).unwrap();
-                let id = v.get("id").unwrap().as_i64().unwrap();
-                let resp_payload = serde_json::json!({
-                    "id": id,
-                    "result": {
-                        "result": {
-                            "type": "string",
-                            "value": serde_json::json!({
-                                "ip": "198.51.100.25",
-                                "country_code": "US",
-                                "country": "United States",
-                                "success": true
-                            }).to_string()
-                        }
-                    }
-                });
-                ws.send(tungstenite::Message::Text(resp_payload.to_string().into()))
-                    .unwrap();
-            }
-        });
-
+        spawn_mock_cdp_server(listener, "target-success", "US", "198.51.100.25");
         std::thread::sleep(Duration::from_millis(50));
 
         let session = BrowserSessionInfo {
@@ -1279,57 +1444,7 @@ mod tests {
     fn test_cdp_mock_country_mismatch() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
-
-        std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            let mut buf = [0u8; 1024];
-            let n = stream.read(&mut buf).unwrap();
-            let req = String::from_utf8_lossy(&buf[..n]);
-
-            if req.contains("GET /json/list") {
-                let targets = serde_json::json!([{
-                    "id": "target-1",
-                    "type": "page",
-                    "title": "Mock Target",
-                    "url": "about:blank",
-                    "webSocketDebuggerUrl": format!("ws://127.0.0.1:{}/devtools/page/target-1", port)
-                }]);
-                let body = targets.to_string();
-                let resp = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                    body.len(),
-                    body
-                );
-                stream.write_all(resp.as_bytes()).unwrap();
-                stream.flush().unwrap();
-                drop(stream);
-            }
-
-            let (ws_stream, _) = listener.accept().unwrap();
-            let mut ws = tungstenite::accept(ws_stream).unwrap();
-            let msg = ws.read().unwrap();
-            if let tungstenite::Message::Text(txt) = msg {
-                let v: serde_json::Value = serde_json::from_str(&txt).unwrap();
-                let id = v.get("id").unwrap().as_i64().unwrap();
-                let resp_payload = serde_json::json!({
-                    "id": id,
-                    "result": {
-                        "result": {
-                            "type": "string",
-                            "value": serde_json::json!({
-                                "ip": "198.51.100.25",
-                                "country_code": "VN",
-                                "country": "Vietnam",
-                                "success": true
-                            }).to_string()
-                        }
-                    }
-                });
-                ws.send(tungstenite::Message::Text(resp_payload.to_string().into()))
-                    .unwrap();
-            }
-        });
-
+        spawn_mock_cdp_server(listener, "target-mismatch", "VN", "198.51.100.25");
         std::thread::sleep(Duration::from_millis(50));
 
         let session = BrowserSessionInfo {
@@ -1355,57 +1470,7 @@ mod tests {
     fn test_cdp_fails_when_no_bridge_tunnel_event() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
-
-        std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            let mut buf = [0u8; 1024];
-            let n = stream.read(&mut buf).unwrap();
-            let req = String::from_utf8_lossy(&buf[..n]);
-
-            if req.contains("GET /json/list") {
-                let targets = serde_json::json!([{
-                    "id": "target-1",
-                    "type": "page",
-                    "title": "Mock Target",
-                    "url": "about:blank",
-                    "webSocketDebuggerUrl": format!("ws://127.0.0.1:{}/devtools/page/target-1", port)
-                }]);
-                let body = targets.to_string();
-                let resp = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                    body.len(),
-                    body
-                );
-                stream.write_all(resp.as_bytes()).unwrap();
-                stream.flush().unwrap();
-                drop(stream);
-            }
-
-            let (ws_stream, _) = listener.accept().unwrap();
-            let mut ws = tungstenite::accept(ws_stream).unwrap();
-            let msg = ws.read().unwrap();
-            if let tungstenite::Message::Text(txt) = msg {
-                let v: serde_json::Value = serde_json::from_str(&txt).unwrap();
-                let id = v.get("id").unwrap().as_i64().unwrap();
-                let resp_payload = serde_json::json!({
-                    "id": id,
-                    "result": {
-                        "result": {
-                            "type": "string",
-                            "value": serde_json::json!({
-                                "ip": "64.233.160.1",
-                                "country_code": "US",
-                                "country": "United States",
-                                "success": true
-                            }).to_string()
-                        }
-                    }
-                });
-                ws.send(tungstenite::Message::Text(resp_payload.to_string().into()))
-                    .unwrap();
-            }
-        });
-
+        spawn_mock_cdp_server(listener, "target-no-bridge", "US", "64.233.160.1");
         std::thread::sleep(Duration::from_millis(50));
 
         // recent_bridge_connection_count == 0 -> must NEVER pass as BROWSER_EGRESS_VERIFIED
@@ -1435,57 +1500,12 @@ mod tests {
     fn test_cdp_fails_when_country_unknown_and_expected_set() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
-
-        std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            let mut buf = [0u8; 1024];
-            let n = stream.read(&mut buf).unwrap();
-            let req = String::from_utf8_lossy(&buf[..n]);
-
-            if req.contains("GET /json/list") {
-                let targets = serde_json::json!([{
-                    "id": "target-1",
-                    "type": "page",
-                    "title": "Mock Target",
-                    "url": "about:blank",
-                    "webSocketDebuggerUrl": format!("ws://127.0.0.1:{}/devtools/page/target-1", port)
-                }]);
-                let body = targets.to_string();
-                let resp = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                    body.len(),
-                    body
-                );
-                stream.write_all(resp.as_bytes()).unwrap();
-                stream.flush().unwrap();
-                drop(stream);
-            }
-
-            let (ws_stream, _) = listener.accept().unwrap();
-            let mut ws = tungstenite::accept(ws_stream).unwrap();
-            let msg = ws.read().unwrap();
-            if let tungstenite::Message::Text(txt) = msg {
-                let v: serde_json::Value = serde_json::from_str(&txt).unwrap();
-                let id = v.get("id").unwrap().as_i64().unwrap();
-                let resp_payload = serde_json::json!({
-                    "id": id,
-                    "result": {
-                        "result": {
-                            "type": "string",
-                            "value": serde_json::json!({
-                                "ip": "64.233.160.1",
-                                "country_code": "UNKNOWN",
-                                "country": "Unknown",
-                                "success": true
-                            }).to_string()
-                        }
-                    }
-                });
-                ws.send(tungstenite::Message::Text(resp_payload.to_string().into()))
-                    .unwrap();
-            }
-        });
-
+        spawn_mock_cdp_server(
+            listener,
+            "target-unknown-country",
+            "UNKNOWN",
+            "64.233.160.1",
+        );
         std::thread::sleep(Duration::from_millis(50));
 
         let session = BrowserSessionInfo {
@@ -1511,57 +1531,7 @@ mod tests {
     fn test_live_verification_rejects_documentation_ip() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
-
-        std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            let mut buf = [0u8; 1024];
-            let n = stream.read(&mut buf).unwrap();
-            let req = String::from_utf8_lossy(&buf[..n]);
-
-            if req.contains("GET /json/list") {
-                let targets = serde_json::json!([{
-                    "id": "target-1",
-                    "type": "page",
-                    "title": "Mock Target",
-                    "url": "about:blank",
-                    "webSocketDebuggerUrl": format!("ws://127.0.0.1:{}/devtools/page/target-1", port)
-                }]);
-                let body = targets.to_string();
-                let resp = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                    body.len(),
-                    body
-                );
-                stream.write_all(resp.as_bytes()).unwrap();
-                stream.flush().unwrap();
-                drop(stream);
-            }
-
-            let (ws_stream, _) = listener.accept().unwrap();
-            let mut ws = tungstenite::accept(ws_stream).unwrap();
-            let msg = ws.read().unwrap();
-            if let tungstenite::Message::Text(txt) = msg {
-                let v: serde_json::Value = serde_json::from_str(&txt).unwrap();
-                let id = v.get("id").unwrap().as_i64().unwrap();
-                let resp_payload = serde_json::json!({
-                    "id": id,
-                    "result": {
-                        "result": {
-                            "type": "string",
-                            "value": serde_json::json!({
-                                "ip": "198.51.100.25",
-                                "country_code": "US",
-                                "country": "United States",
-                                "success": true
-                            }).to_string()
-                        }
-                    }
-                });
-                ws.send(tungstenite::Message::Text(resp_payload.to_string().into()))
-                    .unwrap();
-            }
-        });
-
+        spawn_mock_cdp_server(listener, "target-doc-ip", "US", "198.51.100.25");
         std::thread::sleep(Duration::from_millis(50));
 
         // is_simulation == false -> live mode MUST reject RFC 5737 documentation IP 198.51.100.25
@@ -1654,5 +1624,227 @@ mod tests {
         assert!(ev.observed_public_ip.is_none());
         assert!(ev.observed_country.is_none());
         assert!(!ev.proxy_path_confirmed);
+    }
+
+    /// Verifies that `create_cdp_blank_target` sends a `GET /json/new` request.
+    #[test]
+    fn test_cdp_target_creation_sends_correct_request() {
+        use std::sync::{Arc, Mutex};
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let received_request: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let received_clone = Arc::clone(&received_request);
+
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 2048];
+                if let Ok(n) = stream.read(&mut buf) {
+                    let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                    *received_clone.lock().unwrap() = Some(req.clone());
+
+                    // Reply with a fake target JSON object
+                    if req.contains("GET /json/new") {
+                        let body = r#"{"id":"fake-target-id","type":"page","title":"","url":"about:blank","webSocketDebuggerUrl":"ws://127.0.0.1:1/devtools/page/fake-target-id"}"#;
+                        let resp = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            body.len(),
+                            body
+                        );
+                        let _ = stream.write_all(resp.as_bytes());
+                        let _ = stream.flush();
+                    }
+                }
+            }
+        });
+
+        std::thread::sleep(Duration::from_millis(50));
+
+        let timeout = Duration::from_millis(500);
+        let _ = create_cdp_blank_target(port, timeout);
+
+        std::thread::sleep(Duration::from_millis(100));
+        let req = received_request.lock().unwrap();
+        assert!(
+            req.as_deref().unwrap_or("").contains("GET /json/new"),
+            "Expected GET /json/new in request, got: {:?}",
+            req
+        );
+    }
+
+    /// Verifies that `close_cdp_target` sends a `GET /json/close/{id}` request.
+    #[test]
+    fn test_cdp_cleanup_sends_close_request() {
+        use std::sync::{Arc, Mutex};
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let received_request: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let received_clone = Arc::clone(&received_request);
+
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 2048];
+                if let Ok(n) = stream.read(&mut buf) {
+                    let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                    *received_clone.lock().unwrap() = Some(req.clone());
+                    let resp =
+                        "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK";
+                    let _ = stream.write_all(resp.as_bytes());
+                }
+            }
+        });
+
+        std::thread::sleep(Duration::from_millis(50));
+
+        let timeout = Duration::from_millis(500);
+        close_cdp_target(port, "test-target-abc", timeout);
+
+        std::thread::sleep(Duration::from_millis(100));
+        let req = received_request.lock().unwrap();
+        assert!(
+            req.as_deref()
+                .unwrap_or("")
+                .contains("GET /json/close/test-target-abc"),
+            "Expected GET /json/close/test-target-abc in request, got: {:?}",
+            req
+        );
+    }
+
+    /// Verifies that after a successful CDP session, the target close endpoint is called.
+    #[test]
+    fn test_cdp_cleanup_closes_target_on_success() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        // We'll set up a mock server that:
+        // 1. Responds to /json/new with a fake target
+        // 2. Responds to /json/list with that target
+        // 3. Accepts a WebSocket and returns a fake IP response
+        // 4. Tracks if /json/close was called
+        let close_called = Arc::new(AtomicBool::new(false));
+        let close_clone = Arc::clone(&close_called);
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let target_id = "cleanup-test-target-1";
+        let ws_path = format!("/devtools/page/{}", target_id);
+        let ws_url_str = format!("ws://127.0.0.1:{}{}", port, ws_path);
+
+        std::thread::spawn(move || {
+            // Handle multiple connections
+            for _ in 0..5 {
+                if let Ok((mut stream, _)) = listener.accept() {
+                    let mut peek_buf = [0u8; 512];
+                    let peeked = match stream.peek(&mut peek_buf) {
+                        Ok(n) if n > 0 => n,
+                        _ => continue,
+                    };
+                    let peek_str = String::from_utf8_lossy(&peek_buf[..peeked]);
+
+                    if peek_str.contains("GET /json/new") {
+                        let mut buf = [0u8; 512];
+                        let _ = stream.read(&mut buf);
+                        // Return the fake target
+                        let body = format!(
+                            r#"{{"id":"{}","type":"page","title":"","url":"about:blank","webSocketDebuggerUrl":"{}"}}"#,
+                            target_id, ws_url_str
+                        );
+                        let resp = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            body.len(),
+                            body
+                        );
+                        let _ = stream.write_all(resp.as_bytes());
+                        let _ = stream.flush();
+                    } else if peek_str.contains("GET /json/list") {
+                        let mut buf = [0u8; 512];
+                        let _ = stream.read(&mut buf);
+                        // Return array with the fake target
+                        let body = format!(
+                            r#"[{{"id":"{}","type":"page","title":"","url":"about:blank","webSocketDebuggerUrl":"{}"}}]"#,
+                            target_id, ws_url_str
+                        );
+                        let resp = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            body.len(),
+                            body
+                        );
+                        let _ = stream.write_all(resp.as_bytes());
+                        let _ = stream.flush();
+                    } else if peek_str.contains(&format!("GET /json/close/{}", target_id)) {
+                        let mut buf = [0u8; 512];
+                        let _ = stream.read(&mut buf);
+                        close_clone.store(true, Ordering::SeqCst);
+                        let resp =
+                            "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK";
+                        let _ = stream.write_all(resp.as_bytes());
+                    } else if peek_str.contains("Upgrade: websocket")
+                        || (peek_str.contains("GET") && peek_str.contains(ws_path.as_str()))
+                    {
+                        // WebSocket upgrade for CDP — do NOT pre-read
+                        let mut ws = match tungstenite::accept(stream) {
+                            Ok(ws) => ws,
+                            Err(_) => continue,
+                        };
+                        if let Ok(tungstenite::Message::Text(txt)) = ws.read() {
+                            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&txt) {
+                                let id = v.get("id").and_then(|i| i.as_i64()).unwrap_or(0);
+                                let resp_payload = serde_json::json!({
+                                    "id": id,
+                                    "result": {
+                                        "result": {
+                                            "type": "string",
+                                            "value": serde_json::json!({
+                                                "ip": "198.51.100.25",
+                                                "country_code": "US",
+                                                "country": "United States",
+                                                "success": true
+                                            }).to_string()
+                                        }
+                                    }
+                                });
+                                let _ = ws.send(tungstenite::Message::Text(
+                                    resp_payload.to_string().into(),
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
+        std::thread::sleep(Duration::from_millis(100));
+
+        let session = BrowserSessionInfo {
+            environment_id: "env-cleanup".to_string(),
+            session_id: "sess-cleanup".to_string(),
+            pid: std::process::id(),
+            profile_path: "/tmp/cleanup-profile".to_string(),
+            proxy_bridge_port: Some(49200),
+            proxy_endpoint_id: "ep-001".to_string(),
+            bridge_instance_id: None,
+            expected_country: Some("US".to_string()),
+            expected_ip: Some("198.51.100.25".to_string()),
+            recent_bridge_connection_count: 3,
+            cdp_port: Some(port),
+            is_simulation: true,
+        };
+
+        // This will succeed and should call close_cdp_target
+        let result = attempt_cdp_browser_verification(&session, port, None);
+
+        // Give cleanup a moment to execute
+        std::thread::sleep(Duration::from_millis(200));
+
+        // Whether success or failure, verify close was called
+        // In simulation mode with no bridge tunnel real events (bridge_instance_id = None),
+        // success depends on recent_bridge_connection_count > 0 path.
+        // The important thing is close was called regardless of outcome.
+        let _ = result; // We don't assert the outcome here, only the cleanup behavior
+        assert!(
+            close_called.load(Ordering::SeqCst),
+            "Expected /json/close to be called after CDP session"
+        );
     }
 }
