@@ -1725,13 +1725,6 @@ fn test_v9_real_edge_live_j2proxy_us_acceptance() {
         .map(|s| s.trim().to_ascii_uppercase())
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "HTTP".to_string());
-    let live_username = std::env::var("ANTI_LIVE_J2PROXY_USERNAME")
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty());
-    let live_password = std::env::var("ANTI_LIVE_J2PROXY_PASSWORD")
-        .ok()
-        .filter(|s| !s.is_empty());
     let expected_country = std::env::var("ANTI_LIVE_J2PROXY_EXPECTED_COUNTRY")
         .ok()
         .map(|s| s.trim().to_ascii_uppercase())
@@ -1759,6 +1752,7 @@ fn test_v9_real_edge_live_j2proxy_us_acceptance() {
                 "platform": format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
                 "require_live_j2proxy": require_live_j2proxy,
                 "live_j2proxy_configured": false,
+                "proxy_protocol": live_protocol,
                 "expected_country": expected_country,
                 "expected_ip": expected_ip,
                 "phases": {
@@ -1804,6 +1798,9 @@ fn test_v9_real_edge_live_j2proxy_us_acceptance() {
                 "platform": format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
                 "require_live_j2proxy": require_live_j2proxy,
                 "live_j2proxy_configured": true,
+                "proxy_protocol": live_protocol,
+                "expected_country": expected_country,
+                "expected_ip": expected_ip,
                 "public_us_egress_proven": false,
                 "recorded_at_utc": chrono::Utc::now().to_rfc3339()
             }),
@@ -1829,6 +1826,14 @@ fn test_v9_real_edge_live_j2proxy_us_acceptance() {
         use youtube_isolation_manager_lib::services::proxy_bridge::{
             ProxyBridgeManager, UpstreamProxyConfig,
         };
+
+        let live_username = std::env::var("ANTI_LIVE_J2PROXY_USERNAME")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        let live_password = std::env::var("ANTI_LIVE_J2PROXY_PASSWORD")
+            .ok()
+            .filter(|s| !s.is_empty());
 
         let host = live_host.unwrap();
         let port = live_port.unwrap();
