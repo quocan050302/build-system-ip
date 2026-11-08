@@ -176,16 +176,21 @@ def sample_resources(workspace_dir: Path, target_dir: Path, artifact_dir: Path) 
 
     avail_mem_mib, mem_source = _probe_available_memory_mib()
 
-    def _free_gib(p: Path) -> float:
+    def _free_gib_and_dev(p: Path) -> Tuple[float, int]:
         check_path = p if p.exists() else p.parent
         while not check_path.exists() and check_path.parent != check_path:
             check_path = check_path.parent
         usage = shutil.disk_usage(check_path)
-        return round(usage.free / (1024.0 ** 3), 3)
+        try:
+            dev_id = os.stat(check_path).st_dev
+        except OSError:
+            dev_id = 0
+        return round(usage.free / (1024.0 ** 3), 3), dev_id
 
-    workspace_free_gib = _free_gib(workspace_dir)
-    target_free_gib = _free_gib(target_dir)
-    artifact_free_gib = _free_gib(artifact_dir)
+    workspace_free_gib, ws_dev = _free_gib_and_dev(workspace_dir)
+    target_free_gib, tgt_dev = _free_gib_and_dev(target_dir)
+    artifact_free_gib, art_dev = _free_gib_and_dev(artifact_dir)
+    distinct_volumes = len({d for d in (ws_dev, tgt_dev, art_dev) if d != 0}) or 1
 
     conservative_fallback = avail_mem_mib is None or avail_mem_mib < 1536.0
     recommended_workers = 1 if conservative_fallback else min(4, max(2, cpu_count // 2))
@@ -200,8 +205,46 @@ def sample_resources(workspace_dir: Path, target_dir: Path, artifact_dir: Path) 
         "workspace_free_disk_gib": workspace_free_gib,
         "target_free_disk_gib": target_free_gib,
         "artifact_free_disk_gib": artifact_free_gib,
+        "effective_free_disk_gib": min(workspace_free_gib, target_free_gib, artifact_free_gib),
+        "distinct_volume_count": distinct_volumes,
         "conservative_concurrency_forced": conservative_fallback,
         "recommended_max_workers": recommended_workers,
+    }
+
+
+def compute_effective_max_workers(snapshot: Dict[str, Any]) -> int:
+    """
+    Compute the bounded worker concurrency cap from a resource snapshot.
+    Never overrides recommended_max_workers=1 when conservative mode is active!
+    """
+    if snapshot.get("conservative_concurrency_forced") or snapshot.get("available_memory_mib") is None:
+        return 1
+    return max(1, int(snapshot.get("recommended_max_workers", 1)))
+
+
+def evaluate_windows_packaging_gates(
+    binary_path: Path,
+    nsis_dir: Path,
+    bundler_exit_code: int,
+) -> Dict[str, Any]:
+    """
+    Strictly separate WINDOWS_RELEASE_BINARY_GATE from WINDOWS_INSTALLER_GATE.
+    Never treat youtube-isolation-manager.exe alone as a pass for WINDOWS_INSTALLER_GATE.
+    """
+    binary_ok = binary_path.is_file() and binary_path.stat().st_size > 0
+    installers = (
+        [p for p in sorted(nsis_dir.glob("*.exe")) if p.is_file() and p.stat().st_size > 0]
+        if nsis_dir.is_dir()
+        else []
+    )
+    installer_ok = (bundler_exit_code == 0) and (len(installers) > 0)
+    return {
+        "WINDOWS_RELEASE_BINARY_GATE": "PASS" if binary_ok else "FAIL",
+        "WINDOWS_INSTALLER_GATE": "PASS" if installer_ok else "FAIL",
+        "bundler_exit_code": bundler_exit_code,
+        "binary_exists": binary_ok,
+        "installer_count": len(installers),
+        "installer_paths": [str(p) for p in installers],
     }
 
 
@@ -657,6 +700,77 @@ async def run_orchestrator_selftests(artifact_dir: Path, workspace_dir: Path) ->
             raise AssertionError("Atomic report probe missing or SHA256 mismatch")
         lines.append(f"[PASS] Atomic report durability verified: {probe_dest} ({probe_sha})")
 
+        # 5. R34: Verify Windows NSIS 504 / missing installer never passes WINDOWS_INSTALLER_GATE even when .exe binary exists
+        with tempfile.TemporaryDirectory() as tmp_pkg:
+            tmp_pkg_path = Path(tmp_pkg)
+            fake_bin = tmp_pkg_path / "youtube-isolation-manager.exe"
+            fake_bin.write_bytes(b"MZ-release-binary-payload")
+            empty_nsis = tmp_pkg_path / "bundle" / "nsis"
+            empty_nsis.mkdir(parents=True, exist_ok=True)
+            gates_504 = evaluate_windows_packaging_gates(fake_bin, empty_nsis, bundler_exit_code=1)
+            if (
+                gates_504["WINDOWS_RELEASE_BINARY_GATE"] != "PASS"
+                or gates_504["WINDOWS_INSTALLER_GATE"] != "FAIL"
+            ):
+                raise AssertionError(f"R34 failed: expected BINARY=PASS & INSTALLER=FAIL, got {gates_504}")
+            real_inst = empty_nsis / "YouTube Isolation Manager_0.1.0_x64-setup.exe"
+            real_inst.write_bytes(b"MZ-nsis-installer-payload")
+            gates_ok = evaluate_windows_packaging_gates(fake_bin, empty_nsis, bundler_exit_code=0)
+            if (
+                gates_ok["WINDOWS_RELEASE_BINARY_GATE"] != "PASS"
+                or gates_ok["WINDOWS_INSTALLER_GATE"] != "PASS"
+            ):
+                raise AssertionError(f"R34 positive check failed: {gates_ok}")
+        lines.append("[PASS] R34 verified: Windows release binary never substitutes for NSIS installer gate")
+
+        # 6. R35: Verify unknown/low memory forces recommended_max_workers=1 and compute_effective_max_workers=1
+        unknown_mem_snap = {
+            "available_memory_mib": None,
+            "memory_measurement_status": "unknown",
+            "conservative_concurrency_forced": True,
+            "recommended_max_workers": 1,
+        }
+        low_mem_snap = {
+            "available_memory_mib": 1024.0,
+            "memory_measurement_status": "MEASURED",
+            "conservative_concurrency_forced": True,
+            "recommended_max_workers": 1,
+        }
+        if compute_effective_max_workers(unknown_mem_snap) != 1 or compute_effective_max_workers(low_mem_snap) != 1:
+            raise AssertionError("R35 failed: conservative mode was overridden above 1 worker")
+        lines.append("[PASS] R35 verified: unknown/low RAM strictly enforces max_workers=1")
+
+        # 7. R36: Verify disk guard raises RuntimeError when free disk falls below threshold
+        low_disk_snap = {
+            "workspace_free_disk_gib": 0.5,
+            "target_free_disk_gib": 0.5,
+            "artifact_free_disk_gib": 0.5,
+            "available_memory_mib": 4096.0,
+        }
+        guard_failed = False
+        try:
+            enforce_resource_guard(
+                low_disk_snap,
+                {"disk_gib": 2.0, "mem_mib": 512.0},
+                {"min_free_disk_gib": 2.0, "min_available_mem_mib": 512.0, "fail_on_violation": True},
+            )
+        except RuntimeError:
+            guard_failed = True
+        if not guard_failed:
+            raise AssertionError("R36 failed: enforce_resource_guard did not raise on low disk")
+        lines.append("[PASS] R36 verified: resource guard aborts when free disk < 2.0 GiB")
+
+        # 8. R37: Verify log stream truncation sets truncated=True at cap
+        reader = asyncio.StreamReader()
+        reader.feed_data(b"A" * 2048 + b"\n")
+        reader.feed_eof()
+        trunc_stats: Dict[str, Any] = {"bytes_written": 0, "truncated": False, "redactions": 0}
+        with tempfile.TemporaryFile() as tmp_log:
+            await redact_and_stream_log(reader, tmp_log, 512, trunc_stats, "")
+        if not trunc_stats.get("truncated"):
+            raise AssertionError("R37 failed: log truncation flag was not set when exceeding cap")
+        lines.append("[PASS] R37 verified: log stream cap sets truncated=True and drains cleanly")
+
     except Exception as exc:
         status = "FAIL"
         exit_code = 1
@@ -743,7 +857,7 @@ async def schedule_tasks(
     """
     target_dir = workspace_dir / "src-tauri" / "target"
     initial_snap = sample_resources(workspace_dir, target_dir, artifact_dir)
-    max_workers = max(2, int(initial_snap["recommended_max_workers"]))
+    max_workers = compute_effective_max_workers(initial_snap)
     worker_sem = asyncio.Semaphore(max_workers)
     cargo_lock = asyncio.Semaphore(1)
 
@@ -923,6 +1037,7 @@ def create_run_manifest(
     all_tasks_passed = all(
         t.status == "PASS" for t in tasks if t.task_id != "selftest_timeout_probe"
     )
+    has_corrupt_runtime_evidence = any("error" in v for v in runtime_evidence.values())
     edge_local_rec = (
         runtime_evidence.get("test_v9_actual_edge_local_controlled_proxy_integration", {})
         .get("record", {})
@@ -938,8 +1053,10 @@ def create_run_manifest(
     )
     live_j2_status = live_j2_rec.get("status", "NOT_RUN")
 
-    engineering_gate = "PASS" if all_tasks_passed else "FAIL"
+    engineering_gate = "PASS" if (all_tasks_passed and not has_corrupt_runtime_evidence) else "FAIL"
     if require_real_edge and edge_local_status != "PASS":
+        engineering_gate = "FAIL"
+    if require_live_j2proxy and live_j2_status != "PASS":
         engineering_gate = "FAIL"
 
     if engineering_gate != "PASS":
@@ -950,9 +1067,10 @@ def create_run_manifest(
         overall_state = "ENGINEERING_READY_LIVE_VERIFICATION_PENDING"
 
     concurrency_proof = compute_concurrency_proof(tasks)
+    frontend_executed = any(t.branch == "frontend_branch" for t in tasks)
 
     return {
-        "schema_version": "anti-v9.0",
+        "schema_version": "anti-v10.0",
         "run_id": run_id,
         "generated_at_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         "git_branch": git_branch,
@@ -967,6 +1085,7 @@ def create_run_manifest(
         "policy": {
             "require_real_edge": require_real_edge,
             "require_live_j2proxy": require_live_j2proxy,
+            "frontend_branch_status": "EXECUTED" if frontend_executed else "SKIPPED_BY_CONFIGURATION",
             "min_free_disk_gib": MIN_FREE_DISK_GIB,
             "min_available_mem_mib": MIN_AVAILABLE_MEM_MIB,
             "max_log_bytes_per_task": MAX_LOG_BYTES,

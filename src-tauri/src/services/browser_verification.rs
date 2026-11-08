@@ -1032,6 +1032,25 @@ pub const FALLBACK_VERIFICATION_PROVIDER: VerificationProviderSpec = Verificatio
     supplies_country: false,
 };
 
+/// Classify the verification evidence strength and attribution confidence level.
+pub fn classify_evidence_strength(
+    evidence: &BrowserVerificationEvidence,
+) -> (&'static str, &'static str) {
+    if !evidence.proxy_path_confirmed
+        || evidence.status != VerificationStatus::BrowserEgressVerified.as_str()
+    {
+        return ("LOCAL_CONTROLLED_TRANSPORT", "AMBIGUOUS");
+    }
+    match evidence.verification_source.as_str() {
+        "SIMULATED_MOCK_CDP" => ("MOCK_CDP_UNIT_TEST", "SIMULATED"),
+        "CDP_PAGE_NAVIGATE" | "CDP_BROWSER_FETCH" => (
+            "LIVE_BROWSER_URL_RESULT",
+            "REQUEST_TUNNEL_CORRELATION_STRONG",
+        ),
+        _ => ("LOCAL_CONTROLLED_TRANSPORT", "AMBIGUOUS"),
+    }
+}
+
 /// Verifies that the loopback CDP endpoint on `debug_port` is genuinely owned by the
 /// managed Microsoft Edge process (`session.pid`) and bound to `session.profile_path`.
 pub fn verify_managed_cdp_ownership(
@@ -1057,13 +1076,13 @@ pub fn verify_managed_cdp_ownership(
     }
 
     let profile_dir = std::path::Path::new(&session.profile_path);
-    // If DevToolsActivePort exists in the profile dir, its port MUST match debug_port
-    if let Some((active_port, _ws_path)) =
+    let devtools_port_opt =
         crate::services::profile_service::SystemBrowserLauncher::parse_devtools_active_port(
             profile_dir,
-        )
-    {
-        if active_port != debug_port {
+        );
+    // If DevToolsActivePort exists in the profile dir, its port MUST match debug_port
+    if let Some((active_port, _)) = &devtools_port_opt {
+        if *active_port != debug_port {
             return Err(BrowserVerificationError::SessionMismatch);
         }
     }
@@ -1072,7 +1091,8 @@ pub fn verify_managed_cdp_ownership(
         return Ok(());
     }
 
-    if !profile_dir.exists() {
+    // In live mode, DevToolsActivePort MUST exist in the managed profile directory and match debug_port
+    if !profile_dir.exists() || devtools_port_opt.is_none() {
         return Err(BrowserVerificationError::SessionMismatch);
     }
 
@@ -1119,8 +1139,8 @@ pub fn verify_managed_cdp_ownership(
             }
         }
 
-        // Verify socket ownership via lsof when available on macOS/Unix
-        if let Ok(lsof_out) = Command::new("lsof")
+        // Verify socket ownership via lsof on macOS/Unix (fail closed if lsof fails or does not confirm)
+        let lsof_out = Command::new("lsof")
             .args([
                 "-nP",
                 "-a",
@@ -1130,15 +1150,13 @@ pub fn verify_managed_cdp_ownership(
                 "-sTCP:LISTEN",
             ])
             .output()
-        {
-            if lsof_out.status.success() {
-                let stdout = String::from_utf8_lossy(&lsof_out.stdout);
-                if !stdout.contains(&format!(":{}", debug_port)) {
-                    return Err(BrowserVerificationError::SessionMismatch);
-                }
-            } else if crate::services::profile_service::SystemBrowserLauncher::parse_devtools_active_port(profile_dir).is_none() {
-                return Err(BrowserVerificationError::SessionMismatch);
-            }
+            .map_err(|_| BrowserVerificationError::SessionMismatch)?;
+        if !lsof_out.status.success() {
+            return Err(BrowserVerificationError::SessionMismatch);
+        }
+        let stdout = String::from_utf8_lossy(&lsof_out.stdout);
+        if !stdout.contains(&format!(":{}", debug_port)) {
+            return Err(BrowserVerificationError::SessionMismatch);
         }
     }
 

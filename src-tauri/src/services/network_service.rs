@@ -174,6 +174,7 @@ pub struct NetworkService {
     hypervisor: Arc<dyn HypervisorAdapter>,
     secret_store: Arc<dyn SecretStore>,
     audit_service: Arc<AuditService>,
+    active_verifications: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
 }
 
 impl NetworkService {
@@ -187,6 +188,7 @@ impl NetworkService {
             hypervisor,
             secret_store: get_secret_store(),
             audit_service,
+            active_verifications: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
         }
     }
 
@@ -201,6 +203,7 @@ impl NetworkService {
             hypervisor,
             secret_store,
             audit_service,
+            active_verifications: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
         }
     }
 
@@ -1111,6 +1114,35 @@ impl NetworkService {
         environment_id: &str,
         profile_service: &ProfileService,
     ) -> Result<NetworkCheckRecord, String> {
+        // Per-environment single-flight guard: prevent concurrent competing CDP verification tabs
+        struct SingleFlightGuard {
+            set: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+            env_id: String,
+        }
+        impl Drop for SingleFlightGuard {
+            fn drop(&mut self) {
+                if let Ok(mut guard) = self.set.lock() {
+                    guard.remove(&self.env_id);
+                }
+            }
+        }
+        {
+            let mut active = self
+                .active_verifications
+                .lock()
+                .map_err(|_| "Internal lock poisoned in active_verifications".to_string())?;
+            if !active.insert(environment_id.to_string()) {
+                return Err(format!(
+                    "Browser egress verification is already in progress for environment {}",
+                    environment_id
+                ));
+            }
+        }
+        let _single_flight_guard = SingleFlightGuard {
+            set: Arc::clone(&self.active_verifications),
+            env_id: environment_id.to_string(),
+        };
+
         let now = Utc::now().to_rfc3339();
         let check_id = Uuid::new_v4().to_string();
 

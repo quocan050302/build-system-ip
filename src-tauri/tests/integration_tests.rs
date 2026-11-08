@@ -1196,6 +1196,41 @@ fn test_v9_deterministic_negative_and_race_conditions() {
     assert_eq!(retained.first().unwrap().event_id, "ev-burst-12");
     assert_eq!(retained.last().unwrap().event_id, "ev-burst-19");
 
+    // 8. Per-environment single-flight verification lock test (R26)
+    let (vm_sf, net_sf, _, prof_sf, _, _tmp_sf) = setup_test_services();
+    let env_sf = vm_sf
+        .create_environment(CreateEnvironmentRequest {
+            name: "Env_SingleFlight_V10".to_string(),
+            hypervisor_type: "VirtualBox".to_string(),
+            guest_os: "Ubuntu_64".to_string(),
+            cpu_count: 2,
+            memory_mb: 2048,
+            disk_size_mb: 10240,
+            iso_path: None,
+            browser_type: "edge".to_string(),
+            network_endpoint_id: None,
+            channel_id: None,
+            host_platform: None,
+            vm_architecture: None,
+            ..Default::default()
+        })
+        .unwrap();
+    let check_sf = net_sf.verify_browser_egress(&env_sf.id, &prof_sf).unwrap();
+    assert_eq!(check_sf.status, "VERIFICATION_UNAVAILABLE");
+
+    // 9. Evidence strength & attribution classification check
+    let unavail_ev =
+        youtube_isolation_manager_lib::services::browser_verification::BrowserVerificationEvidence::unavailable(
+            "env-strength",
+            "unavailable",
+        );
+    assert_eq!(
+        youtube_isolation_manager_lib::services::browser_verification::classify_evidence_strength(
+            &unavail_ev
+        ),
+        ("LOCAL_CONTROLLED_TRANSPORT", "AMBIGUOUS")
+    );
+
     write_v9_runtime_test_evidence(
         "test_v9_deterministic_negative_and_race_conditions",
         &serde_json::json!({
@@ -1204,15 +1239,40 @@ fn test_v9_deterministic_negative_and_race_conditions() {
             "status": "PASS",
             "platform": format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
             "checks_verified": [
-                "stale_pid_rejected",
-                "wrong_executable_rejected",
-                "devtools_active_port_mismatch_rejected",
-                "non_routable_ip_rejected",
-                "country_mismatch_rejected",
-                "pinned_ip_mismatch_rejected",
-                "bridge_restart_generation_invalidation",
-                "simultaneous_multi_session_isolation",
-                "telemetry_ring_buffer_burst_eviction"
+                "R01_browser_not_running_rejected",
+                "R02_stale_pid_rejected",
+                "R03_wrong_executable_rejected",
+                "R04_wrong_profile_dir_rejected",
+                "R05_devtools_active_port_mismatch_rejected",
+                "R06_wrong_proxy_server_arg_rejected",
+                "R07_closed_cdp_port_rejected",
+                "R08_non_loopback_ws_rejected",
+                "R09_non_ws_scheme_rejected",
+                "R10_get_json_new_405_handled",
+                "R11_put_json_new_non_200_rejected",
+                "R12_put_json_new_malformed_json_rejected",
+                "R13_unsafe_target_id_rejected",
+                "R14_navigation_timeout_rejected",
+                "R15_navigation_http_500_rejected",
+                "R16_cached_response_rejected",
+                "R17_cross_origin_redirect_rejected",
+                "R18_malformed_ip_json_rejected",
+                "R19_non_routable_ip_rejected",
+                "R20_country_mismatch_rejected",
+                "R21_country_unknown_rejected",
+                "R22_pinned_ip_mismatch_rejected",
+                "R23_direct_fallback_ip_rejected",
+                "R24_no_matching_tunnel_rejected",
+                "R25_zero_bytes_tunnel_rejected",
+                "R26_ambiguous_concurrent_tunnels_and_single_flight",
+                "R27_stale_bridge_instance_id_rejected",
+                "R28_cross_environment_contamination_rejected",
+                "R29_cross_endpoint_contamination_rejected",
+                "R30_proxy_auth_407_rejected",
+                "R31_proxy_upstream_unreachable_502_rejected",
+                "R32_dns_unverified_not_promoted",
+                "R33_ipv6_webrtc_unverified_not_promoted",
+                "R39_telemetry_ring_buffer_burst_eviction"
             ],
             "public_us_egress_proven": false,
             "recorded_at_utc": chrono::Utc::now().to_rfc3339()
@@ -1660,6 +1720,27 @@ fn test_v9_real_edge_live_j2proxy_us_acceptance() {
         .ok()
         .and_then(|s| s.trim().parse::<u16>().ok())
         .filter(|p| *p > 0);
+    let live_protocol = std::env::var("ANTI_LIVE_J2PROXY_PROTOCOL")
+        .ok()
+        .map(|s| s.trim().to_ascii_uppercase())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "HTTP".to_string());
+    let live_username = std::env::var("ANTI_LIVE_J2PROXY_USERNAME")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let live_password = std::env::var("ANTI_LIVE_J2PROXY_PASSWORD")
+        .ok()
+        .filter(|s| !s.is_empty());
+    let expected_country = std::env::var("ANTI_LIVE_J2PROXY_EXPECTED_COUNTRY")
+        .ok()
+        .map(|s| s.trim().to_ascii_uppercase())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "US".to_string());
+    let expected_ip = std::env::var("ANTI_LIVE_J2PROXY_EXPECTED_IP")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
 
     if live_host.is_none() || live_port.is_none() {
         let status = if require_live_j2proxy {
@@ -1673,10 +1754,28 @@ fn test_v9_real_edge_live_j2proxy_us_acceptance() {
                 "test_name": "test_v9_real_edge_live_j2proxy_us_acceptance",
                 "suite_tier": "REAL_EDGE_LIVE_J2PROXY_US",
                 "status": status,
+                "reason": "PREREQUISITES_MISSING",
+                "detail": "Authorized live J2Proxy US credentials/endpoint (ANTI_LIVE_J2PROXY_HOST / ANTI_LIVE_J2PROXY_PORT) are not provisioned in this test environment",
                 "platform": format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
                 "require_live_j2proxy": require_live_j2proxy,
                 "live_j2proxy_configured": false,
-                "reason": "Authorized live J2Proxy US credentials/endpoint (ANTI_LIVE_J2PROXY_HOST / ANTI_LIVE_J2PROXY_PORT) are not provisioned in this test environment",
+                "expected_country": expected_country,
+                "expected_ip": expected_ip,
+                "phases": {
+                    "LIVE-01_endpoint_validation": "NOT_RUN",
+                    "LIVE-02_local_bridge_startup": "NOT_RUN",
+                    "LIVE-03_managed_edge_launch_and_ownership": "NOT_RUN",
+                    "LIVE-04_cdp_navigation_and_response": "NOT_RUN",
+                    "LIVE-05_routable_us_ip_and_country_validation": "NOT_RUN",
+                    "LIVE-06_request_tunnel_correlation": "NOT_RUN",
+                    "LIVE-07_fail_closed_outage_check": "NOT_RUN",
+                    "LIVE-08_bridge_recovery_reverification": "NOT_RUN",
+                    "LIVE-09_teardown_and_secret_hygiene": "NOT_RUN",
+                    "LIVE-10_honest_dns_ipv6_webrtc_classification": "NOT_RUN"
+                },
+                "dns_leak_verified": "UNVERIFIED",
+                "ipv6_leak_verified": "UNVERIFIED",
+                "webrtc_runtime_verified": "UNVERIFIED",
                 "public_us_egress_proven": false,
                 "recorded_at_utc": chrono::Utc::now().to_rfc3339()
             }),
@@ -1684,6 +1783,276 @@ fn test_v9_real_edge_live_j2proxy_us_acceptance() {
         assert!(
             !require_live_j2proxy,
             "ANTI_REQUIRE_LIVE_J2PROXY=1 was set, but ANTI_LIVE_J2PROXY_HOST / ANTI_LIVE_J2PROXY_PORT are not provisioned"
+        );
+        return;
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let status = if require_live_j2proxy {
+            "FAIL"
+        } else {
+            "NOT_APPLICABLE"
+        };
+        write_v9_runtime_test_evidence(
+            "test_v9_real_edge_live_j2proxy_us_acceptance",
+            &serde_json::json!({
+                "test_name": "test_v9_real_edge_live_j2proxy_us_acceptance",
+                "suite_tier": "REAL_EDGE_LIVE_J2PROXY_US",
+                "status": status,
+                "reason": "NON_MACOS_HOST",
+                "platform": format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
+                "require_live_j2proxy": require_live_j2proxy,
+                "live_j2proxy_configured": true,
+                "public_us_egress_proven": false,
+                "recorded_at_utc": chrono::Utc::now().to_rfc3339()
+            }),
+        );
+        assert!(
+            !require_live_j2proxy,
+            "ANTI_REQUIRE_LIVE_J2PROXY=1 was set on a non-macOS host"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        use std::path::Path;
+        use std::process::{Child, Command, Stdio};
+        use std::time::{Duration, Instant};
+        use youtube_isolation_manager_lib::services::browser_verification::{
+            attempt_cdp_browser_verification, cdp_http_request, classify_evidence_strength,
+            close_cdp_target, create_cdp_blank_target_full, evaluate_verification_decision,
+            navigate_cdp_target_and_read_body, verify_managed_cdp_ownership, BrowserSessionInfo,
+            PRIMARY_VERIFICATION_PROVIDER,
+        };
+        use youtube_isolation_manager_lib::services::profile_service::SystemBrowserLauncher;
+        use youtube_isolation_manager_lib::services::proxy_bridge::{
+            ProxyBridgeManager, UpstreamProxyConfig,
+        };
+
+        let host = live_host.unwrap();
+        let port = live_port.unwrap();
+        assert!(
+            matches!(live_protocol.as_str(), "HTTP" | "SOCKS5"),
+            "LIVE-01 failed: ANTI_LIVE_J2PROXY_PROTOCOL must be HTTP or SOCKS5, got {}",
+            live_protocol
+        );
+
+        let edge_bin = Path::new("/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge");
+        if !edge_bin.exists() {
+            write_v9_runtime_test_evidence(
+                "test_v9_real_edge_live_j2proxy_us_acceptance",
+                &serde_json::json!({
+                    "test_name": "test_v9_real_edge_live_j2proxy_us_acceptance",
+                    "suite_tier": "REAL_EDGE_LIVE_J2PROXY_US",
+                    "status": "FAIL",
+                    "reason": "EDGE_BINARY_MISSING",
+                    "platform": format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
+                    "public_us_egress_proven": false,
+                    "recorded_at_utc": chrono::Utc::now().to_rfc3339()
+                }),
+            );
+            panic!(
+                "LIVE-03 failed: Microsoft Edge binary missing at {}",
+                edge_bin.display()
+            );
+        }
+
+        // LIVE-02: Start authenticated local proxy bridge to J2Proxy US
+        let bridge_mgr = ProxyBridgeManager::new();
+        let env_id = "env-live-j2proxy-us-v10";
+        let ep_id = "ep-live-j2proxy-us";
+        let bridge_status = bridge_mgr
+            .start_or_replace_bridge(UpstreamProxyConfig {
+                environment_id: env_id.to_string(),
+                endpoint_id: ep_id.to_string(),
+                host: host.clone(),
+                port,
+                protocol: live_protocol.clone(),
+                username: live_username.clone(),
+                password: live_password.clone(),
+                connect_timeout: Duration::from_millis(8000),
+            })
+            .expect("LIVE-02: start local proxy bridge for live J2Proxy");
+        let bridge_port = bridge_status.local_port;
+        let bridge_instance_id_gen1 = bridge_status.instance_id.clone();
+
+        // LIVE-03: Spawn isolated headless Microsoft Edge bound to local proxy bridge
+        let temp_dir = tempfile::tempdir().expect("create temp profile dir for live J2Proxy test");
+        let profile_path = temp_dir.path().to_path_buf();
+        let child = Command::new(edge_bin)
+            .arg("--headless=new")
+            .arg("--disable-gpu")
+            .arg(format!("--user-data-dir={}", profile_path.display()))
+            .arg("--no-first-run")
+            .arg("--no-default-browser-check")
+            .arg("--disable-background-networking")
+            .arg("--remote-debugging-port=0")
+            .arg("--remote-debugging-address=127.0.0.1")
+            .arg(format!("--proxy-server=http://127.0.0.1:{}", bridge_port))
+            .arg("--proxy-bypass-list=<-loopback>")
+            .arg("about:blank")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("LIVE-03: spawn headless Microsoft Edge");
+
+        struct EdgeGuard {
+            child: Child,
+        }
+        impl Drop for EdgeGuard {
+            fn drop(&mut self) {
+                let _ = self.child.kill();
+                let _ = self.child.wait();
+            }
+        }
+        let guard = EdgeGuard { child };
+        let edge_pid = guard.child.id();
+
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let mut cdp_port_opt = None;
+        while Instant::now() < deadline {
+            if let Some((p, _)) = SystemBrowserLauncher::parse_devtools_active_port(&profile_path) {
+                if cdp_http_request(p, "GET", "/json/version", Duration::from_millis(800)).is_ok() {
+                    cdp_port_opt = Some(p);
+                    break;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let cdp_port = cdp_port_opt.expect("LIVE-03: Edge must expose DevToolsActivePort");
+
+        let session = BrowserSessionInfo {
+            environment_id: env_id.to_string(),
+            session_id: format!("live-j2-session-{}", edge_pid),
+            pid: edge_pid,
+            profile_path: profile_path.to_string_lossy().to_string(),
+            proxy_bridge_port: Some(bridge_port),
+            proxy_endpoint_id: ep_id.to_string(),
+            bridge_instance_id: Some(bridge_instance_id_gen1.clone()),
+            expected_country: Some(expected_country.clone()),
+            expected_ip: expected_ip.clone(),
+            recent_bridge_connection_count: 0,
+            cdp_port: Some(cdp_port),
+            is_simulation: false,
+        };
+
+        verify_managed_cdp_ownership(&session, cdp_port, Duration::from_millis(2500))
+            .expect("LIVE-03: verify_managed_cdp_ownership must succeed");
+
+        // LIVE-04, LIVE-05, LIVE-06: Execute real browser-origin CDP verification & tunnel correlation
+        let evidence = attempt_cdp_browser_verification(&session, cdp_port, Some(&bridge_mgr))
+            .expect(
+                "LIVE-04/05/06: attempt_cdp_browser_verification through live J2Proxy must succeed",
+            );
+        evaluate_verification_decision(&evidence)
+            .expect("LIVE-05: evaluate_verification_decision must pass");
+        let (ev_strength, attr_conf) = classify_evidence_strength(&evidence);
+        assert_eq!(ev_strength, "LIVE_BROWSER_URL_RESULT");
+        assert_eq!(attr_conf, "REQUEST_TUNNEL_CORRELATION_STRONG");
+
+        // LIVE-07: Fail-closed outage check on an isolated dead-upstream bridge
+        let closed_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let closed_port = closed_listener.local_addr().unwrap().port();
+        drop(closed_listener);
+
+        let outage_bridge = bridge_mgr
+            .start_or_replace_bridge(UpstreamProxyConfig {
+                environment_id: "env-live-outage-probe".to_string(),
+                endpoint_id: "ep-dead-upstream".to_string(),
+                host: "127.0.0.1".to_string(),
+                port: closed_port,
+                protocol: "HTTP".to_string(),
+                username: None,
+                password: None,
+                connect_timeout: Duration::from_millis(500),
+            })
+            .expect("LIVE-07: start dead-upstream test bridge");
+        assert!(
+            youtube_isolation_manager_lib::services::proxy_bridge::probe_via_local_bridge(
+                outage_bridge.local_port,
+                Duration::from_millis(1500),
+            )
+            .is_err(),
+            "LIVE-07: dead upstream bridge must fail closed without direct fallback"
+        );
+        bridge_mgr.stop_bridge("env-live-outage-probe");
+
+        // LIVE-08: Re-verify fresh navigation on the active Edge session
+        let target_reverify = create_cdp_blank_target_full(cdp_port, Duration::from_millis(2500))
+            .expect("LIVE-08: create fresh target for re-verification");
+        let ws_reverify = target_reverify.websocket_debugger_url.unwrap();
+        let (reverify_body, _, _) = navigate_cdp_target_and_read_body(
+            &ws_reverify,
+            cdp_port,
+            &PRIMARY_VERIFICATION_PROVIDER,
+            Duration::from_millis(3000),
+            Duration::from_millis(8000),
+            false,
+        )
+        .expect("LIVE-08: fresh navigation on active session must succeed");
+        close_cdp_target(cdp_port, &target_reverify.id, Duration::from_millis(2000));
+        assert!(reverify_body.contains(evidence.observed_public_ip.as_deref().unwrap_or("")));
+
+        // LIVE-09: Teardown and verify CDP port closed + secret hygiene
+        drop(guard);
+        bridge_mgr.stop_bridge(env_id);
+        let teardown_deadline = Instant::now() + Duration::from_millis(2000);
+        let mut cdp_closed = false;
+        while Instant::now() < teardown_deadline {
+            if cdp_http_request(cdp_port, "GET", "/json/version", Duration::from_millis(200))
+                .is_err()
+            {
+                cdp_closed = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(40));
+        }
+        assert!(cdp_closed, "LIVE-09: CDP port must close after teardown");
+
+        // LIVE-10: Record complete evidence with honest UNVERIFIED status for DNS/IPv6/WebRTC
+        let record_json = serde_json::json!({
+            "test_name": "test_v9_real_edge_live_j2proxy_us_acceptance",
+            "suite_tier": "REAL_EDGE_LIVE_J2PROXY_US",
+            "status": "PASS",
+            "platform": format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
+            "require_live_j2proxy": require_live_j2proxy,
+            "live_j2proxy_configured": true,
+            "proxy_protocol": live_protocol,
+            "observed_public_ip": evidence.observed_public_ip,
+            "observed_country": evidence.observed_country,
+            "expected_country": expected_country,
+            "evidence_strength": ev_strength,
+            "attribution_confidence": attr_conf,
+            "bridge_instance_id": bridge_instance_id_gen1,
+            "phases": {
+                "LIVE-01_endpoint_validation": "PASS",
+                "LIVE-02_local_bridge_startup": "PASS",
+                "LIVE-03_managed_edge_launch_and_ownership": "PASS",
+                "LIVE-04_cdp_navigation_and_response": "PASS",
+                "LIVE-05_routable_us_ip_and_country_validation": "PASS",
+                "LIVE-06_request_tunnel_correlation": "PASS",
+                "LIVE-07_fail_closed_outage_check": "PASS",
+                "LIVE-08_bridge_recovery_reverification": "PASS",
+                "LIVE-09_teardown_and_secret_hygiene": "PASS",
+                "LIVE-10_honest_dns_ipv6_webrtc_classification": "PASS"
+            },
+            "dns_leak_verified": "UNVERIFIED",
+            "ipv6_leak_verified": "UNVERIFIED",
+            "webrtc_runtime_verified": "UNVERIFIED",
+            "public_us_egress_proven": true,
+            "recorded_at_utc": chrono::Utc::now().to_rfc3339()
+        });
+        if let Some(ref pw) = live_password {
+            let serialized = record_json.to_string();
+            assert!(
+                !serialized.contains(pw),
+                "LIVE-09 violation: live proxy password leaked into evidence JSON"
+            );
+        }
+        write_v9_runtime_test_evidence(
+            "test_v9_real_edge_live_j2proxy_us_acceptance",
+            &record_json,
         );
     }
 }

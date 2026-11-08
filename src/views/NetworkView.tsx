@@ -337,17 +337,22 @@ export const NetworkView: React.FC<NetworkViewProps> = ({
                         </div>
                       )}
 
-                      {/* DNS / WebRTC protection badges */}
-                      {(env.last_dns_leak_status || env.last_webrtc_status) && (
-                        <div className="flex items-center justify-between text-[11px]">
-                          <span className="text-slate-400">DNS / WebRTC:</span>
-                          <span className="flex items-center gap-1">
-                            {getDnsWebRtcBadge(env.last_dns_leak_status)}
-                            <span className="text-slate-600">/</span>
-                            {getDnsWebRtcBadge(env.last_webrtc_status)}
+                      {/* DNS / IPv6 / WebRTC protection badges (always shown explicitly so UNVERIFIED is never hidden) */}
+                      <div className="flex items-center justify-between text-[11px]">
+                        <span className="text-slate-400">DNS / IPv6 / WebRTC:</span>
+                        <span className="flex items-center gap-1">
+                          {getDnsWebRtcBadge(env.last_dns_leak_status || 'UNVERIFIED')}
+                          <span className="text-slate-600">/</span>
+                          <span
+                            className="text-[10px] font-mono px-1.5 py-0.5 rounded border bg-amber-950/60 text-amber-400 border-amber-700/60"
+                            title="IPv6 leak status is not independently verified by an external IPv6 observer"
+                          >
+                            ⚠️ IPv6 Unverified
                           </span>
-                        </div>
-                      )}
+                          <span className="text-slate-600">/</span>
+                          {getDnsWebRtcBadge(env.last_webrtc_status || 'UNVERIFIED')}
+                        </span>
+                      </div>
 
                       <div className="flex items-center justify-between text-[11px] pt-1 border-t border-surface-750/80 text-slate-500">
                         <span>Last Verified:</span>
