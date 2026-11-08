@@ -94,6 +94,16 @@ def sha256_file(path: Path) -> str:
     return h.hexdigest()
 
 
+def sha256_text_fixture(path: Path) -> str:
+    """
+    Compute canonical LF-normalized SHA256 digest of a text/JSONL fixture so Windows
+    git core.autocrlf checkouts (\r\n) and POSIX checkouts (\n) produce the exact same
+    canonical content digest.
+    """
+    raw = path.read_bytes().replace(b"\r\n", b"\n")
+    return hashlib.sha256(raw).hexdigest()
+
+
 def _probe_available_memory_mib() -> Tuple[Optional[float], str]:
     """
     Measure available system memory in MiB without external dependencies.
@@ -580,10 +590,10 @@ async def run_orchestrator_selftests(artifact_dir: Path, workspace_dir: Path) ->
     exit_code = 0
 
     try:
-        # 1. Verify immutable fixture SHA256 digests
+        # 1. Verify immutable fixture SHA256 digests (canonical LF-normalized across POSIX/Windows)
         for rel_path, expected_sha in EXPECTED_FIXTURE_DIGESTS.items():
             full_path = workspace_dir / rel_path
-            actual_sha = sha256_file(full_path)
+            actual_sha = sha256_text_fixture(full_path)
             if actual_sha != expected_sha:
                 raise AssertionError(
                     f"Immutable fixture {rel_path} SHA256 mismatch: expected {expected_sha}, got {actual_sha}"
@@ -598,7 +608,7 @@ async def run_orchestrator_selftests(artifact_dir: Path, workspace_dir: Path) ->
         ]
         if len(adv_lines) != 15:
             raise AssertionError(f"Expected 15 adversarial holdout cases, found {len(adv_lines)}")
-        adv_sha = sha256_file(adv_path)
+        adv_sha = sha256_text_fixture(adv_path)
         lines.append(
             f"[PASS] Fixture src-tauri/tests/fixtures/v9_adversarial_holdout.jsonl (15 cases) SHA256: {adv_sha}"
         )
@@ -908,7 +918,7 @@ def create_run_manifest(
     ):
         fp = workspace_dir / rel
         if fp.exists():
-            fixture_digests[rel] = sha256_file(fp)
+            fixture_digests[rel] = sha256_text_fixture(fp)
 
     all_tasks_passed = all(
         t.status == "PASS" for t in tasks if t.task_id != "selftest_timeout_probe"
@@ -1022,6 +1032,11 @@ def _default_artifact_base() -> Path:
 
 
 def main() -> int:
+    if hasattr(sys.stdout, "reconfigure"):
+        try:
+            sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
     parser = argparse.ArgumentParser(description="ANTI V9 Bounded Async Verification Orchestrator")
     parser.add_argument("--artifact-dir", type=str, default="", help="Explicit artifact output directory")
     parser.add_argument("--skip-frontend", action="store_true", help="Skip frontend vitest/build branch")
