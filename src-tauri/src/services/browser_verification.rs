@@ -189,25 +189,41 @@ pub struct BrowserSessionInfo {
 }
 
 /// Helper to verify whether an OS process ID is currently alive.
+///
+/// # Safety (Unix)
+/// `kill(pid, 0)` is a standard POSIX signal probe — it never delivers a signal,
+/// only checks whether the process exists and is reachable by the caller.
 #[cfg(unix)]
 pub fn is_process_alive(pid: u32) -> bool {
     if pid == 0 {
         return false;
     }
-    unsafe { libc::kill(pid as i32, 0) == 0 }
+    // SAFETY: signal 0 is a standard POSIX liveness probe; it does not deliver
+    // a signal to the target process. The cast is safe: u32 fits in i32 for any
+    // realistic PID value (Linux PIDs are limited to 4_194_304 < i32::MAX).
+    unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
 }
 
+/// Helper to verify whether an OS process ID is currently alive.
+///
+/// # Safety (Windows)
+/// Uses `OpenProcess` with the minimum required access right
+/// (`PROCESS_QUERY_LIMITED_INFORMATION`) and immediately closes the handle.
+/// The handle is never stored or used for any other purpose.
 #[cfg(windows)]
 pub fn is_process_alive(pid: u32) -> bool {
     if pid == 0 {
         return false;
     }
-    use windows::Win32::System::Threading::{
-        CloseHandle, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
-    };
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+    // SAFETY: `OpenProcess` returns a handle or error; we immediately close it.
+    // `CloseHandle` is safe to call on a valid non-null handle returned by OpenProcess.
     unsafe {
         match OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) {
             Ok(handle) if !handle.is_invalid() => {
+                // Explicitly ignore the Result<()> returned by CloseHandle —
+                // failure to close does not affect the liveness determination.
                 let _ = CloseHandle(handle);
                 true
             }
