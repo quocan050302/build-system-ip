@@ -2187,6 +2187,38 @@ mod tests {
         assert_eq!(result, Err(BrowserVerificationError::SessionMismatch));
     }
 
+    fn read_http_req_until_end(stream: &mut TcpStream) -> String {
+        stream
+            .set_read_timeout(Some(Duration::from_millis(500)))
+            .ok();
+        let mut acc = Vec::with_capacity(512);
+        let mut chunk = [0u8; 512];
+        while acc.len() < 4096 {
+            match stream.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(n) => {
+                    acc.extend_from_slice(&chunk[..n]);
+                    if acc.windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        String::from_utf8_lossy(&acc).to_string()
+    }
+
+    fn finish_http_mock_response(stream: &mut TcpStream, resp: &[u8]) {
+        let _ = stream.write_all(resp);
+        let _ = stream.flush();
+        let _ = stream.shutdown(std::net::Shutdown::Write);
+        stream
+            .set_read_timeout(Some(Duration::from_millis(50)))
+            .ok();
+        let mut drain = [0u8; 128];
+        let _ = stream.read(&mut drain);
+    }
+
     #[test]
     fn test_cdp_security_violation_when_non_loopback_ws() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -2205,33 +2237,29 @@ mod tests {
         std::thread::spawn(move || {
             for _ in 0..3 {
                 if let Ok((mut stream, _)) = listener.accept() {
-                    let mut buf = [0u8; 1024];
-                    let n = match stream.read(&mut buf) {
-                        Ok(n) => n,
-                        Err(_) => break,
-                    };
-                    let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                    let req = read_http_req_until_end(&mut stream);
                     if req.starts_with("PUT /json/new") {
                         let resp = format!(
                             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                             new_body.len(), new_body
                         );
-                        let _ = stream.write_all(resp.as_bytes());
+                        finish_http_mock_response(&mut stream, resp.as_bytes());
                     } else if req.starts_with("GET /json/new") {
                         let msg = "Using unsafe HTTP verb GET to invoke /json/new. This action supports only PUT verb.";
                         let resp = format!(
                             "HTTP/1.1 405 Method Not Allowed\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                             msg.len(), msg
                         );
-                        let _ = stream.write_all(resp.as_bytes());
+                        finish_http_mock_response(&mut stream, resp.as_bytes());
                     } else if req.starts_with("GET /json/list") {
                         let resp = format!(
                             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                             list_body.len(), list_body
                         );
-                        let _ = stream.write_all(resp.as_bytes());
+                        finish_http_mock_response(&mut stream, resp.as_bytes());
                     } else if req.starts_with("GET /json/close") {
-                        let _ = stream.write_all(
+                        finish_http_mock_response(
+                            &mut stream,
                             b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK",
                         );
                     }
@@ -2276,6 +2304,16 @@ mod tests {
         ws_country_code: &'static str,
         ws_ip: &'static str,
     ) {
+        spawn_mock_cdp_server_with_close_tracker(listener, target_id, ws_country_code, ws_ip, None);
+    }
+
+    fn spawn_mock_cdp_server_with_close_tracker(
+        listener: TcpListener,
+        target_id: &'static str,
+        ws_country_code: &'static str,
+        ws_ip: &'static str,
+        close_tracker: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    ) {
         let port = listener.local_addr().unwrap().port();
         let ws_path = format!("/devtools/page/{}", target_id);
         let ws_url = format!("ws://127.0.0.1:{}{}", port, ws_path);
@@ -2283,6 +2321,9 @@ mod tests {
         std::thread::spawn(move || {
             for _ in 0..8 {
                 if let Ok((mut stream, _)) = listener.accept() {
+                    stream
+                        .set_read_timeout(Some(Duration::from_millis(1000)))
+                        .ok();
                     let mut peek_buf = [0u8; 512];
                     let peeked = match stream.peek(&mut peek_buf) {
                         Ok(n) if n > 0 => n,
@@ -2291,8 +2332,7 @@ mod tests {
                     let peek_str = String::from_utf8_lossy(&peek_buf[..peeked]);
 
                     if peek_str.starts_with("PUT /json/new") {
-                        let mut buf = [0u8; 512];
-                        let _ = stream.read(&mut buf);
+                        let _ = read_http_req_until_end(&mut stream);
                         let body = format!(
                             r#"{{"id":"{}","type":"page","title":"","url":"about:blank","webSocketDebuggerUrl":"{}"}}"#,
                             target_id, ws_url
@@ -2302,20 +2342,18 @@ mod tests {
                             body.len(),
                             body
                         );
-                        let _ = stream.write_all(resp.as_bytes());
+                        finish_http_mock_response(&mut stream, resp.as_bytes());
                     } else if peek_str.starts_with("GET /json/new") {
-                        let mut buf = [0u8; 512];
-                        let _ = stream.read(&mut buf);
+                        let _ = read_http_req_until_end(&mut stream);
                         let msg = "Using unsafe HTTP verb GET to invoke /json/new. This action supports only PUT verb.";
                         let resp = format!(
                             "HTTP/1.1 405 Method Not Allowed\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                             msg.len(),
                             msg
                         );
-                        let _ = stream.write_all(resp.as_bytes());
+                        finish_http_mock_response(&mut stream, resp.as_bytes());
                     } else if peek_str.starts_with("GET /json/list") {
-                        let mut buf = [0u8; 512];
-                        let _ = stream.read(&mut buf);
+                        let _ = read_http_req_until_end(&mut stream);
                         let body = format!(
                             r#"[{{"id":"{}","type":"page","title":"","url":"about:blank","webSocketDebuggerUrl":"{}"}}]"#,
                             target_id, ws_url
@@ -2325,11 +2363,14 @@ mod tests {
                             body.len(),
                             body
                         );
-                        let _ = stream.write_all(resp.as_bytes());
+                        finish_http_mock_response(&mut stream, resp.as_bytes());
                     } else if peek_str.starts_with("GET /json/close") {
-                        let mut buf = [0u8; 512];
-                        let _ = stream.read(&mut buf);
-                        let _ = stream.write_all(
+                        let _ = read_http_req_until_end(&mut stream);
+                        if let Some(ref tracker) = close_tracker {
+                            tracker.store(true, std::sync::atomic::Ordering::SeqCst);
+                        }
+                        finish_http_mock_response(
+                            &mut stream,
                             b"HTTP/1.1 200 OK\r\nContent-Length: 17\r\nConnection: close\r\n\r\nTarget is closing",
                         );
                     } else if peek_str.contains("Upgrade: websocket")
@@ -2427,6 +2468,11 @@ mod tests {
                                     let _ = ws.send(tungstenite::Message::Text(
                                         body_resp.to_string().into(),
                                     ));
+                                    let _ = ws.flush();
+                                    ws.get_mut()
+                                        .set_read_timeout(Some(Duration::from_millis(100)))
+                                        .ok();
+                                    let _ = ws.read();
                                     break;
                                 }
                                 _ => {}
@@ -2670,32 +2716,28 @@ mod tests {
 
         std::thread::spawn(move || {
             if let Ok((mut stream, _)) = listener.accept() {
-                let mut buf = [0u8; 2048];
-                if let Ok(n) = stream.read(&mut buf) {
-                    let req = String::from_utf8_lossy(&buf[..n]).to_string();
-                    *received_clone.lock().unwrap() = Some(req.clone());
+                let req = read_http_req_until_end(&mut stream);
+                *received_clone.lock().unwrap() = Some(req.clone());
 
-                    if req.starts_with("PUT /json/new?about:blank") {
-                        let body = format!(
-                            r#"{{"id":"fake-target-id","type":"page","title":"","url":"about:blank","webSocketDebuggerUrl":"ws://127.0.0.1:{}/devtools/page/fake-target-id"}}"#,
-                            port
-                        );
-                        let resp = format!(
-                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                            body.len(),
-                            body
-                        );
-                        let _ = stream.write_all(resp.as_bytes());
-                        let _ = stream.flush();
-                    } else {
-                        let msg = "Using unsafe HTTP verb GET to invoke /json/new. This action supports only PUT verb.";
-                        let resp = format!(
-                            "HTTP/1.1 405 Method Not Allowed\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                            msg.len(),
-                            msg
-                        );
-                        let _ = stream.write_all(resp.as_bytes());
-                    }
+                if req.starts_with("PUT /json/new?about:blank") {
+                    let body = format!(
+                        r#"{{"id":"fake-target-id","type":"page","title":"","url":"about:blank","webSocketDebuggerUrl":"ws://127.0.0.1:{}/devtools/page/fake-target-id"}}"#,
+                        port
+                    );
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    finish_http_mock_response(&mut stream, resp.as_bytes());
+                } else {
+                    let msg = "Using unsafe HTTP verb GET to invoke /json/new. This action supports only PUT verb.";
+                    let resp = format!(
+                        "HTTP/1.1 405 Method Not Allowed\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        msg.len(),
+                        msg
+                    );
+                    finish_http_mock_response(&mut stream, resp.as_bytes());
                 }
             }
         });
@@ -2725,15 +2767,14 @@ mod tests {
 
         std::thread::spawn(move || {
             if let Ok((mut stream, _)) = listener.accept() {
-                let mut buf = [0u8; 1024];
-                let _ = stream.read(&mut buf);
+                let _ = read_http_req_until_end(&mut stream);
                 let msg = "Method Not Allowed";
                 let resp = format!(
                     "HTTP/1.1 405 Method Not Allowed\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                     msg.len(),
                     msg
                 );
-                let _ = stream.write_all(resp.as_bytes());
+                finish_http_mock_response(&mut stream, resp.as_bytes());
             }
         });
 
@@ -2763,14 +2804,10 @@ mod tests {
 
         std::thread::spawn(move || {
             if let Ok((mut stream, _)) = listener.accept() {
-                let mut buf = [0u8; 2048];
-                if let Ok(n) = stream.read(&mut buf) {
-                    let req = String::from_utf8_lossy(&buf[..n]).to_string();
-                    *received_clone.lock().unwrap() = Some(req.clone());
-                    let resp =
-                        "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK";
-                    let _ = stream.write_all(resp.as_bytes());
-                }
+                let req = read_http_req_until_end(&mut stream);
+                *received_clone.lock().unwrap() = Some(req);
+                let resp = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK";
+                finish_http_mock_response(&mut stream, resp);
             }
         });
 
@@ -2805,88 +2842,13 @@ mod tests {
 
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
-        let target_id = "cleanup-test-target-1";
-        let ws_path = format!("/devtools/page/{}", target_id);
-        let ws_url_str = format!("ws://127.0.0.1:{}{}", port, ws_path);
-
-        std::thread::spawn(move || {
-            for _ in 0..6 {
-                if let Ok((mut stream, _)) = listener.accept() {
-                    let mut peek_buf = [0u8; 512];
-                    let peeked = match stream.peek(&mut peek_buf) {
-                        Ok(n) if n > 0 => n,
-                        _ => continue,
-                    };
-                    let peek_str = String::from_utf8_lossy(&peek_buf[..peeked]);
-
-                    if peek_str.starts_with("PUT /json/new") {
-                        let mut buf = [0u8; 512];
-                        let _ = stream.read(&mut buf);
-                        let body = format!(
-                            r#"{{"id":"{}","type":"page","title":"","url":"about:blank","webSocketDebuggerUrl":"{}"}}"#,
-                            target_id, ws_url_str
-                        );
-                        let resp = format!(
-                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                            body.len(),
-                            body
-                        );
-                        let _ = stream.write_all(resp.as_bytes());
-                        let _ = stream.flush();
-                    } else if peek_str.starts_with("GET /json/list") {
-                        let mut buf = [0u8; 512];
-                        let _ = stream.read(&mut buf);
-                        let body = format!(
-                            r#"[{{"id":"{}","type":"page","title":"","url":"about:blank","webSocketDebuggerUrl":"{}"}}]"#,
-                            target_id, ws_url_str
-                        );
-                        let resp = format!(
-                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                            body.len(),
-                            body
-                        );
-                        let _ = stream.write_all(resp.as_bytes());
-                        let _ = stream.flush();
-                    } else if peek_str.starts_with(&format!("GET /json/close/{}", target_id)) {
-                        let mut buf = [0u8; 512];
-                        let _ = stream.read(&mut buf);
-                        close_clone.store(true, Ordering::SeqCst);
-                        let resp =
-                            "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK";
-                        let _ = stream.write_all(resp.as_bytes());
-                    } else if peek_str.contains("Upgrade: websocket")
-                        || (peek_str.starts_with("GET") && peek_str.contains(ws_path.as_str()))
-                    {
-                        let mut ws = match tungstenite::accept(stream) {
-                            Ok(ws) => ws,
-                            Err(_) => continue,
-                        };
-                        if let Ok(tungstenite::Message::Text(txt)) = ws.read() {
-                            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&txt) {
-                                let id = v.get("id").and_then(|i| i.as_i64()).unwrap_or(0);
-                                let resp_payload = serde_json::json!({
-                                    "id": id,
-                                    "result": {
-                                        "result": {
-                                            "type": "string",
-                                            "value": serde_json::json!({
-                                                "ip": "198.51.100.25",
-                                                "country_code": "US",
-                                                "country": "United States",
-                                                "success": true
-                                            }).to_string()
-                                        }
-                                    }
-                                });
-                                let _ = ws.send(tungstenite::Message::Text(
-                                    resp_payload.to_string().into(),
-                                ));
-                            }
-                        }
-                    }
-                }
-            }
-        });
+        spawn_mock_cdp_server_with_close_tracker(
+            listener,
+            "cleanup-test-target-1",
+            "US",
+            "198.51.100.25",
+            Some(close_clone),
+        );
 
         std::thread::sleep(Duration::from_millis(100));
 
