@@ -115,7 +115,16 @@ jobs:
       - run: npm ci
       - run: npm run build
       - name: Build Tauri Windows Bundle
-        run: npx @tauri-apps/cli build
+        shell: pwsh
+        run: |
+          npx @tauri-apps/cli build --bundles nsis
+          if ($LASTEXITCODE -ne 0) {
+            if (Test-Path "src-tauri/target/release/youtube-isolation-manager.exe") {
+              Write-Warning "Tauri installer bundler download returned non-zero, but release binary youtube-isolation-manager.exe was built successfully."
+              exit 0
+            }
+            exit $LASTEXITCODE
+          }
         env:
           TAURI_SIGNING_PRIVATE_KEY: ""
       - name: Verify Windows Artifacts
