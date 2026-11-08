@@ -107,7 +107,7 @@ The system uses a strict status hierarchy to avoid false PASS:
 | `ENDPOINT_CONFIGURED` | Proxy config saved to DB | — |
 | `ENDPOINT_REACHABLE` | TCP handshake succeeded | TCP connect to proxy host:port |
 | `PROXY_EGRESS_VERIFIED` | Backend Rust probe through bridge returned valid US IP | ipwho.is response via 127.0.0.1:bridge_port |
-| `BROWSER_EGRESS_VERIFIED` | Real Edge-origin request via CDP confirmed US exit IP, proxy route confirmed | CDP `Runtime.evaluate(fetch("https://ipwho.is/"))` → IP/country + `find_matching_tunnel` correlation |
+| `BROWSER_EGRESS_VERIFIED` | Real Edge-origin request via CDP confirmed US exit IP, session/profile ownership verified, and proxy CONNECT tunnel correlated | CDP `PUT /json/new?about:blank` + `Page.navigate` (`Network.getResponseBody`) + `verify_managed_cdp_ownership` (`DevToolsActivePort` / `ps` / `lsof`) + `correlate_connect_tunnel` (`HTTP_CONNECT` with `bytes_transferred > 0` and zero concurrent ambiguity) |
 | `VERIFICATION_UNAVAILABLE` | Cannot verify (browser not running, no bridge) | — |
 | `AUTH_FAILED` | Proxy credentials rejected (HTTP 407) | — |
 | `CONNECTION_FAILED` | Network path failed or country mismatch | — |
@@ -141,8 +141,9 @@ If `expected_country` is configured (e.g., "US"):
 
 1. **IPv6 bypass risk**: Edge may use IPv6 if the system has it; traffic would bypass the IPv4-only proxy bridge. Recommend disabling IPv6 at UTM VM network level, or adding `--disable-ipv6` to Edge launch args.
 2. **WebRTC runtime verification**: `--force-webrtc-ip-handling-policy=disable_non_proxied_udp` is applied at launch but not confirmed effective at runtime. Full verification requires injecting JavaScript via CDP to test `RTCPeerConnection`.
-3. **HTTPS CONNECT tunnel opacity**: HTTP CONNECT establishes an encrypted tunnel; the bridge can confirm the tunnel's upstream host and timestamp but cannot inspect individual encrypted requests inside it. Correlation in `find_matching_tunnel` relies on IP/timestamp heuristics.
-4. **Bridge port visibility**: Any local process can connect to the dynamic port if discovered. Consider token-based access control for the bridge in a future hardening pass.
+3. **HTTPS CONNECT tunnel opacity & V8 mitigation**: HTTP CONNECT establishes an encrypted TLS tunnel; the local proxy bridge cannot inspect encrypted HTTP payloads inside TLS without MITM interception (which is intentionally avoided to preserve certificate integrity). In V8, `BridgeTelemetry::correlate_connect_tunnel` requires an `HTTP_CONNECT` tunnel (rejecting `PLAIN_HTTP` backend probes), matching `environment_id`, `proxy_endpoint_id`, `bridge_instance_id`, exact provider `host:443`, `bytes_transferred > 0` tracked in real time during bidirectional relay, and **uniqueness** (if >1 concurrent `HTTP_CONNECT` tunnel to the same verification host:port overlaps the window, correlation returns `AmbiguousConcurrentTunnels` and fails closed to `PROXY_EGRESS_VERIFIED`).
+4. **CDP session & profile ownership (V8 hardening)**: Edge is launched with `--remote-debugging-port=0 --remote-debugging-address=127.0.0.1` and discovered via `<profile_dir>/DevToolsActivePort` (eliminating pre-bind TOCTOU races). Before any CDP verification runs, `verify_managed_cdp_ownership` verifies PID liveness, non-empty `profile_path`, `DevToolsActivePort` port match, OS process command line (`--user-data-dir`, `--proxy-server=http://127.0.0.1:<bridge_port>`, Edge executable), and TCP LISTEN ownership (`lsof`).
+5. **Bridge port visibility**: Any local process can connect to the dynamic port if discovered. Consider token-based access control for the bridge in a future hardening pass.
 
 ---
 

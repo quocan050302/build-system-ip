@@ -88,16 +88,20 @@ On Windows x64 (`x86_64-pc-windows-msvc`):
 
 ## Phase 6 — Proxy Verification Hardening (fix/macos-edge-us-proxy-verification-v2)
 
-### Status: ENGINEERING_READY_LIVE_VERIFICATION_PENDING (V7)
+### Status: ENGINEERING_READY_LIVE_VERIFICATION_PENDING (V8)
 
-### Changes delivered (cumulative V1–V7)
+### Changes delivered (cumulative V1–V8)
 
 #### Defect fixes
-1. **FALSE BROWSER_EGRESS_VERIFIED** — `verify_browser_egress()` now returns `PROXY_EGRESS_VERIFIED` for backend bridge probes. `BROWSER_EGRESS_VERIFIED` requires all four: managed Edge PID alive, CDP succeeded, globally-routable public IP observed, and proxy route confirmed.
-2. **UNKNOWN country false pass** — `UNKNOWN` and empty geolocation results now fail when `expected_country` is set.
+1. **FALSE BROWSER_EGRESS_VERIFIED** — `verify_browser_egress()` now returns `PROXY_EGRESS_VERIFIED` for backend bridge probes. `BROWSER_EGRESS_VERIFIED` requires all invariants: managed Edge PID alive, non-empty `profile_path`, verified CDP ownership (`DevToolsActivePort` + `ps` + `lsof`), CDP `PUT /json/new?about:blank` + `Page.navigate` response body parsed, globally-routable public IP observed, non-`UNKNOWN` country match, and unambiguous `HTTP_CONNECT` proxy tunnel with `bytes_transferred > 0`.
+2. **UNKNOWN country false pass** — `UNKNOWN` and empty geolocation results now fail when `expected_country` is set.Fallback IP-only providers (`api.ipify.org`) never fabricate a country code.
 3. **IP address validation** — `expected_ip` and observed IP validated with `std::net` parsers; RFC5737, private, loopback, link-local, CGNAT ranges all rejected.
 4. **Windows E0432** — `Win32_System_Threading` Cargo feature added; `CloseHandle` import corrected to `Win32::Foundation`.
 5. **Mock CDP false pass** — `evaluate_verification_decision()` rejects any result with `verification_source == "SIMULATED_MOCK_CDP"`.
+6. **V8 Chromium 157+ `/json/new` HTTP 405 fix** — Replaced `GET /json/new?about:blank` with `PUT /json/new?about:blank` in `create_cdp_blank_target_full`, with HTTP status code validation, response size caps, and `CdpTargetGuard` RAII cleanup via `GET /json/close/{id}`.
+7. **V8 CORS-free CDP navigation** — Replaced `Runtime.evaluate(fetch(...))` on `about:blank` with `Page.enable`, `Network.enable`, `Network.setCacheDisabled(true)`, `Page.navigate`, `Network.requestWillBeSent`, `Network.responseReceived`, `Network.loadingFinished`, and `Network.getResponseBody`.
+8. **V8 `DevToolsActivePort` & CDP session ownership** — Replaced pre-bind/drop port allocation with `--remote-debugging-port=0 --remote-debugging-address=127.0.0.1` and `<profile_dir>/DevToolsActivePort` discovery, plus `verify_managed_cdp_ownership`.
+9. **V8 Proxy CONNECT correlation & UI badge truthfulness** — Real-time `bytes_transferred` tracking in `relay_bidirectional`, `correlate_connect_tunnel` rejecting `PLAIN_HTTP` / zero-byte / concurrent ambiguous tunnels, explicit CDP failure surfacing in `verify_browser_egress` (no `.ok()` swallowing), and honest `⚠️ Assumed (Proxy)` (`REMOTE_PROXY_DNS`) badge in `NetworkView.tsx`.
 
 #### CDP browser-origin verification (implemented in V5–V7)
 - `attempt_cdp_browser_verification` — connects to Edge's CDP debug port, creates a **dedicated blank target** (`/json/new?about:blank`), injects a `fetch("https://ipwho.is/")` via `Runtime.evaluate`, parses the JSON response for `ip` and `country`, cleans up the target on all exit paths.

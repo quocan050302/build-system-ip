@@ -66,6 +66,12 @@ pub enum BrowserStatus {
         startup_url: String,
         #[serde(default)]
         cdp_port: Option<u16>,
+        #[serde(default)]
+        session_id: String,
+        #[serde(default)]
+        profile_path: String,
+        #[serde(default)]
+        executable_path: String,
     },
     Stopped,
     Error(String),
@@ -110,6 +116,10 @@ pub trait BrowserLauncher: Send + Sync {
     fn launch(&self, config: BrowserLaunchConfig) -> Result<BrowserSession, BrowserError>;
     fn stop(&self, session_id: &str) -> Result<(), BrowserError>;
     fn status(&self, session_id: &str) -> Result<BrowserStatus, BrowserError>;
+    fn get_session(&self, session_id: &str) -> Result<Option<BrowserSession>, BrowserError> {
+        let _ = session_id;
+        Ok(None)
+    }
 }
 
 struct ManagedProcess {
@@ -483,6 +493,24 @@ impl SystemBrowserLauncher {
         Ok(())
     }
 
+    /// Parse `<profile_dir>/DevToolsActivePort` written by Chromium/Edge when launched
+    /// with `--remote-debugging-port=0`. Returns `(port, browser_ws_path)`.
+    pub fn parse_devtools_active_port(profile_dir: &Path) -> Option<(u16, Option<String>)> {
+        let devtools_file = profile_dir.join("DevToolsActivePort");
+        let content = std::fs::read_to_string(devtools_file).ok()?;
+        let mut lines = content.lines();
+        let port_str = lines.next()?.trim();
+        let port = port_str.parse::<u16>().ok()?;
+        if port == 0 {
+            return None;
+        }
+        let ws_path = lines
+            .next()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        Some((port, ws_path))
+    }
+
     fn refresh_process_state(proc_entry: &mut ManagedProcess) -> bool {
         if let Some(ref mut child) = proc_entry.child {
             match child.try_wait() {
@@ -645,11 +673,13 @@ impl BrowserLauncher for SystemBrowserLauncher {
         let profile_path_str = config.profile_dir.to_string_lossy().to_string();
         let now = Utc::now().to_rfc3339();
         let mut cdp_port = config.custom_cdp_port;
+        let devtools_active_port_path = config.profile_dir.join("DevToolsActivePort");
 
         let (child_opt, pid) = if self.dry_run_spawn {
             (None, 42000 + (Uuid::new_v4().as_u128() % 1000) as u32)
         } else {
             let mut cmd = Command::new(&exe_path);
+            let mut wait_for_devtools_file = false;
             if norm_browser == "firefox" {
                 cmd.arg("-profile").arg(&profile_path_str);
                 cmd.arg("-no-remote");
@@ -662,20 +692,16 @@ impl BrowserLauncher for SystemBrowserLauncher {
                 cmd.arg("--force-webrtc-ip-handling-policy=disable_non_proxied_udp");
                 cmd.arg("--enforce-webrtc-ip-permission-check");
 
-                // Assign loopback CDP port for native browser-origin verification
-                if cdp_port.is_none() {
-                    if let Ok(listener) = std::net::TcpListener::bind("127.0.0.1:0") {
-                        if let Ok(addr) = listener.local_addr() {
-                            let p = addr.port();
-                            drop(listener);
-                            cmd.arg(format!("--remote-debugging-port={}", p));
-                            cmd.arg("--remote-debugging-address=127.0.0.1");
-                            cdp_port = Some(p);
-                        }
-                    }
-                } else if let Some(p) = cdp_port {
+                // Eliminate pre-bind/drop TOCTOU port race: let Edge bind an ephemeral port
+                // directly in the OS kernel (--remote-debugging-port=0) and read DevToolsActivePort.
+                let _ = std::fs::remove_file(&devtools_active_port_path);
+                if let Some(p) = cdp_port {
                     cmd.arg(format!("--remote-debugging-port={}", p));
                     cmd.arg("--remote-debugging-address=127.0.0.1");
+                } else {
+                    cmd.arg("--remote-debugging-port=0");
+                    cmd.arg("--remote-debugging-address=127.0.0.1");
+                    wait_for_devtools_file = true;
                 }
 
                 if let Some(ref proxy) = config.proxy_server {
@@ -696,10 +722,28 @@ impl BrowserLauncher for SystemBrowserLauncher {
             cmd.stdout(Stdio::null());
             cmd.stderr(Stdio::null());
 
-            let child = cmd.spawn().map_err(|e| {
+            let mut child = cmd.spawn().map_err(|e| {
                 BrowserError::LaunchFailed(format!("Failed to spawn '{}': {}", exe_str, e))
             })?;
             let pid = child.id();
+
+            if wait_for_devtools_file {
+                let poll_start = std::time::Instant::now();
+                let max_wait = Duration::from_millis(3000);
+                while poll_start.elapsed() < max_wait {
+                    if let Some((port, _ws_path)) =
+                        Self::parse_devtools_active_port(&config.profile_dir)
+                    {
+                        cdp_port = Some(port);
+                        break;
+                    }
+                    if let Ok(Some(_exit)) = child.try_wait() {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(40));
+                }
+            }
+
             (Some(child), pid)
         };
 
@@ -762,16 +806,45 @@ impl BrowserLauncher for SystemBrowserLauncher {
 
         if let Some(proc_entry) = map.get_mut(session_id) {
             if Self::refresh_process_state(proc_entry) {
+                if proc_entry.session.cdp_port.is_none() {
+                    let profile_dir = PathBuf::from(&proc_entry.session.profile_path);
+                    if let Some((port, _)) = Self::parse_devtools_active_port(&profile_dir) {
+                        proc_entry.session.cdp_port = Some(port);
+                    }
+                }
                 return Ok(BrowserStatus::Running {
                     pid: proc_entry.session.pid,
                     started_at: proc_entry.session.started_at.clone(),
                     proxy_bridge_port: proc_entry.session.proxy_bridge_port,
                     startup_url: proc_entry.session.startup_url.clone(),
                     cdp_port: proc_entry.session.cdp_port,
+                    session_id: proc_entry.session.session_id.clone(),
+                    profile_path: proc_entry.session.profile_path.clone(),
+                    executable_path: proc_entry.session.executable_path.clone(),
                 });
             }
         }
         Ok(BrowserStatus::Stopped)
+    }
+
+    fn get_session(&self, session_id: &str) -> Result<Option<BrowserSession>, BrowserError> {
+        let mut map = self
+            .sessions
+            .lock()
+            .map_err(|_| BrowserError::LaunchFailed("Session lock poisoned".to_string()))?;
+
+        if let Some(proc_entry) = map.get_mut(session_id) {
+            if Self::refresh_process_state(proc_entry) {
+                if proc_entry.session.cdp_port.is_none() {
+                    let profile_dir = PathBuf::from(&proc_entry.session.profile_path);
+                    if let Some((port, _)) = Self::parse_devtools_active_port(&profile_dir) {
+                        proc_entry.session.cdp_port = Some(port);
+                    }
+                }
+                return Ok(Some(proc_entry.session.clone()));
+            }
+        }
+        Ok(None)
     }
 }
 
@@ -1389,6 +1462,20 @@ impl ProfileService {
             self.proxy_bridge_manager.stop_bridge(environment_id);
         }
         Ok(status)
+    }
+
+    pub fn get_running_browser_session(
+        &self,
+        environment_id: &str,
+    ) -> Result<Option<BrowserSession>, String> {
+        let sess = self
+            .launcher
+            .get_session(environment_id)
+            .map_err(|e| e.to_string())?;
+        if sess.is_none() {
+            self.proxy_bridge_manager.stop_bridge(environment_id);
+        }
+        Ok(sess)
     }
 
     pub fn open_profile_folder(&self, environment_id: &str) -> Result<String, String> {

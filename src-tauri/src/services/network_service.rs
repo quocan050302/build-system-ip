@@ -1116,39 +1116,56 @@ impl NetworkService {
 
         // 1. Verify browser session is actively running for this environment
         let browser_status = profile_service.get_browser_session_status(environment_id)?;
-        let (pid, bridge_port_opt, cdp_port_opt) = match browser_status {
-            BrowserStatus::Running {
-                pid,
-                proxy_bridge_port,
-                cdp_port,
-                ..
-            } => (pid, proxy_bridge_port, cdp_port),
-            _ => {
-                let record = NetworkCheckRecord {
-                    id: check_id,
-                    environment_id: environment_id.to_string(),
-                    observed_ipv4: None,
-                    observed_ipv6: None,
-                    observed_country: None,
-                    dns_summary: Some("Browser session is not running".to_string()),
-                    dns_leak_status: "UNVERIFIED".to_string(),
-                    webrtc_status: "UNVERIFIED".to_string(),
-                    check_source: "PROXY_BRIDGE_PROBE".to_string(),
-                    status: "VERIFICATION_UNAVAILABLE".to_string(),
-                    error_message: Some(
-                        "Cannot report BROWSER_EGRESS_VERIFIED: Microsoft Edge session is not running for this environment. Launch the browser first."
-                            .to_string(),
-                    ),
-                    checked_at: now,
-                    latency_ms: None,
-                    session_id: None,
-                };
-                self.persist_network_check(&record)?;
-                return Ok(record);
-            }
-        };
+        let (pid, bridge_port_opt, cdp_port_opt, running_session_id, running_profile_path) =
+            match browser_status {
+                BrowserStatus::Running {
+                    pid,
+                    proxy_bridge_port,
+                    cdp_port,
+                    session_id,
+                    profile_path,
+                    ..
+                } => (pid, proxy_bridge_port, cdp_port, session_id, profile_path),
+                _ => {
+                    let record = NetworkCheckRecord {
+                        id: check_id,
+                        environment_id: environment_id.to_string(),
+                        observed_ipv4: None,
+                        observed_ipv6: None,
+                        observed_country: None,
+                        dns_summary: Some("Browser session is not running".to_string()),
+                        dns_leak_status: "UNVERIFIED".to_string(),
+                        webrtc_status: "UNVERIFIED".to_string(),
+                        check_source: "PROXY_BRIDGE_PROBE".to_string(),
+                        status: "VERIFICATION_UNAVAILABLE".to_string(),
+                        error_message: Some(
+                            "Cannot report BROWSER_EGRESS_VERIFIED: Microsoft Edge session is not running for this environment. Launch the browser first."
+                                .to_string(),
+                        ),
+                        checked_at: now,
+                        latency_ms: None,
+                        session_id: None,
+                    };
+                    self.persist_network_check(&record)?;
+                    return Ok(record);
+                }
+            };
 
-        let session_tag = format!("pid:{}", pid);
+        let session_tag = if running_session_id.trim().is_empty() {
+            format!("pid:{}", pid)
+        } else {
+            running_session_id
+        };
+        let resolved_profile_path = if running_profile_path.trim().is_empty() {
+            profile_service
+                .get_profile_by_environment(environment_id)
+                .ok()
+                .flatten()
+                .map(|p| p.profile_path)
+                .unwrap_or_default()
+        } else {
+            running_profile_path
+        };
 
         // 2. Check configured endpoint metadata for this environment
         let ep_meta = self
@@ -1402,7 +1419,7 @@ impl NetworkService {
                     environment_id: environment_id.to_string(),
                     session_id: session_tag.clone(),
                     pid,
-                    profile_path: String::new(),
+                    profile_path: resolved_profile_path.clone(),
                     proxy_bridge_port: Some(bridge_port),
                     proxy_endpoint_id: _ep_id.clone(),
                     bridge_instance_id,
@@ -1415,16 +1432,38 @@ impl NetworkService {
                     is_simulation: false,
                 };
 
-                // Attempt real CDP browser-origin verification if Edge has an active loopback debug port
+                // Attempt real CDP browser-origin verification if Edge has an active loopback debug port.
+                // Never swallow CDP or decision gate failures silently (.ok()): surface exact diagnostic reason!
+                let mut cdp_failure_reason: Option<String> = None;
                 let cdp_evidence = if let Some(cdp_port) = cdp_port_opt {
-                    attempt_cdp_browser_verification(
+                    match attempt_cdp_browser_verification(
                         &bridge_session,
                         cdp_port,
                         Some(profile_service.proxy_bridge_manager()),
-                    )
-                    .ok()
-                    .filter(|ev| evaluate_verification_decision(ev).is_ok())
+                    ) {
+                        Ok(ev) => match evaluate_verification_decision(&ev) {
+                            Ok(_) => Some(ev),
+                            Err(gate_err) => {
+                                cdp_failure_reason = Some(redact_sensitive_str(&format!(
+                                    "Browser-origin decision gate rejected evidence: {}",
+                                    gate_err
+                                )));
+                                None
+                            }
+                        },
+                        Err(cdp_err) => {
+                            cdp_failure_reason = Some(redact_sensitive_str(&format!(
+                                "Browser-origin CDP verification failed: {}",
+                                cdp_err
+                            )));
+                            None
+                        }
+                    }
                 } else {
+                    cdp_failure_reason = Some(
+                        "Browser-origin CDP verification unavailable: no active loopback DevTools port bound to this Edge session."
+                            .to_string(),
+                    );
                     None
                 };
 
@@ -1443,13 +1482,28 @@ impl NetworkService {
                         ),
                     )
                 } else {
+                    let reason_note = cdp_failure_reason
+                        .as_deref()
+                        .unwrap_or("browser-origin verification requires active CDP session and correlated proxy tunnel");
                     (
                         "PROXY_EGRESS_VERIFIED".to_string(),
                         "PROXY_BRIDGE_PROBE".to_string(),
                         format!(
-                            "Proxy bridge probe for session ({}) confirmed egress IP: {} (country: {}, latency: {}ms). Note: browser-origin verification requires active CDP session and correlated proxy tunnel.",
-                            session_tag, probe_res.observed_ipv4, country_code, probe_res.latency_ms
+                            "Proxy bridge probe for session ({}) confirmed egress IP: {} (country: {}, latency: {}ms). Browser-origin downgrade reason: {}",
+                            session_tag, probe_res.observed_ipv4, country_code, probe_res.latency_ms, reason_note
                         ),
+                    )
+                };
+
+                let dns_summary_str = if let Some(ref reason) = cdp_failure_reason {
+                    format!(
+                        "{} (Bridge 127.0.0.1:{} -> '{}' [{}]) | {}",
+                        probe_res.dns_summary, bridge_port, ep_name, session_tag, reason
+                    )
+                } else {
+                    format!(
+                        "{} (Bridge 127.0.0.1:{} -> '{}' [{}])",
+                        probe_res.dns_summary, bridge_port, ep_name, session_tag
                     )
                 };
 
@@ -1465,15 +1519,12 @@ impl NetworkService {
                         .as_ref()
                         .and_then(|e| e.observed_country.clone())
                         .or(Some(country_code.clone())),
-                    dns_summary: Some(format!(
-                        "{} (Bridge 127.0.0.1:{} -> '{}' [{}])",
-                        probe_res.dns_summary, bridge_port, ep_name, session_tag
-                    )),
+                    dns_summary: Some(dns_summary_str),
                     dns_leak_status: "REMOTE_PROXY_DNS".to_string(),
                     webrtc_status: "NON_PROXIED_UDP_DISABLED".to_string(),
                     check_source,
                     status: final_status.clone(),
-                    error_message: None,
+                    error_message: cdp_failure_reason.clone(),
                     checked_at: now,
                     latency_ms: cdp_evidence
                         .as_ref()

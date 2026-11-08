@@ -37,7 +37,7 @@ pub enum BridgeTunnelOutcome {
 /// - Exact destination host & port (no substring matches)
 /// - Connection start and finish timestamps
 /// - Typed tunnel outcome
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BridgeConnectionEvent {
     pub event_id: String,
     pub bridge_instance_id: String,
@@ -52,6 +52,19 @@ pub struct BridgeConnectionEvent {
     pub outcome: BridgeTunnelOutcome,
     pub latency_ms: Option<u32>,
     pub bytes_transferred: u64,
+}
+
+/// Result of correlating a browser verification attempt against proxy bridge CONNECT telemetry.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum BridgeCorrelationOutcome {
+    /// Exactly one fresh HTTP_CONNECT or SOCKS5_CONNECT tunnel matched the verification window with >0 bytes transferred.
+    Confirmed(BridgeConnectionEvent),
+    /// Zero matching CONNECT tunnels in the window (e.g., direct bypass, wrong host/port, stale pre-existing tunnel, or only PLAIN_HTTP backend probe).
+    NoMatchingTunnel,
+    /// Multiple concurrent CONNECT tunnels to the same destination host:port during the window; cannot attribute unambiguously.
+    AmbiguousConcurrentTunnels(usize),
+    /// A CONNECT tunnel was opened in the window, but transferred 0 payload bytes.
+    ZeroBytesTransferred(BridgeConnectionEvent),
 }
 
 /// Thread-safe, bounded ring-buffer of recent bridge connection events.
@@ -81,6 +94,19 @@ impl BridgeTelemetry {
         }
     }
 
+    /// Increment `bytes_transferred` and update `connection_finished_at` for an active tunnel event.
+    pub fn add_bytes(&self, event_id: &str, delta_bytes: u64) {
+        if delta_bytes == 0 {
+            return;
+        }
+        if let Ok(mut events) = self.events.lock() {
+            if let Some(ev) = events.iter_mut().rev().find(|e| e.event_id == event_id) {
+                ev.bytes_transferred = ev.bytes_transferred.saturating_add(delta_bytes);
+                ev.connection_finished_at = Some(Utc::now().to_rfc3339());
+            }
+        }
+    }
+
     /// Return all events recorded within the last `since_secs` seconds.
     pub fn recent_events(&self, since_secs: u64) -> Vec<BridgeConnectionEvent> {
         if let Ok(events) = self.events.lock() {
@@ -100,16 +126,76 @@ impl BridgeTelemetry {
         }
     }
 
-    /// Find an exact matching tunnel event for request-level browser verification correlation.
+    /// Strictly correlate a browser HTTPS navigation attempt with proxy bridge CONNECT telemetry.
     ///
-    /// Requires exact match on:
-    /// - `bridge_instance_id`: proves event belongs to the current bridge generation.
-    /// - `environment_id`: proves event belongs to the current environment.
-    /// - `proxy_endpoint_id`: proves event used the assigned proxy endpoint.
-    /// - `destination_host`: exact normalized hostname (no substring matches).
-    /// - `destination_port`: exact destination port (e.g. 443).
-    /// - `outcome`: must be `BridgeTunnelOutcome::Success`.
-    /// - `connection_started_at`: must have started AT OR AFTER `started_after` (rejects stale events).
+    /// Enforces:
+    /// - Exact `bridge_instance_id`, `environment_id`, `proxy_endpoint_id`
+    /// - Exact normalized `destination_host` and `destination_port`
+    /// - `outcome == BridgeTunnelOutcome::Success`
+    /// - `protocol` is `"HTTP_CONNECT"` or `"SOCKS5_CONNECT"` (rejects `"PLAIN_HTTP"` backend probes)
+    /// - `connection_started_at >= started_after` (and `<= ended_before` when provided), rejecting stale/reused tunnels
+    /// - Unambiguous cardinality: exactly 1 matching tunnel in the window (`> 1` returns `AmbiguousConcurrentTunnels`)
+    /// - Non-zero payload transfer (`bytes_transferred > 0`)
+    #[allow(clippy::too_many_arguments)]
+    pub fn correlate_connect_tunnel(
+        &self,
+        bridge_instance_id: &str,
+        environment_id: &str,
+        proxy_endpoint_id: &str,
+        target_host: &str,
+        target_port: u16,
+        started_after: chrono::DateTime<Utc>,
+        ended_before: Option<chrono::DateTime<Utc>>,
+    ) -> BridgeCorrelationOutcome {
+        let norm_target = target_host.trim_end_matches('.').to_ascii_lowercase();
+        let matches: Vec<BridgeConnectionEvent> = if let Ok(events) = self.events.lock() {
+            events
+                .iter()
+                .filter(|e| {
+                    if e.bridge_instance_id != bridge_instance_id
+                        || e.environment_id != environment_id
+                        || e.proxy_endpoint_id != proxy_endpoint_id
+                        || e.destination_host != norm_target
+                        || (target_port != 0 && e.destination_port != target_port)
+                        || e.outcome != BridgeTunnelOutcome::Success
+                        || !matches!(e.protocol.as_str(), "HTTP_CONNECT" | "SOCKS5_CONNECT")
+                    {
+                        return false;
+                    }
+                    e.connection_started_at
+                        .parse::<chrono::DateTime<Utc>>()
+                        .map(|t| {
+                            t >= started_after
+                                && ended_before.map(|end_ts| t <= end_ts).unwrap_or(true)
+                        })
+                        .unwrap_or(false)
+                })
+                .cloned()
+                .collect()
+        } else {
+            return BridgeCorrelationOutcome::NoMatchingTunnel;
+        };
+
+        if matches.is_empty() {
+            return BridgeCorrelationOutcome::NoMatchingTunnel;
+        }
+
+        let active_matches: Vec<BridgeConnectionEvent> = matches
+            .iter()
+            .filter(|e| e.bytes_transferred > 0)
+            .cloned()
+            .collect();
+
+        match active_matches.len() {
+            0 => {
+                BridgeCorrelationOutcome::ZeroBytesTransferred(matches.into_iter().next().unwrap())
+            }
+            1 => BridgeCorrelationOutcome::Confirmed(active_matches.into_iter().next().unwrap()),
+            n => BridgeCorrelationOutcome::AmbiguousConcurrentTunnels(n),
+        }
+    }
+
+    /// Find an exact, unambiguous matching CONNECT tunnel event for browser verification correlation.
     pub fn find_matching_tunnel(
         &self,
         bridge_instance_id: &str,
@@ -119,25 +205,17 @@ impl BridgeTelemetry {
         target_port: u16,
         started_after: chrono::DateTime<Utc>,
     ) -> Option<BridgeConnectionEvent> {
-        let norm_target = target_host.trim_end_matches('.').to_ascii_lowercase();
-        if let Ok(events) = self.events.lock() {
-            events
-                .iter()
-                .find(|e| {
-                    e.bridge_instance_id == bridge_instance_id
-                        && e.environment_id == environment_id
-                        && e.proxy_endpoint_id == proxy_endpoint_id
-                        && e.destination_host == norm_target
-                        && (target_port == 0 || e.destination_port == target_port)
-                        && e.outcome == BridgeTunnelOutcome::Success
-                        && e.connection_started_at
-                            .parse::<chrono::DateTime<Utc>>()
-                            .map(|t| t >= started_after)
-                            .unwrap_or(false)
-                })
-                .cloned()
-        } else {
-            None
+        match self.correlate_connect_tunnel(
+            bridge_instance_id,
+            environment_id,
+            proxy_endpoint_id,
+            target_host,
+            target_port,
+            started_after,
+            None,
+        ) {
+            BridgeCorrelationOutcome::Confirmed(ev) => Some(ev),
+            _ => None,
         }
     }
 
@@ -392,6 +470,43 @@ impl ProxyBridgeManager {
         0
     }
 
+    /// Strictly correlate a browser HTTPS navigation attempt with proxy bridge CONNECT telemetry.
+    #[allow(clippy::too_many_arguments)]
+    pub fn correlate_connect_tunnel(
+        &self,
+        bridge_instance_id: &str,
+        environment_id: &str,
+        proxy_endpoint_id: &str,
+        target_host: &str,
+        target_port: u16,
+        started_after: chrono::DateTime<Utc>,
+        ended_before: Option<chrono::DateTime<Utc>>,
+    ) -> BridgeCorrelationOutcome {
+        if let Ok(map) = self.bridges.lock() {
+            if let Some(instance) = map.get(environment_id) {
+                return instance.telemetry.correlate_connect_tunnel(
+                    bridge_instance_id,
+                    environment_id,
+                    proxy_endpoint_id,
+                    target_host,
+                    target_port,
+                    started_after,
+                    ended_before,
+                );
+            }
+        }
+        BridgeCorrelationOutcome::NoMatchingTunnel
+    }
+
+    /// Inject a telemetry event for deterministic integration/adversarial testing.
+    pub fn record_tunnel_event_for_test(&self, environment_id: &str, event: BridgeConnectionEvent) {
+        if let Ok(map) = self.bridges.lock() {
+            if let Some(instance) = map.get(environment_id) {
+                instance.telemetry.record_event(event);
+            }
+        }
+    }
+
     /// Find an exact matching tunnel event belonging to the current bridge generation,
     /// environment, assigned proxy endpoint, exact host/port, and started after the baseline.
     pub fn find_matching_tunnel(
@@ -593,10 +708,11 @@ fn record_telemetry_event(
     outcome: BridgeTunnelOutcome,
     latency_ms: Option<u32>,
     bytes_transferred: u64,
-) {
+) -> String {
+    let event_id = uuid::Uuid::new_v4().to_string();
     let norm_host = dest_host.trim_end_matches('.').to_ascii_lowercase();
     instance.telemetry.record_event(BridgeConnectionEvent {
-        event_id: uuid::Uuid::new_v4().to_string(),
+        event_id: event_id.clone(),
         bridge_instance_id: instance.instance_id.clone(),
         environment_id: instance.config.environment_id.clone(),
         proxy_endpoint_id: instance.config.endpoint_id.clone(),
@@ -610,6 +726,7 @@ fn record_telemetry_event(
         latency_ms,
         bytes_transferred,
     });
+    event_id
 }
 
 fn handle_client_connection(
@@ -777,7 +894,8 @@ fn handle_client_connection(
             *err = None;
         }
 
-        record_telemetry_event(
+        let initial_bytes = (upstream_leftover.len() + leftover.len()) as u64;
+        let event_id = record_telemetry_event(
             instance,
             &dest_host,
             dest_port,
@@ -785,10 +903,10 @@ fn handle_client_connection(
             conn_start,
             BridgeTunnelOutcome::Success,
             Some(start_inst.elapsed().as_millis() as u32),
-            0,
+            initial_bytes,
         );
 
-        relay_bidirectional(client, upstream);
+        relay_bidirectional(client, upstream, instance.telemetry.clone(), event_id);
         Ok(())
     } else {
         // Plain HTTP request through upstream HTTP proxy
@@ -1149,7 +1267,7 @@ fn handle_socks5_upstream(
     }
 
     // Record telemetry for the SOCKS5 tunnel.
-    record_telemetry_event(
+    let event_id = record_telemetry_event(
         instance,
         dest_host,
         dest_port,
@@ -1161,7 +1279,7 @@ fn handle_socks5_upstream(
         conn_start,
         BridgeTunnelOutcome::Success,
         Some(start_inst.elapsed().as_millis() as u32),
-        0,
+        leftover.len() as u64,
     );
 
     if method == "CONNECT" {
@@ -1172,7 +1290,7 @@ fn handle_socks5_upstream(
             let _ = upstream.write_all(leftover);
         }
         if let Ok(client_clone) = client.try_clone() {
-            relay_bidirectional(client_clone, upstream);
+            relay_bidirectional(client_clone, upstream, instance.telemetry.clone(), event_id);
         }
         Ok(())
     } else {
@@ -1194,13 +1312,43 @@ fn handle_socks5_upstream(
         if !leftover.is_empty() {
             let _ = upstream.write_all(leftover);
         }
-        let _ = std::io::copy(&mut upstream, client);
+        let copied = std::io::copy(&mut upstream, client).unwrap_or(0);
+        instance
+            .telemetry
+            .add_bytes(&event_id, (rebuilt.len() as u64) + copied);
         let _ = client.shutdown(Shutdown::Both);
         Ok(())
     }
 }
 
-fn relay_bidirectional(mut client: TcpStream, mut upstream: TcpStream) {
+fn copy_and_track(
+    reader: &mut TcpStream,
+    writer: &mut TcpStream,
+    telemetry: &BridgeTelemetry,
+    event_id: &str,
+) {
+    let mut buf = [0u8; 8192];
+    loop {
+        match reader.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                if writer.write_all(&buf[..n]).is_err() {
+                    break;
+                }
+                let _ = writer.flush();
+                telemetry.add_bytes(event_id, n as u64);
+            }
+            Err(_) => break,
+        }
+    }
+}
+
+fn relay_bidirectional(
+    mut client: TcpStream,
+    mut upstream: TcpStream,
+    telemetry: Arc<BridgeTelemetry>,
+    event_id: String,
+) {
     let mut client_reader = match client.try_clone() {
         Ok(c) => c,
         Err(_) => return,
@@ -1210,12 +1358,19 @@ fn relay_bidirectional(mut client: TcpStream, mut upstream: TcpStream) {
         Err(_) => return,
     };
 
+    let c2u_telemetry = telemetry.clone();
+    let c2u_event_id = event_id.clone();
     let c2u = thread::spawn(move || {
-        let _ = std::io::copy(&mut client_reader, &mut upstream_writer);
+        copy_and_track(
+            &mut client_reader,
+            &mut upstream_writer,
+            &c2u_telemetry,
+            &c2u_event_id,
+        );
         let _ = upstream_writer.shutdown(Shutdown::Write);
     });
 
-    let _ = std::io::copy(&mut upstream, &mut client);
+    copy_and_track(&mut upstream, &mut client, &telemetry, &event_id);
     let _ = client.shutdown(Shutdown::Both);
     let _ = c2u.join();
 }
@@ -1492,5 +1647,101 @@ mod tests {
         assert!(telemetry.has_recent_connection_to("ipwho.is", 60));
         assert!(!telemetry.has_recent_connection_to("unknown.domain.org", 60));
         assert_eq!(telemetry.recent_events(60).len(), 1);
+    }
+
+    #[test]
+    fn test_correlate_connect_tunnel_rejects_plain_http_zero_bytes_and_concurrent_ambiguity() {
+        let telemetry = BridgeTelemetry::new(50);
+        let baseline = Utc::now() - chrono::Duration::seconds(1);
+
+        // 1. PLAIN_HTTP (from Rust backend probe_via_local_bridge) must NEVER satisfy browser CONNECT correlation
+        telemetry.record_event(BridgeConnectionEvent {
+            event_id: "ev-plain-http".to_string(),
+            bridge_instance_id: "inst-1".to_string(),
+            environment_id: "env-1".to_string(),
+            proxy_endpoint_id: "ep-1".to_string(),
+            local_bridge_port: 49200,
+            destination_host: "ipwho.is".to_string(),
+            destination_port: 80,
+            protocol: "PLAIN_HTTP".to_string(),
+            connection_started_at: Utc::now().to_rfc3339(),
+            connection_finished_at: Some(Utc::now().to_rfc3339()),
+            outcome: BridgeTunnelOutcome::Success,
+            latency_ms: Some(25),
+            bytes_transferred: 512,
+        });
+        assert_eq!(
+            telemetry.correlate_connect_tunnel(
+                "inst-1", "env-1", "ep-1", "ipwho.is", 443, baseline, None
+            ),
+            BridgeCorrelationOutcome::NoMatchingTunnel
+        );
+        assert_eq!(
+            telemetry.correlate_connect_tunnel(
+                "inst-1", "env-1", "ep-1", "ipwho.is", 80, baseline, None
+            ),
+            BridgeCorrelationOutcome::NoMatchingTunnel
+        );
+
+        // 2. Zero-byte HTTP_CONNECT must return ZeroBytesTransferred until bytes flow
+        telemetry.record_event(BridgeConnectionEvent {
+            event_id: "ev-connect-1".to_string(),
+            bridge_instance_id: "inst-1".to_string(),
+            environment_id: "env-1".to_string(),
+            proxy_endpoint_id: "ep-1".to_string(),
+            local_bridge_port: 49200,
+            destination_host: "ipwho.is".to_string(),
+            destination_port: 443,
+            protocol: "HTTP_CONNECT".to_string(),
+            connection_started_at: Utc::now().to_rfc3339(),
+            connection_finished_at: Some(Utc::now().to_rfc3339()),
+            outcome: BridgeTunnelOutcome::Success,
+            latency_ms: Some(40),
+            bytes_transferred: 0,
+        });
+        assert!(matches!(
+            telemetry.correlate_connect_tunnel(
+                "inst-1", "env-1", "ep-1", "ipwho.is", 443, baseline, None
+            ),
+            BridgeCorrelationOutcome::ZeroBytesTransferred(_)
+        ));
+        assert!(telemetry
+            .find_matching_tunnel("inst-1", "env-1", "ep-1", "ipwho.is", 443, baseline)
+            .is_none());
+
+        // 3. Once bytes flow on ev-connect-1, correlation is Confirmed
+        telemetry.add_bytes("ev-connect-1", 768);
+        assert!(matches!(
+            telemetry.correlate_connect_tunnel(
+                "inst-1", "env-1", "ep-1", "ipwho.is", 443, baseline, None
+            ),
+            BridgeCorrelationOutcome::Confirmed(ref ev) if ev.event_id == "ev-connect-1" && ev.bytes_transferred == 768
+        ));
+
+        // 4. A second concurrent HTTP_CONNECT to ipwho.is:443 in the same window causes AmbiguousConcurrentTunnels
+        telemetry.record_event(BridgeConnectionEvent {
+            event_id: "ev-connect-2".to_string(),
+            bridge_instance_id: "inst-1".to_string(),
+            environment_id: "env-1".to_string(),
+            proxy_endpoint_id: "ep-1".to_string(),
+            local_bridge_port: 49200,
+            destination_host: "ipwho.is".to_string(),
+            destination_port: 443,
+            protocol: "HTTP_CONNECT".to_string(),
+            connection_started_at: Utc::now().to_rfc3339(),
+            connection_finished_at: Some(Utc::now().to_rfc3339()),
+            outcome: BridgeTunnelOutcome::Success,
+            latency_ms: Some(42),
+            bytes_transferred: 512,
+        });
+        assert_eq!(
+            telemetry.correlate_connect_tunnel(
+                "inst-1", "env-1", "ep-1", "ipwho.is", 443, baseline, None
+            ),
+            BridgeCorrelationOutcome::AmbiguousConcurrentTunnels(2)
+        );
+        assert!(telemetry
+            .find_matching_tunnel("inst-1", "env-1", "ep-1", "ipwho.is", 443, baseline)
+            .is_none());
     }
 }

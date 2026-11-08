@@ -163,8 +163,12 @@ export const NetworkView: React.FC<NetworkViewProps> = ({
   const getDnsWebRtcBadge = (status?: string | null) => {
     switch (status) {
       case 'VERIFIED':
-      case 'REMOTE_PROXY_DNS':
         return <span className="text-[10px] font-mono px-1.5 py-0.5 rounded border bg-emerald-950/60 text-emerald-400 border-emerald-800/60">✓ VERIFIED</span>;
+      case 'REMOTE_PROXY_DNS':
+      case 'PROXY_DNS_ASSUMED':
+        return <span className="text-[10px] font-mono px-1.5 py-0.5 rounded border bg-amber-950/60 text-amber-400 border-amber-700/60" title="Remote DNS via HTTP CONNECT is assumed by protocol design, not independently leak-tested">⚠️ Assumed (Proxy)</span>;
+      case 'NON_PROXIED_UDP_DISABLED':
+        return <span className="text-[10px] font-mono px-1.5 py-0.5 rounded border bg-amber-950/60 text-amber-400 border-amber-700/60" title="Edge launch flag --force-webrtc-ip-handling-policy=disable_non_proxied_udp applied; not live-tested">⚠️ Flag Set (Unverified)</span>;
       case 'FAILED':
       case 'HOST_DNS_DETECTED':
         return <span className="text-[10px] font-mono px-1.5 py-0.5 rounded border bg-rose-950/60 text-rose-400 border-rose-800/60">✗ FAILED</span>;
