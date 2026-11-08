@@ -901,8 +901,357 @@ fn test_browser_egress_verified_requires_cdp_success() {
     assert_ne!(check.webrtc_status, "VERIFIED");
 }
 
+fn write_v9_runtime_test_evidence(test_name: &str, record: &serde_json::Value) {
+    if let Ok(artifact_dir) = std::env::var("ANTI_V9_ARTIFACT_DIR") {
+        let trimmed = artifact_dir.trim();
+        if !trimmed.is_empty() {
+            let dir = std::path::PathBuf::from(trimmed).join("runtime_tests");
+            if std::fs::create_dir_all(&dir).is_ok() {
+                let final_path = dir.join(format!("{}.json", test_name));
+                let tmp_path = dir.join(format!(
+                    ".{}.{}.tmp",
+                    test_name,
+                    uuid::Uuid::new_v4().simple()
+                ));
+                if let Ok(serialized) = serde_json::to_string_pretty(record) {
+                    if let Ok(mut f) = std::fs::File::create(&tmp_path) {
+                        use std::io::Write;
+                        let _ = f.write_all(serialized.as_bytes());
+                        let _ = f.sync_all();
+                        let _ = std::fs::rename(&tmp_path, &final_path);
+                    }
+                }
+            }
+        }
+    }
+}
+
 #[test]
-fn test_v8_real_edge_headless_cdp_target_lifecycle_ownership_and_fail_closed_bridge() {
+fn test_v9_deterministic_negative_and_race_conditions() {
+    use std::time::Duration;
+    use youtube_isolation_manager_lib::services::browser_verification::{
+        attempt_cdp_browser_verification, validate_observed_egress_ip_and_country,
+        verify_managed_cdp_ownership, BrowserSessionInfo, BrowserVerificationError,
+    };
+    use youtube_isolation_manager_lib::services::proxy_bridge::{
+        BridgeConnectionEvent, BridgeCorrelationOutcome, BridgeTelemetry, BridgeTunnelOutcome,
+        ProxyBridgeManager, UpstreamProxyConfig,
+    };
+
+    // 1. Stale PID and dead process rejection
+    let stale_session = BrowserSessionInfo {
+        environment_id: "env-neg-stale".to_string(),
+        session_id: "sess-neg-stale".to_string(),
+        pid: 999_999_999,
+        profile_path: "/tmp/nonexistent-profile-v9".to_string(),
+        proxy_bridge_port: Some(54000),
+        proxy_endpoint_id: "ep-us-1".to_string(),
+        bridge_instance_id: Some("br-neg-1".to_string()),
+        expected_country: Some("US".to_string()),
+        expected_ip: None,
+        recent_bridge_connection_count: 1,
+        cdp_port: Some(9222),
+        is_simulation: false,
+    };
+    assert_eq!(
+        verify_managed_cdp_ownership(&stale_session, 9222, Duration::from_millis(500)),
+        Err(BrowserVerificationError::SessionMismatch)
+    );
+    assert_eq!(
+        attempt_cdp_browser_verification(&stale_session, 9222, None),
+        Err(BrowserVerificationError::SessionMismatch)
+    );
+
+    // 2. Wrong executable / non-browser PID in live mode (current test runner process is not Edge/Chrome)
+    let temp_profile = tempfile::tempdir().expect("tempdir");
+    std::fs::write(
+        temp_profile.path().join("DevToolsActivePort"),
+        "9229\n/devtools/browser/test\n",
+    )
+    .expect("write DevToolsActivePort");
+    let non_edge_session = BrowserSessionInfo {
+        environment_id: "env-neg-exe".to_string(),
+        session_id: "sess-neg-exe".to_string(),
+        pid: std::process::id(),
+        profile_path: temp_profile.path().to_string_lossy().to_string(),
+        proxy_bridge_port: Some(54001),
+        proxy_endpoint_id: "ep-us-1".to_string(),
+        bridge_instance_id: Some("br-neg-2".to_string()),
+        expected_country: Some("US".to_string()),
+        expected_ip: None,
+        recent_bridge_connection_count: 1,
+        cdp_port: Some(9229),
+        is_simulation: false,
+    };
+    assert!(
+        verify_managed_cdp_ownership(&non_edge_session, 9229, Duration::from_millis(500)).is_err(),
+        "Live ownership check must reject non-Edge process or closed CDP port"
+    );
+
+    // 3. Port reuse / DevToolsActivePort mismatch rejection
+    let mut port_mismatch_session = non_edge_session.clone();
+    port_mismatch_session.is_simulation = true;
+    assert_eq!(
+        verify_managed_cdp_ownership(&port_mismatch_session, 9333, Duration::from_millis(500)),
+        Err(BrowserVerificationError::SessionMismatch)
+    );
+
+    // 4. Shared pure IP + Country validation negative checks
+    assert!(matches!(
+        validate_observed_egress_ip_and_country(
+            "198.51.100.25",
+            Some("US"),
+            "US",
+            None,
+            Some("US"),
+            "ipwho.is",
+            false
+        ),
+        Err(BrowserVerificationError::IpNotGloballyRoutable(_))
+    ));
+    assert!(matches!(
+        validate_observed_egress_ip_and_country(
+            "64.233.160.1",
+            Some("VN"),
+            "VN",
+            None,
+            Some("US"),
+            "ipwho.is",
+            false
+        ),
+        Err(BrowserVerificationError::CountryMismatch(_))
+    ));
+    assert!(matches!(
+        validate_observed_egress_ip_and_country(
+            "64.233.160.1",
+            Some("US"),
+            "US",
+            Some("8.8.8.8"),
+            Some("US"),
+            "ipwho.is",
+            false
+        ),
+        Err(BrowserVerificationError::IpMismatch(_))
+    ));
+
+    // 5. Race condition: Bridge start / stop / restart invalidates old bridge_instance_id
+    let bridge_mgr = ProxyBridgeManager::new();
+    let status_gen1 = bridge_mgr
+        .start_or_replace_bridge(UpstreamProxyConfig {
+            environment_id: "env-race-restart".to_string(),
+            endpoint_id: "ep-race-1".to_string(),
+            host: "127.0.0.1".to_string(),
+            port: 59999,
+            protocol: "HTTP".to_string(),
+            username: None,
+            password: None,
+            connect_timeout: Duration::from_millis(300),
+        })
+        .expect("start bridge gen1");
+    let inst_gen1 = status_gen1.instance_id.clone();
+
+    let status_gen2 = bridge_mgr
+        .start_or_replace_bridge(UpstreamProxyConfig {
+            environment_id: "env-race-restart".to_string(),
+            endpoint_id: "ep-race-1".to_string(),
+            host: "127.0.0.1".to_string(),
+            port: 59998,
+            protocol: "HTTP".to_string(),
+            username: None,
+            password: None,
+            connect_timeout: Duration::from_millis(300),
+        })
+        .expect("restart bridge gen2");
+    let inst_gen2 = status_gen2.instance_id.clone();
+    assert_ne!(
+        inst_gen1, inst_gen2,
+        "Bridge restart must assign a fresh bridge_instance_id"
+    );
+
+    let now = chrono::Utc::now();
+    // Correlating against the restarted bridge using the stale gen1 instance ID must fail
+    let stale_corr = bridge_mgr.correlate_connect_tunnel(
+        &inst_gen1,
+        "env-race-restart",
+        "ep-race-1",
+        "ipwho.is",
+        443,
+        now - chrono::Duration::seconds(2),
+        Some(now + chrono::Duration::seconds(2)),
+    );
+    assert_eq!(stale_corr, BridgeCorrelationOutcome::NoMatchingTunnel);
+    bridge_mgr.stop_bridge("env-race-restart");
+
+    // 6. Race condition: Simultaneous browser sessions across two environments (env-alpha & env-beta)
+    //    must never cross-contaminate tunnel telemetry.
+    let telemetry = BridgeTelemetry::new(32);
+    telemetry.record_event(BridgeConnectionEvent {
+        event_id: "ev-alpha-1".to_string(),
+        bridge_instance_id: "br-alpha".to_string(),
+        environment_id: "env-alpha".to_string(),
+        proxy_endpoint_id: "ep-alpha".to_string(),
+        local_bridge_port: 54101,
+        destination_host: "ipwho.is".to_string(),
+        destination_port: 443,
+        protocol: "HTTP_CONNECT".to_string(),
+        connection_started_at: now.to_rfc3339(),
+        connection_finished_at: Some(now.to_rfc3339()),
+        outcome: BridgeTunnelOutcome::Success,
+        latency_ms: Some(45),
+        bytes_transferred: 1280,
+    });
+    telemetry.record_event(BridgeConnectionEvent {
+        event_id: "ev-beta-1".to_string(),
+        bridge_instance_id: "br-beta".to_string(),
+        environment_id: "env-beta".to_string(),
+        proxy_endpoint_id: "ep-beta".to_string(),
+        local_bridge_port: 54102,
+        destination_host: "ipwho.is".to_string(),
+        destination_port: 443,
+        protocol: "HTTP_CONNECT".to_string(),
+        connection_started_at: now.to_rfc3339(),
+        connection_finished_at: Some(now.to_rfc3339()),
+        outcome: BridgeTunnelOutcome::Success,
+        latency_ms: Some(52),
+        bytes_transferred: 1420,
+    });
+
+    // Cross-environment or cross-endpoint correlation must reject
+    assert_eq!(
+        telemetry.correlate_connect_tunnel(
+            "br-alpha",
+            "env-beta",
+            "ep-alpha",
+            "ipwho.is",
+            443,
+            now - chrono::Duration::seconds(1),
+            Some(now + chrono::Duration::seconds(1)),
+        ),
+        BridgeCorrelationOutcome::NoMatchingTunnel
+    );
+    assert_eq!(
+        telemetry.correlate_connect_tunnel(
+            "br-alpha",
+            "env-alpha",
+            "ep-beta",
+            "ipwho.is",
+            443,
+            now - chrono::Duration::seconds(1),
+            Some(now + chrono::Duration::seconds(1)),
+        ),
+        BridgeCorrelationOutcome::NoMatchingTunnel
+    );
+
+    // Exact own-session correlation for both concurrent environments succeeds independently
+    match telemetry.correlate_connect_tunnel(
+        "br-alpha",
+        "env-alpha",
+        "ep-alpha",
+        "ipwho.is",
+        443,
+        now - chrono::Duration::seconds(1),
+        Some(now + chrono::Duration::seconds(1)),
+    ) {
+        BridgeCorrelationOutcome::Confirmed(ev) => assert_eq!(ev.event_id, "ev-alpha-1"),
+        other => panic!("Expected Confirmed for env-alpha, got {:?}", other),
+    }
+    match telemetry.correlate_connect_tunnel(
+        "br-beta",
+        "env-beta",
+        "ep-beta",
+        "ipwho.is",
+        443,
+        now - chrono::Duration::seconds(1),
+        Some(now + chrono::Duration::seconds(1)),
+    ) {
+        BridgeCorrelationOutcome::Confirmed(ev) => assert_eq!(ev.event_id, "ev-beta-1"),
+        other => panic!("Expected Confirmed for env-beta, got {:?}", other),
+    }
+
+    // 7. Telemetry ring-buffer eviction under burst load
+    let small_ring = BridgeTelemetry::new(8);
+    for idx in 0..20 {
+        small_ring.record_event(BridgeConnectionEvent {
+            event_id: format!("ev-burst-{}", idx),
+            bridge_instance_id: "br-burst".to_string(),
+            environment_id: "env-burst".to_string(),
+            proxy_endpoint_id: "ep-burst".to_string(),
+            local_bridge_port: 54200,
+            destination_host: "ipwho.is".to_string(),
+            destination_port: 443,
+            protocol: "HTTP_CONNECT".to_string(),
+            connection_started_at: now.to_rfc3339(),
+            connection_finished_at: Some(now.to_rfc3339()),
+            outcome: BridgeTunnelOutcome::Success,
+            latency_ms: Some(10),
+            bytes_transferred: 512,
+        });
+    }
+    let retained = small_ring.recent_events(300);
+    assert_eq!(
+        retained.len(),
+        8,
+        "Ring buffer must cap retained events at max_events=8"
+    );
+    assert_eq!(retained.first().unwrap().event_id, "ev-burst-12");
+    assert_eq!(retained.last().unwrap().event_id, "ev-burst-19");
+
+    write_v9_runtime_test_evidence(
+        "test_v9_deterministic_negative_and_race_conditions",
+        &serde_json::json!({
+            "test_name": "test_v9_deterministic_negative_and_race_conditions",
+            "suite_tier": "DETERMINISTIC_NEGATIVE_AND_RACE",
+            "status": "PASS",
+            "platform": format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
+            "checks_verified": [
+                "stale_pid_rejected",
+                "wrong_executable_rejected",
+                "devtools_active_port_mismatch_rejected",
+                "non_routable_ip_rejected",
+                "country_mismatch_rejected",
+                "pinned_ip_mismatch_rejected",
+                "bridge_restart_generation_invalidation",
+                "simultaneous_multi_session_isolation",
+                "telemetry_ring_buffer_burst_eviction"
+            ],
+            "public_us_egress_proven": false,
+            "recorded_at_utc": chrono::Utc::now().to_rfc3339()
+        }),
+    );
+}
+
+#[test]
+fn test_v9_actual_edge_local_controlled_proxy_integration() {
+    let require_real_edge = std::env::var("ANTI_REQUIRE_REAL_EDGE")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let status = if require_real_edge {
+            "FAIL"
+        } else {
+            "NOT_APPLICABLE"
+        };
+        write_v9_runtime_test_evidence(
+            "test_v9_actual_edge_local_controlled_proxy_integration",
+            &serde_json::json!({
+                "test_name": "test_v9_actual_edge_local_controlled_proxy_integration",
+                "suite_tier": "ACTUAL_EDGE_LOCAL_CONTROLLED_PROXY",
+                "status": status,
+                "platform": format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
+                "reason": "macOS native Microsoft Edge binary path is not applicable on non-macOS host",
+                "require_real_edge": require_real_edge,
+                "public_us_egress_proven": false,
+                "recorded_at_utc": chrono::Utc::now().to_rfc3339()
+            }),
+        );
+        assert!(
+            !require_real_edge,
+            "ANTI_REQUIRE_REAL_EDGE=1 was set on a non-macOS platform where macOS Edge cannot run"
+        );
+    }
+
     #[cfg(target_os = "macos")]
     {
         use std::path::Path;
@@ -920,9 +1269,36 @@ fn test_v8_real_edge_headless_cdp_target_lifecycle_ownership_and_fail_closed_bri
 
         let edge_bin = Path::new("/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge");
         if !edge_bin.exists() {
-            // Skip gracefully on CI runners where Edge is not installed
+            let status = if require_real_edge { "FAIL" } else { "NOT_RUN" };
+            write_v9_runtime_test_evidence(
+                "test_v9_actual_edge_local_controlled_proxy_integration",
+                &serde_json::json!({
+                    "test_name": "test_v9_actual_edge_local_controlled_proxy_integration",
+                    "suite_tier": "ACTUAL_EDGE_LOCAL_CONTROLLED_PROXY",
+                    "status": status,
+                    "platform": format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
+                    "edge_binary_path": edge_bin.display().to_string(),
+                    "edge_installed": false,
+                    "require_real_edge": require_real_edge,
+                    "reason": "Microsoft Edge binary is absent at /Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+                    "public_us_egress_proven": false,
+                    "recorded_at_utc": chrono::Utc::now().to_rfc3339()
+                }),
+            );
+            assert!(
+                !require_real_edge,
+                "ANTI_REQUIRE_REAL_EDGE=1: Microsoft Edge binary is required but absent at {}",
+                edge_bin.display()
+            );
             return;
         }
+
+        let version_out = Command::new(edge_bin)
+            .arg("--version")
+            .output()
+            .ok()
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .unwrap_or_else(|| "unknown".to_string());
 
         let temp_dir = tempfile::tempdir().expect("create temp profile dir");
         let profile_path = temp_dir.path().to_path_buf();
@@ -990,8 +1366,8 @@ fn test_v8_real_edge_headless_cdp_target_lifecycle_ownership_and_fail_closed_bri
         let bridge_mgr = ProxyBridgeManager::new();
         let bridge_status = bridge_mgr
             .start_or_replace_bridge(UpstreamProxyConfig {
-                environment_id: "env-real-edge-v8".to_string(),
-                endpoint_id: "ep-us-test".to_string(),
+                environment_id: "env-real-edge-v9".to_string(),
+                endpoint_id: "ep-us-local-controlled".to_string(),
                 host: "127.0.0.1".to_string(),
                 port: upstream_port,
                 protocol: "HTTP".to_string(),
@@ -1001,7 +1377,7 @@ fn test_v8_real_edge_headless_cdp_target_lifecycle_ownership_and_fail_closed_bri
             })
             .expect("start local proxy bridge");
         let bridge_port = bridge_status.local_port;
-        let bridge_instance_id = bridge_mgr.get_instance_id("env-real-edge-v8");
+        let bridge_instance_id = bridge_mgr.get_instance_id("env-real-edge-v9");
 
         // 2. Spawn real Microsoft Edge in headless mode with --remote-debugging-port=0
         let child = Command::new(edge_bin)
@@ -1053,13 +1429,13 @@ fn test_v8_real_edge_headless_cdp_target_lifecycle_ownership_and_fail_closed_bri
 
         // 4. Verify real Edge CDP ownership check passes with matching session + profile + bridge
         let session = BrowserSessionInfo {
-            environment_id: "env-real-edge-v8".to_string(),
+            environment_id: "env-real-edge-v9".to_string(),
             session_id: format!("edge-session-{}", edge_pid),
             pid: edge_pid,
             profile_path: profile_path.to_string_lossy().to_string(),
             proxy_bridge_port: Some(bridge_port),
-            proxy_endpoint_id: "ep-us-test".to_string(),
-            bridge_instance_id,
+            proxy_endpoint_id: "ep-us-local-controlled".to_string(),
+            bridge_instance_id: bridge_instance_id.clone(),
             expected_country: Some("US".to_string()),
             expected_ip: None,
             recent_bridge_connection_count: 0,
@@ -1084,7 +1460,7 @@ fn test_v8_real_edge_headless_cdp_target_lifecycle_ownership_and_fail_closed_bri
 
         // 5. Verify ownership check rejects wrong profile_path
         let mut wrong_profile_session = session.clone();
-        wrong_profile_session.profile_path = "/tmp/nonexistent-wrong-profile-v8".to_string();
+        wrong_profile_session.profile_path = "/tmp/nonexistent-wrong-profile-v9".to_string();
         assert!(
             verify_managed_cdp_ownership(
                 &wrong_profile_session,
@@ -1108,7 +1484,7 @@ fn test_v8_real_edge_headless_cdp_target_lifecycle_ownership_and_fail_closed_bri
             "Real Edge 157+ returns HTTP 405 on GET /json/new"
         );
 
-        // 7. Prove V8 fix on real Edge 157+: PUT /json/new?about:blank succeeds with HTTP 200
+        // 7. Prove V8/V9 fix on real Edge 157+: PUT /json/new?about:blank succeeds with HTTP 200
         let target = create_cdp_blank_target_full(cdp_port, Duration::from_millis(2000))
             .expect("PUT /json/new?about:blank must succeed on real Edge");
         assert!(!target.id.is_empty());
@@ -1188,17 +1564,17 @@ fn test_v8_real_edge_headless_cdp_target_lifecycle_ownership_and_fail_closed_bri
 
         let corr = bridge_mgr.correlate_connect_tunnel(
             bridge_mgr
-                .get_instance_id("env-real-edge-v8")
+                .get_instance_id("env-real-edge-v9")
                 .as_deref()
                 .unwrap(),
-            "env-real-edge-v8",
-            "ep-us-test",
+            "env-real-edge-v9",
+            "ep-us-local-controlled",
             "ipwho.is",
             443,
             window_start,
             Some(window_end),
         );
-        match corr {
+        let correlated_event = match corr {
             youtube_isolation_manager_lib::services::proxy_bridge::BridgeCorrelationOutcome::Confirmed(ev) => {
                 assert_eq!(ev.protocol, "HTTP_CONNECT");
                 assert_eq!(ev.destination_host, "ipwho.is");
@@ -1208,13 +1584,106 @@ fn test_v8_real_edge_headless_cdp_target_lifecycle_ownership_and_fail_closed_bri
                     "Bridge telemetry must record bytes_transferred > 0 for real Edge TLS handshake, got {}",
                     ev.bytes_transferred
                 );
+                ev
             }
             other => panic!(
                 "Expected BridgeCorrelationOutcome::Confirmed for real Edge CONNECT tunnel, got: {:?}",
                 other
             ),
-        }
+        };
 
-        bridge_mgr.stop_bridge("env-real-edge-v8");
+        // 11. Explicitly drop EdgeGuard, stop bridge, and verify child process termination + CDP port closure
+        drop(guard);
+        bridge_mgr.stop_bridge("env-real-edge-v9");
+
+        let teardown_deadline = Instant::now() + Duration::from_millis(2000);
+        let mut cdp_closed = false;
+        while Instant::now() < teardown_deadline {
+            if cdp_http_request(cdp_port, "GET", "/json/version", Duration::from_millis(200))
+                .is_err()
+            {
+                cdp_closed = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(40));
+        }
+        assert!(
+            cdp_closed,
+            "CDP port {} must be closed after Edge child termination",
+            cdp_port
+        );
+
+        let sanitized_profile = profile_path
+            .file_name()
+            .map(|n| format!("<tempdir>/{}", n.to_string_lossy()))
+            .unwrap_or_else(|| "<tempdir>/profile".to_string());
+
+        write_v9_runtime_test_evidence(
+            "test_v9_actual_edge_local_controlled_proxy_integration",
+            &serde_json::json!({
+                "test_name": "test_v9_actual_edge_local_controlled_proxy_integration",
+                "suite_tier": "ACTUAL_EDGE_LOCAL_CONTROLLED_PROXY",
+                "status": "PASS",
+                "platform": format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
+                "edge_binary_path": edge_bin.display().to_string(),
+                "edge_version": version_out,
+                "edge_pid": edge_pid,
+                "sanitized_profile_dir": sanitized_profile,
+                "cdp_port": cdp_port,
+                "local_bridge_port": bridge_port,
+                "bridge_instance_id": bridge_instance_id,
+                "get_json_new_status_code": 405,
+                "put_json_new_status_code": 200,
+                "tls_client_hello_bytes": tls_bytes,
+                "correlated_event_id": correlated_event.event_id,
+                "correlated_bytes_transferred": correlated_event.bytes_transferred,
+                "child_reaped": true,
+                "cdp_port_closed_after_teardown": cdp_closed,
+                "public_us_egress_proven": false,
+                "recorded_at_utc": chrono::Utc::now().to_rfc3339()
+            }),
+        );
+    }
+}
+
+#[test]
+fn test_v9_real_edge_live_j2proxy_us_acceptance() {
+    let require_live_j2proxy = std::env::var("ANTI_REQUIRE_LIVE_J2PROXY")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+
+    let live_host = std::env::var("ANTI_LIVE_J2PROXY_HOST")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let live_port = std::env::var("ANTI_LIVE_J2PROXY_PORT")
+        .ok()
+        .and_then(|s| s.trim().parse::<u16>().ok())
+        .filter(|p| *p > 0);
+
+    if live_host.is_none() || live_port.is_none() {
+        let status = if require_live_j2proxy {
+            "FAIL"
+        } else {
+            "NOT_RUN"
+        };
+        write_v9_runtime_test_evidence(
+            "test_v9_real_edge_live_j2proxy_us_acceptance",
+            &serde_json::json!({
+                "test_name": "test_v9_real_edge_live_j2proxy_us_acceptance",
+                "suite_tier": "REAL_EDGE_LIVE_J2PROXY_US",
+                "status": status,
+                "platform": format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
+                "require_live_j2proxy": require_live_j2proxy,
+                "live_j2proxy_configured": false,
+                "reason": "Authorized live J2Proxy US credentials/endpoint (ANTI_LIVE_J2PROXY_HOST / ANTI_LIVE_J2PROXY_PORT) are not provisioned in this test environment",
+                "public_us_egress_proven": false,
+                "recorded_at_utc": chrono::Utc::now().to_rfc3339()
+            }),
+        );
+        assert!(
+            !require_live_j2proxy,
+            "ANTI_REQUIRE_LIVE_J2PROXY=1 was set, but ANTI_LIVE_J2PROXY_HOST / ANTI_LIVE_J2PROXY_PORT are not provisioned"
+        );
     }
 }

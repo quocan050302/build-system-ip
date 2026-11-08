@@ -145,6 +145,10 @@ export const NetworkView: React.FC<NetworkViewProps> = ({
         return <span className="text-[10px] font-mono px-2 py-0.5 rounded-full border bg-amber-950/60 text-amber-400 border-amber-700/60">🕐 STALE — Re-verify required</span>;
       case 'VERIFICATION_UNAVAILABLE':
         return <span className="text-[10px] font-mono px-2 py-0.5 rounded-full border bg-yellow-950/60 text-yellow-400 border-yellow-700/60">⚠️ UNAVAILABLE</span>;
+      case 'NOT_RUN':
+      case 'SKIPPED':
+      case 'UNVERIFIED':
+        return <span className="text-[10px] font-mono px-2 py-0.5 rounded-full border bg-surface-800 text-slate-400 border-surface-700">⏸ {status}</span>;
       case 'ENDPOINT_REACHABLE':
         return <span className="text-[10px] font-mono px-2 py-0.5 rounded-full border bg-sky-950/60 text-sky-400 border-sky-800/60">⚡ ENDPOINT REACHABLE</span>;
       case 'CONNECTION_FAILED':

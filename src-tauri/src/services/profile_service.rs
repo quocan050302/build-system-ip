@@ -516,12 +516,20 @@ impl SystemBrowserLauncher {
             match child.try_wait() {
                 Ok(Some(_exit_status)) => {
                     proc_entry.session.status = "STOPPED".to_string();
+                    proc_entry.session.cdp_port = None;
+                    let _ = std::fs::remove_file(
+                        PathBuf::from(&proc_entry.session.profile_path).join("DevToolsActivePort"),
+                    );
                     proc_entry.child = None;
                     return false;
                 }
                 Ok(None) => return true,
                 Err(_) => {
                     proc_entry.session.status = "STOPPED".to_string();
+                    proc_entry.session.cdp_port = None;
+                    let _ = std::fs::remove_file(
+                        PathBuf::from(&proc_entry.session.profile_path).join("DevToolsActivePort"),
+                    );
                     proc_entry.child = None;
                     return false;
                 }
@@ -791,6 +799,10 @@ impl BrowserLauncher for SystemBrowserLauncher {
                 let _ = child.kill();
                 let _ = child.wait();
             }
+            let _ = std::fs::remove_file(
+                PathBuf::from(&proc_entry.session.profile_path).join("DevToolsActivePort"),
+            );
+            proc_entry.session.cdp_port = None;
             proc_entry.session.status = "STOPPED".to_string();
             Ok(())
         } else {
@@ -806,11 +818,9 @@ impl BrowserLauncher for SystemBrowserLauncher {
 
         if let Some(proc_entry) = map.get_mut(session_id) {
             if Self::refresh_process_state(proc_entry) {
-                if proc_entry.session.cdp_port.is_none() {
-                    let profile_dir = PathBuf::from(&proc_entry.session.profile_path);
-                    if let Some((port, _)) = Self::parse_devtools_active_port(&profile_dir) {
-                        proc_entry.session.cdp_port = Some(port);
-                    }
+                let profile_dir = PathBuf::from(&proc_entry.session.profile_path);
+                if let Some((port, _)) = Self::parse_devtools_active_port(&profile_dir) {
+                    proc_entry.session.cdp_port = Some(port);
                 }
                 return Ok(BrowserStatus::Running {
                     pid: proc_entry.session.pid,
@@ -835,11 +845,9 @@ impl BrowserLauncher for SystemBrowserLauncher {
 
         if let Some(proc_entry) = map.get_mut(session_id) {
             if Self::refresh_process_state(proc_entry) {
-                if proc_entry.session.cdp_port.is_none() {
-                    let profile_dir = PathBuf::from(&proc_entry.session.profile_path);
-                    if let Some((port, _)) = Self::parse_devtools_active_port(&profile_dir) {
-                        proc_entry.session.cdp_port = Some(port);
-                    }
+                let profile_dir = PathBuf::from(&proc_entry.session.profile_path);
+                if let Some((port, _)) = Self::parse_devtools_active_port(&profile_dir) {
+                    proc_entry.session.cdp_port = Some(port);
                 }
                 return Ok(Some(proc_entry.session.clone()));
             }

@@ -119,12 +119,17 @@ On Windows x64 (`x86_64-pc-windows-msvc`):
 - `NetworkProtectionStatus` — structured DNS/IPv6/WebRTC status reporting to UI.
 - `is_verification_stale()` — cached results older than the configured threshold are automatically marked stale.
 
-#### CI improvements
+#### CI & V9 Verification Orchestration
 - `macos-14` → `macos-15` for reliable ARM64 runner.
 - Feature branch triggers added (`fix/**`, `feature/**`).
 - Architecture verification step in macOS jobs.
 - Bounded timeouts on all jobs.
-- 50 Rust tests (21 unit + 29 integration), 5 npm tests — all pass.
+- `scripts/verify_v9.py` bounded async/parallel orchestrator:
+  - Runs independent DAG branches (`frontend_branch`, `selftest_branch`, `rust_cargo_branch`) concurrently via `asyncio.gather` while strictly serializing Cargo invocations (`Semaphore(1)`).
+  - Enforces `ANTI_REQUIRE_REAL_EDGE=1` when Microsoft Edge is installed so absent Edge can never silently pass as green.
+  - Evaluates 35 deterministic synthetic replay cases (`10 DEV` + `10 HOLDOUT` + `15 ADVERSARIAL_HOLDOUT`) with `0` false-positive `BROWSER_EGRESS_VERIFIED` outcomes, while classifying `HISTORICAL_BACKTEST_GATE` as `INSUFFICIENT_HISTORICAL_EVIDENCE` and `LIVE_J2PROXY_US_GATE` as `NOT_RUN` when live J2Proxy credentials are not provisioned.
+  - Writes durable atomic evidence (`v9_run_manifest.json` + `v9_summary.md` + redacted per-task logs) to `$RUNNER_TEMP/anti-v9` / `/tmp/anti-v9` and uploads CI artifacts with 14-day retention.
+- 58 Rust tests (26 unit + 32 integration), 5 npm tests — all pass.
 
 ### Known remaining gaps
 

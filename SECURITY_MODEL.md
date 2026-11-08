@@ -193,7 +193,7 @@ If `expected_country` is configured (e.g., "US"):
 | DNS routing through proxy | ⚠️ ASSUMED | CONNECT/SOCKS5 semantics; not packet-verified |
 | IPv6 bypass prevention | ❌ NOT MITIGATED | No IPv6 disable; bridge is IPv4-only |
 | WebRTC non-proxied UDP disable | ⚠️ POLICY SET | Flag applied at launch; runtime not verified |
-| Browser-origin verification | ✅ IMPLEMENTED (live test pending) | CDP `Runtime.evaluate` fetch → IP/country; `find_matching_tunnel` timestamp correlation |
+| Browser-origin verification | ✅ IMPLEMENTED (local controlled proxy proven; live J2Proxy US pending) | CDP `PUT /json/new?about:blank` + `Page.navigate` + `Network.*` → IP/country + `correlate_connect_tunnel` (`bytes_transferred > 0`, unique active tunnel); `ANTI_REQUIRE_REAL_EDGE=1` enforced in `scripts/verify_v9.py` |
 
 ## 8. Legitimate Use Boundaries
 

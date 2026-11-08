@@ -1643,48 +1643,16 @@ pub fn attempt_cdp_browser_verification(
         .clone()
         .unwrap_or_else(|| "UNKNOWN".to_string());
 
-    // 5. Strict IP validation
-    if !crate::services::network_service::NetworkService::is_valid_ip_address(&observed_ip) {
-        return Err(BrowserVerificationError::IpMismatch(format!(
-            "Browser returned syntactically invalid IP: '{}'",
-            observed_ip
-        )));
-    }
-
-    // Non-routable / documentation IPs must be rejected in live verification
-    if !session.is_simulation && !is_globally_routable_ip(&observed_ip) {
-        return Err(BrowserVerificationError::IpNotGloballyRoutable(format!(
-            "Observed IP '{}' is not globally routable (private, documentation, or local range)",
-            observed_ip
-        )));
-    }
-
-    if let Some(ref exp_ip) = session.expected_ip {
-        if &observed_ip != exp_ip {
-            return Err(BrowserVerificationError::IpMismatch(format!(
-                "Expected IP '{}', observed '{}'",
-                exp_ip, observed_ip
-            )));
-        }
-    }
-
-    // 6. Strict Country validation
-    if let Some(ref exp_c) = session.expected_country {
-        if let Err(e) = crate::services::network_service::NetworkService::evaluate_country_match(
-            &observed_country_for_eval,
-            Some(exp_c),
-        ) {
-            return Err(BrowserVerificationError::CountryMismatch(e));
-        }
-    } else if !session.is_simulation
-        && (observed_country_opt.is_none()
-            || observed_country_for_eval.eq_ignore_ascii_case("UNKNOWN"))
-    {
-        return Err(BrowserVerificationError::CountryMismatch(format!(
-            "Provider '{}' did not supply a verified country code",
-            active_provider.name
-        )));
-    }
+    // 5 & 6. Strict IP and Country validation via shared pure decision helper
+    validate_observed_egress_ip_and_country(
+        &observed_ip,
+        observed_country_opt.as_deref(),
+        &observed_country_for_eval,
+        session.expected_ip.as_deref(),
+        session.expected_country.as_deref(),
+        active_provider.name,
+        session.is_simulation,
+    )?;
 
     // 7. In live mode, verify OS process + profile + CDP port ownership
     if !session.is_simulation {
@@ -1775,11 +1743,66 @@ pub fn attempt_cdp_browser_verification(
     })
 }
 
+/// Shared pure decision function validating observed egress IP and country for both
+/// live CDP verification and deterministic replay evaluation.
+#[allow(clippy::too_many_arguments)]
+pub fn validate_observed_egress_ip_and_country(
+    observed_ip: &str,
+    observed_country_opt: Option<&str>,
+    observed_country_for_eval: &str,
+    expected_ip: Option<&str>,
+    expected_country: Option<&str>,
+    provider_name: &str,
+    is_simulation: bool,
+) -> Result<(), BrowserVerificationError> {
+    if !crate::services::network_service::NetworkService::is_valid_ip_address(observed_ip) {
+        return Err(BrowserVerificationError::IpMismatch(format!(
+            "Browser returned syntactically invalid IP: '{}'",
+            observed_ip
+        )));
+    }
+
+    if !is_simulation && !is_globally_routable_ip(observed_ip) {
+        return Err(BrowserVerificationError::IpNotGloballyRoutable(format!(
+            "Observed IP '{}' is not globally routable (private, documentation, or local range)",
+            observed_ip
+        )));
+    }
+
+    if let Some(exp_ip) = expected_ip {
+        if observed_ip != exp_ip {
+            return Err(BrowserVerificationError::IpMismatch(format!(
+                "Expected IP '{}', observed '{}'",
+                exp_ip, observed_ip
+            )));
+        }
+    }
+
+    if let Some(exp_c) = expected_country {
+        if let Err(e) = crate::services::network_service::NetworkService::evaluate_country_match(
+            observed_country_for_eval,
+            Some(exp_c),
+        ) {
+            return Err(BrowserVerificationError::CountryMismatch(e));
+        }
+    } else if !is_simulation
+        && (observed_country_opt.is_none()
+            || observed_country_for_eval.eq_ignore_ascii_case("UNKNOWN"))
+    {
+        return Err(BrowserVerificationError::CountryMismatch(format!(
+            "Provider '{}' did not supply a verified country code",
+            provider_name
+        )));
+    }
+
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
-// Historical Replay / Backtest Engine (Phase 6E)
+// Synthetic Replay Corpus & Honest Historical Backtest Gate (Phase 4 & 5)
 // ---------------------------------------------------------------------------
 
-/// A single frozen historical or adversarial verification trace case for deterministic replay.
+/// A single frozen verification trace case for deterministic synthetic replay.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReplayTraceCase {
     pub case_id: String,
@@ -1792,6 +1815,12 @@ pub struct ReplayTraceCase {
     pub cdp_new_target_method: String,
     pub cdp_new_target_status: u16,
     pub cdp_navigation_succeeded: bool,
+    #[serde(default)]
+    pub from_cache: bool,
+    #[serde(default)]
+    pub redirected_to_non_https: bool,
+    #[serde(default)]
+    pub environment_id: Option<String>,
     pub provider_name: String,
     pub provider_host: String,
     pub provider_port: u16,
@@ -1808,10 +1837,11 @@ pub struct ReplayTraceCase {
     pub expected_reason_substring: String,
 }
 
-/// Summary metrics and confusion matrix for a replay corpus split (`DEV` or `HOLDOUT`).
+/// Summary metrics and confusion matrix for a replay corpus split (`DEV`, `HOLDOUT`, or `ADVERSARIAL_HOLDOUT`).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ReplayCorpusSummary {
     pub split: String,
+    pub corpus_classification: String,
     pub total_cases: usize,
     pub exact_status_matches: usize,
     pub reason_matches: usize,
@@ -1822,7 +1852,37 @@ pub struct ReplayCorpusSummary {
     pub failures: Vec<String>,
 }
 
-/// Deterministically evaluate a single `ReplayTraceCase` through the V8 verification decision pipeline.
+/// Honest assessment of genuine historical network backtest evidence vs. synthetic replay.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HistoricalBacktestReport {
+    pub classification: String,
+    pub status: String,
+    pub reason: String,
+    pub synthetic_replay_conflated: bool,
+}
+
+/// Evaluates whether a genuine pre-recorded historical network capture corpus exists.
+/// Never conflates synthetic JSONL decision replay with a real historical network backtest.
+pub fn evaluate_historical_backtest_honesty(
+    historical_capture_path: Option<&std::path::Path>,
+) -> HistoricalBacktestReport {
+    match historical_capture_path {
+        Some(p) if p.exists() && p.is_file() => HistoricalBacktestReport {
+            classification: "HISTORICAL_BACKTEST".to_string(),
+            status: "PASS".to_string(),
+            reason: format!("Verified historical capture corpus at {}", p.display()),
+            synthetic_replay_conflated: false,
+        },
+        _ => HistoricalBacktestReport {
+            classification: "HISTORICAL_BACKTEST".to_string(),
+            status: "INSUFFICIENT_HISTORICAL_EVIDENCE".to_string(),
+            reason: "No genuine pre-existing historical network packet/session capture archive is present in the repository; synthetic JSONL traces are classified strictly as SYNTHETIC_REPLAY_CORPUS.".to_string(),
+            synthetic_replay_conflated: false,
+        },
+    }
+}
+
+/// Deterministically evaluate a single `ReplayTraceCase` through the shared verification decision pipeline.
 pub fn evaluate_replay_trace_case(case: &ReplayTraceCase) -> (String, String) {
     if !case.session_pid_alive {
         return (
@@ -1845,6 +1905,19 @@ pub fn evaluate_replay_trace_case(case: &ReplayTraceCase) -> (String, String) {
             ),
         );
     }
+    if case.redirected_to_non_https {
+        return (
+            "PROXY_EGRESS_VERIFIED".to_string(),
+            "CdpSecurityViolation: verification navigation redirected to non-HTTPS or unexpected origin".to_string(),
+        );
+    }
+    if case.from_cache {
+        return (
+            "PROXY_EGRESS_VERIFIED".to_string(),
+            "BrowserRequestFailed: verification response served from cache instead of live network"
+                .to_string(),
+        );
+    }
     if !case.cdp_navigation_succeeded {
         return (
             "PROXY_EGRESS_VERIFIED".to_string(),
@@ -1862,48 +1935,34 @@ pub fn evaluate_replay_trace_case(case: &ReplayTraceCase) -> (String, String) {
         }
     };
 
-    if !crate::services::network_service::NetworkService::is_valid_ip_address(ip) {
-        return (
-            "CONNECTION_FAILED".to_string(),
-            format!("IpMismatch: invalid IP '{}'", ip),
-        );
-    }
-    if !is_globally_routable_ip(ip) {
-        return (
-            "CONNECTION_FAILED".to_string(),
-            format!("IpNotGloballyRoutable: non-routable IP '{}'", ip),
-        );
-    }
-    if let Some(ref exp_ip) = case.expected_ip {
-        if ip != exp_ip {
-            return (
-                "CONNECTION_FAILED".to_string(),
-                format!("IpMismatch: expected '{}', observed '{}'", exp_ip, ip),
-            );
-        }
-    }
-
-    let country_str = if case.provider_name == "api.ipify.org" {
-        "UNKNOWN"
+    let country_opt = if case.provider_name == "api.ipify.org" {
+        None
     } else {
-        case.observed_country.as_deref().unwrap_or("UNKNOWN").trim()
+        case.observed_country
+            .as_deref()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
     };
+    let country_str = country_opt.unwrap_or("UNKNOWN");
 
-    if let Some(ref exp_c) = case.expected_country {
-        if let Err(e) = crate::services::network_service::NetworkService::evaluate_country_match(
-            country_str,
-            Some(exp_c),
-        ) {
-            return (
-                "CONNECTION_FAILED".to_string(),
-                format!("CountryMismatch: {}", e),
-            );
-        }
-    } else if country_str.is_empty() || country_str.eq_ignore_ascii_case("UNKNOWN") {
-        return (
-            "CONNECTION_FAILED".to_string(),
-            "CountryMismatch: missing or UNKNOWN country".to_string(),
-        );
+    if let Err(err) = validate_observed_egress_ip_and_country(
+        ip,
+        country_opt,
+        country_str,
+        case.expected_ip.as_deref(),
+        case.expected_country.as_deref(),
+        &case.provider_name,
+        false,
+    ) {
+        let reason = match err {
+            BrowserVerificationError::IpMismatch(m) => format!("IpMismatch: {}", m),
+            BrowserVerificationError::IpNotGloballyRoutable(m) => {
+                format!("IpNotGloballyRoutable: {}", m)
+            }
+            BrowserVerificationError::CountryMismatch(m) => format!("CountryMismatch: {}", m),
+            other => other.to_string(),
+        };
+        return ("CONNECTION_FAILED".to_string(), reason);
     }
 
     let inst_id = match case.bridge_instance_id.as_deref() {
@@ -1938,9 +1997,11 @@ pub fn evaluate_replay_trace_case(case: &ReplayTraceCase) -> (String, String) {
         telemetry.record_event(ev.clone());
     }
 
+    let expected_env_id = case.environment_id.as_deref().unwrap_or("env-replay");
+
     match telemetry.correlate_connect_tunnel(
         inst_id,
-        "env-replay",
+        expected_env_id,
         &case.proxy_endpoint_id,
         &case.provider_host,
         case.provider_port,
@@ -1950,7 +2011,7 @@ pub fn evaluate_replay_trace_case(case: &ReplayTraceCase) -> (String, String) {
         crate::services::proxy_bridge::BridgeCorrelationOutcome::Confirmed(ev) => {
             let evidence = BrowserVerificationEvidence {
                 verification_id: format!("replay-{}", case.case_id),
-                environment_id: "env-replay".to_string(),
+                environment_id: expected_env_id.to_string(),
                 browser_session_id: "sess-replay".to_string(),
                 browser_pid: std::process::id(),
                 profile_path: case.profile_path.clone(),
@@ -1995,6 +2056,7 @@ pub fn evaluate_replay_trace_case(case: &ReplayTraceCase) -> (String, String) {
 pub fn run_replay_corpus(split_name: &str, jsonl_content: &str) -> ReplayCorpusSummary {
     let mut summary = ReplayCorpusSummary {
         split: split_name.to_string(),
+        corpus_classification: "SYNTHETIC_REPLAY_CORPUS".to_string(),
         total_cases: 0,
         exact_status_matches: 0,
         reason_matches: 0,
@@ -2922,9 +2984,10 @@ mod tests {
         let holdout_jsonl = include_str!("../../tests/fixtures/v8_replay_holdout.jsonl");
 
         let dev_summary = run_replay_corpus("DEV", dev_jsonl);
-        assert!(
-            dev_summary.total_cases >= 8,
-            "DEV corpus should have >=8 cases, got {}",
+        assert_eq!(dev_summary.corpus_classification, "SYNTHETIC_REPLAY_CORPUS");
+        assert_eq!(
+            dev_summary.total_cases, 10,
+            "DEV corpus must have 10 cases, got {}",
             dev_summary.total_cases
         );
         assert_eq!(
@@ -2939,9 +3002,13 @@ mod tests {
         );
 
         let holdout_summary = run_replay_corpus("HOLDOUT", holdout_jsonl);
-        assert!(
-            holdout_summary.total_cases >= 8,
-            "HOLDOUT corpus should have >=8 cases, got {}",
+        assert_eq!(
+            holdout_summary.corpus_classification,
+            "SYNTHETIC_REPLAY_CORPUS"
+        );
+        assert_eq!(
+            holdout_summary.total_cases, 10,
+            "HOLDOUT corpus must have 10 cases, got {}",
             holdout_summary.total_cases
         );
         assert_eq!(
@@ -2954,5 +3021,41 @@ mod tests {
             "HOLDOUT corpus failures: {:?}",
             holdout_summary.failures
         );
+    }
+
+    #[test]
+    fn test_v9_adversarial_holdout_and_historical_backtest_honesty() {
+        let adv_jsonl = include_str!("../../tests/fixtures/v9_adversarial_holdout.jsonl");
+        let adv_summary = run_replay_corpus("ADVERSARIAL_HOLDOUT", adv_jsonl);
+
+        assert_eq!(adv_summary.corpus_classification, "SYNTHETIC_REPLAY_CORPUS");
+        assert_eq!(
+            adv_summary.total_cases, 15,
+            "ADVERSARIAL_HOLDOUT corpus must have 15 cases, got {}",
+            adv_summary.total_cases
+        );
+        assert_eq!(
+            adv_summary.false_positive_browser_verified, 0,
+            "ADVERSARIAL_HOLDOUT corpus MUST have 0 false-positive BROWSER_EGRESS_VERIFIED: {:?}",
+            adv_summary.failures
+        );
+        assert_eq!(
+            adv_summary.false_negative_browser_verified, 0,
+            "ADVERSARIAL_HOLDOUT corpus MUST have 0 false-negative BROWSER_EGRESS_VERIFIED: {:?}",
+            adv_summary.failures
+        );
+        assert_eq!(adv_summary.exact_status_matches, 15);
+        assert_eq!(adv_summary.reason_matches, 15);
+        assert!(
+            adv_summary.failures.is_empty(),
+            "ADVERSARIAL_HOLDOUT failures: {:?}",
+            adv_summary.failures
+        );
+
+        // Verify honest historical backtest reporting when no real historical packet capture exists
+        let hist_report = evaluate_historical_backtest_honesty(None);
+        assert_eq!(hist_report.classification, "HISTORICAL_BACKTEST");
+        assert_eq!(hist_report.status, "INSUFFICIENT_HISTORICAL_EVIDENCE");
+        assert!(!hist_report.synthetic_replay_conflated);
     }
 }

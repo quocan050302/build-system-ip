@@ -39,12 +39,22 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: src-tauri
-      - name: Check formatting
-        run: cargo fmt --manifest-path src-tauri/Cargo.toml --all -- --check
-      - name: Run Clippy
-        run: cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
-      - name: Run Integration Tests
-        run: cargo test --manifest-path src-tauri/Cargo.toml
+      - name: Run Bounded V9 Verification Suite (fmt + clippy + unit + integration + replay)
+        shell: pwsh
+        run: |
+          $artifactDir = "$env:RUNNER_TEMP/anti-v9/$env:GITHUB_SHA/$env:GITHUB_RUN_ID-windows"
+          python scripts/verify_v9.py --skip-frontend --artifact-dir "$artifactDir"
+          if (-not (Test-Path "$artifactDir/v9_run_manifest.json")) {
+            Write-Error "Missing durable v9_run_manifest.json!"
+            exit 1
+          }
+      - name: Upload V9 Evidence Bundle (Windows x64)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: anti-v9-evidence-windows-x64
+          path: ${{ runner.temp }}/anti-v9
+          retention-days: 14
 
   rust-macos:
     name: Rust — macOS ARM64 (fmt + clippy + test)
@@ -65,12 +75,25 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: src-tauri
-      - name: Check formatting
-        run: cargo fmt --manifest-path src-tauri/Cargo.toml --all -- --check
-      - name: Run Clippy
-        run: cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
-      - name: Run Integration Tests
-        run: cargo test --manifest-path src-tauri/Cargo.toml
+      - name: Run Bounded V9 Verification Suite (Real Edge + Local Proxy + Replay)
+        run: |
+          ARTIFACT_DIR="${RUNNER_TEMP}/anti-v9/${GITHUB_SHA}/${GITHUB_RUN_ID}-macos"
+          if [ -x "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge" ]; then
+            echo "Microsoft Edge detected on macos-15 runner — enforcing ANTI_REQUIRE_REAL_EDGE=1"
+            python3 scripts/verify_v9.py --skip-frontend --require-real-edge --artifact-dir "${ARTIFACT_DIR}"
+          else
+            echo "Microsoft Edge binary not present on runner — running with explicit NOT_RUN recording"
+            python3 scripts/verify_v9.py --skip-frontend --artifact-dir "${ARTIFACT_DIR}"
+          fi
+          test -f "${ARTIFACT_DIR}/v9_run_manifest.json"
+          test -f "${ARTIFACT_DIR}/v9_summary.md"
+      - name: Upload V9 Evidence Bundle (macOS ARM64)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: anti-v9-evidence-macos-arm64
+          path: ${{ runner.temp }}/anti-v9
+          retention-days: 14
 
   # ── Tauri bundle — Windows ──────────────────────────────────────────────────
   tauri-windows:
